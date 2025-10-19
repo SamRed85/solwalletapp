@@ -3,6 +3,10 @@ import VueRouter from 'vue-router'
 import Home from '../views/Home.vue'
 import Users from '../views/Users.vue'
 import Admin from '../views/Admin.vue'
+import Predictions from '../views/Predictions.vue'
+import EventPredictions from '../views/EventPredictions.vue'
+import MyCoupons from '../views/MyCoupons.vue'
+import PaymentConfirmation from '../views/PaymentConfirmation.vue'
 
 Vue.use(VueRouter)
 
@@ -23,6 +27,30 @@ const routes = [
     name: 'Admin',
     component: Admin,
     meta: { requiresAuth: true, requiresAdmin: true }
+  },
+  {
+    path: '/predictions',
+    name: 'Predictions',
+    component: Predictions,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/predictions/:id',
+    name: 'EventPredictions',
+    component: EventPredictions,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/my-coupons',
+    name: 'MyCoupons',
+    component: MyCoupons,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/payment-confirmation',
+    name: 'PaymentConfirmation',
+    component: PaymentConfirmation,
+    meta: { requiresAuth: true }
   }
 ]
 

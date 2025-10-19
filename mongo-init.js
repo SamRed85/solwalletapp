@@ -28,3 +28,23 @@ db.admins.insertOne({
 
 print("Database 'admin_db' initialized");
 print("Admin collection created with initial admin wallet: 4tyf8awFN919MwuhDs7AkPN4gY6RJNawSwqisK3dcHdy");
+
+// Switch to the predictions_db database
+db = db.getSiblingDB('predictions_db');
+
+// Create indexes for events collection
+db.events.createIndex({ "createdAt": 1 });
+db.events.createIndex({ "status": 1 });
+db.events.createIndex({ "createdBy": 1 });
+
+// Create indexes for games collection
+db.games.createIndex({ "eventId": 1 });
+db.games.createIndex({ "status": 1 });
+
+// Create indexes for predictions collection
+db.predictions.createIndex({ "userId": 1 });
+db.predictions.createIndex({ "eventId": 1 });
+db.predictions.createIndex({ "createdAt": 1 });
+
+print("Database 'predictions_db' initialized");
+print("Collections created: events, games, predictions");

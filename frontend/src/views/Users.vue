@@ -236,7 +236,9 @@ export default {
       this.isAuthenticated = false
       this.currentUser = null
       this.userBalance = '0.0000'
-      this.safeNavigate('/')
+      
+      // Refresh page to clear all cached data
+      window.location.reload()
     },
 
     showSnackbar(text, color = 'success') {

@@ -39,9 +39,22 @@
           <!-- Quick actions for authenticated users -->
           <div v-if="isAuthenticated" class="mt-8">
             <v-row justify="center">
-              <v-col v-if="isAdmin" cols="12" sm="6">
+              <v-col cols="12" sm="6" md="4">
                 <v-btn
                   color="primary"
+                  large
+                  block
+                  @click="$router.push('/predictions')"
+                  class="mb-3"
+                >
+                  <v-icon left>mdi-target</v-icon>
+                  Make Predictions
+                </v-btn>
+              </v-col>
+              
+              <v-col v-if="isAdmin" cols="12" sm="6" md="4">
+                <v-btn
+                  color="warning"
                   large
                   block
                   @click="$router.push('/admin')"
@@ -52,7 +65,7 @@
                 </v-btn>
               </v-col>
               
-              <v-col v-if="isAdmin" cols="12" sm="6">
+              <v-col v-if="isAdmin" cols="12" sm="6" md="4">
                 <v-btn
                   color="secondary"
                   large
@@ -82,7 +95,7 @@ export default {
   },
   computed: {
     isAuthenticated() {
-      return localStorage.getItem('isAuthenticated') === 'true'
+      return localStorage.getItem('isAuthenticated') === 'true';
     },
     username() {
       const userData = localStorage.getItem('solanaUser')

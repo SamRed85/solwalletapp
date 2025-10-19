@@ -385,11 +385,13 @@ export default {
       color: 'success',
       timeout: 5000
     },
-    menuItems: [
-      { title: 'Home', icon: 'mdi-home', to: '/' },
-      { title: 'Users', icon: 'mdi-account-group', to: '/users', requiresAdmin: true },
-      { title: 'Admin', icon: 'mdi-shield-crown', to: '/admin', requiresAdmin: true }
-    ],
+        menuItems: [
+          { title: 'Home', icon: 'mdi-home', to: '/' },
+          { title: 'Predictions', icon: 'mdi-target', to: '/predictions' },
+          { title: 'My Coupons', icon: 'mdi-ticket', to: '/my-coupons' },
+          { title: 'Users', icon: 'mdi-account-group', to: '/users', requiresAdmin: true },
+          { title: 'Admin', icon: 'mdi-shield-crown', to: '/admin', requiresAdmin: true }
+        ],
     footerLinks: [
       'Home',
       'About Us',
@@ -530,6 +532,9 @@ export default {
       this.isAdmin = false
       // Disconnect wallet
       solanaService.forceDisconnect()
+      
+      // Refresh page to clear all cached data
+      window.location.reload()
     },
 
     async connectWallet() {
@@ -620,8 +625,10 @@ export default {
           
           this.showSnackbar('Authentication successful! Welcome to Sol!', 'success')
           
-          // Always redirect to home after successful authentication
-          this.safeNavigate('/')
+          // Refresh page to clear all cached data and ensure clean state
+          setTimeout(() => {
+            window.location.reload()
+          }, 1000) // Small delay to show success message
         } else {
           this.showSnackbar('Authentication failed. Please try again.', 'error')
         }
