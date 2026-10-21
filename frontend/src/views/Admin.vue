@@ -1,577 +1,235 @@
 <template>
-  <v-container>
-    <v-row>
-      <v-col cols="12">
-        <v-card>
-          <v-card-title class="text-h4 pa-6 warning--text">
-            <v-icon large color="warning" class="mr-3">mdi-shield-crown</v-icon>
-            Admin Dashboard
-          </v-card-title>
-          
-          <v-card-text>
-            <v-tabs v-model="activeTab" centered>
-              <v-tab>
-                <v-icon left>mdi-calendar-plus</v-icon>
-                Events
-              </v-tab>
-              <v-tab>
-                <v-icon left>mdi-account-group</v-icon>
-                Users
-              </v-tab>
-            </v-tabs>
+  <v-container class="py-6">
+    <v-card>
+      <v-card-title class="d-flex align-center">
+        <v-icon color="warning" class="mr-2">mdi-shield-crown</v-icon>
+        Events
+        <v-spacer />
+        <v-btn color="primary" prepend-icon="mdi-plus" @click="openCreate">Create event</v-btn>
+      </v-card-title>
+      <v-card-subtitle>
+        Games can be set once while the event is a draft. Results can be set once, after the start time.
+      </v-card-subtitle>
 
-            <v-tabs-items v-model="activeTab">
-              <!-- Events Tab -->
-              <v-tab-item>
-                <v-container>
-                  <v-row>
-                    <v-col cols="12">
-                      <div class="d-flex justify-space-between align-center mb-4">
-                        <h2 class="text-h5">Event Management</h2>
-                        <v-btn color="primary" @click="showCreateEventDialog = true">
-                          <v-icon left>mdi-plus</v-icon>
-                          Create Event
-                        </v-btn>
-                      </div>
+      <v-data-table :headers="headers" :items="events" :loading="loading" item-value="id">
+        <template #[`item.status`]="{ value }">
+          <v-chip :color="statusColors[value]" size="small" variant="flat">{{ value }}</v-chip>
+        </template>
+        <template #[`item.startTime`]="{ value }">{{ formatDate(value) }}</template>
+        <template #[`item.actions`]="{ item }">
+          <v-btn icon="mdi-eye" size="small" variant="text" title="Details" @click="details = item" />
+          <v-btn
+            v-if="item.status === 'draft'" icon="mdi-format-list-numbered" size="small" variant="text"
+            color="success" title="Set games" @click="openGames(item)"
+          />
+          <v-btn
+            v-if="item.status === 'closed'" icon="mdi-flag-checkered" size="small" variant="text"
+            color="warning" title="Set results" @click="openResults(item)"
+          />
+        </template>
+      </v-data-table>
+    </v-card>
 
-                      <!-- Events List -->
-                      <v-data-table
-                        :headers="eventHeaders"
-                        :items="events"
-                        :loading="loadingEvents"
-                        class="elevation-1"
-                      >
-                        <template v-slot:item.status="{ item }">
-                          <v-chip
-                            :color="getStatusColor(item.status)"
-                            small
-                            text-color="white"
-                          >
-                            {{ item.status }}
-                          </v-chip>
-                        </template>
-                        
-                        <template v-slot:item.actions="{ item }">
-                          <v-btn
-                            small
-                            color="primary"
-                            @click="viewEvent(item)"
-                            class="mr-2"
-                          >
-                            <v-icon small>mdi-eye</v-icon>
-                          </v-btn>
-                          <v-btn
-                            v-if="item.status === 'upcoming'"
-                            small
-                            color="success"
-                            @click="addGamesToEvent(item)"
-                            class="mr-2"
-                          >
-                            <v-icon small>mdi-plus</v-icon>
-                          </v-btn>
-                          <v-btn
-                            v-if="item.status === 'active'"
-                            small
-                            color="warning"
-                            @click="setEventOutcomes(item)"
-                          >
-                            <v-icon small>mdi-check</v-icon>
-                          </v-btn>
-                        </template>
-                      </v-data-table>
-                    </v-col>
-                  </v-row>
-                </v-container>
-              </v-tab-item>
-
-              <!-- Users Tab -->
-              <v-tab-item>
-                <v-container>
-                  <v-row>
-                    <v-col cols="12">
-                      <h2 class="text-h5 mb-4">User Management</h2>
-                      <v-btn color="primary" @click="$router.push('/users')">
-                        <v-icon left>mdi-account-group</v-icon>
-                        Manage Users
-                      </v-btn>
-                    </v-col>
-                  </v-row>
-                </v-container>
-              </v-tab-item>
-            </v-tabs-items>
-          </v-card-text>
-        </v-card>
-      </v-col>
-    </v-row>
-
-    <!-- Create Event Dialog -->
-    <v-dialog v-model="showCreateEventDialog" max-width="600px">
-      <v-card>
-        <v-card-title>
-          <span class="text-h5">Create New Event</span>
-        </v-card-title>
-        
+    <v-dialog v-model="createDialog" max-width="600">
+      <v-card title="Create event">
         <v-card-text>
-          <v-form ref="eventForm" v-model="eventFormValid">
+          <v-form ref="createForm" v-model="createValid">
+            <v-text-field v-model="newEvent.title" label="Title" :rules="[required, v => v.length <= 120 || 'Max 120 characters']" />
+            <v-textarea v-model="newEvent.description" label="Description" rows="3" :rules="[v => v.length <= 1000 || 'Max 1000 characters']" />
             <v-text-field
-              v-model="newEvent.title"
-              label="Event Title"
-              :rules="[v => !!v || 'Title is required']"
-              required
-            ></v-text-field>
-            
-            <v-textarea
-              v-model="newEvent.description"
-              label="Event Description"
-              rows="3"
-            ></v-textarea>
-            
+              v-model.number="newEvent.gameCount" label="Number of games" type="number" min="7" max="13"
+              :rules="[v => (v >= 7 && v <= 13) || 'Between 7 and 13 games']"
+            />
             <v-text-field
-              v-model.number="newEvent.gameCount"
-              label="Number of Games"
-              type="number"
-              min="7"
-              max="13"
-              :rules="[
-                v => !!v || 'Game count is required',
-                v => v >= 7 || 'Minimum 7 games required',
-                v => v <= 13 || 'Maximum 13 games allowed'
-              ]"
-              required
-            ></v-text-field>
-            
+              v-model="newEvent.startTime" label="Start time (entries close)" type="datetime-local"
+              :rules="[required, v => new Date(v) > new Date() || 'Must be in the future']"
+            />
             <v-text-field
-              v-model="newEvent.startTime"
-              label="Start Time"
-              type="datetime-local"
-              :rules="[v => !!v || 'Start time is required']"
-              required
-            ></v-text-field>
-            
-            <v-text-field
-              v-model="newEvent.endTime"
-              label="End Time"
-              type="datetime-local"
-              :rules="[v => !!v || 'End time is required']"
-              required
-            ></v-text-field>
+              v-model="newEvent.endTime" label="End time" type="datetime-local"
+              :rules="[required, v => new Date(v) > new Date(newEvent.startTime) || 'Must be after start time']"
+            />
           </v-form>
         </v-card-text>
-        
         <v-card-actions>
-          <v-spacer></v-spacer>
-          <v-btn color="grey" text @click="showCreateEventDialog = false">
-            Cancel
-          </v-btn>
-          <v-btn
-            color="primary"
-            :disabled="!eventFormValid"
-            :loading="creatingEvent"
-            @click="createEvent"
-          >
-            Create Event
-          </v-btn>
+          <v-spacer />
+          <v-btn @click="createDialog = false">Cancel</v-btn>
+          <v-btn color="primary" variant="flat" :disabled="!createValid" :loading="saving" @click="createEvent">Create</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
 
-    <!-- Add Games Dialog -->
-    <v-dialog v-model="showAddGamesDialog" max-width="800px">
-      <v-card>
-        <v-card-title>
-          <span class="text-h5">Add Games to Event</span>
-        </v-card-title>
-        
+    <v-dialog v-model="gamesDialog" max-width="800" scrollable>
+      <v-card :title="`Games for ${selected?.title}`">
         <v-card-text>
-          <v-form ref="gamesForm" v-model="gamesFormValid">
-            <div v-for="(game, index) in newGames" :key="index" class="mb-4">
-              <v-card outlined>
-                <v-card-text>
-                  <div class="text-h6 mb-2">Game {{ index + 1 }}</div>
-                  <v-row>
-                    <v-col cols="5">
-                      <v-text-field
-                        v-model="game.homeTeam"
-                        label="Home Team"
-                        :rules="[v => !!v || 'Home team is required']"
-                        required
-                      ></v-text-field>
-                    </v-col>
-                    <v-col cols="2" class="d-flex align-center justify-center">
-                      <span class="text-h6">VS</span>
-                    </v-col>
-                    <v-col cols="5">
-                      <v-text-field
-                        v-model="game.awayTeam"
-                        label="Away Team"
-                        :rules="[v => !!v || 'Away team is required']"
-                        required
-                      ></v-text-field>
-                    </v-col>
-                  </v-row>
-                </v-card-text>
-              </v-card>
-            </div>
+          <v-alert type="warning" variant="tonal" density="compact" class="mb-4">
+            Games cannot be changed after they are saved.
+          </v-alert>
+          <v-form v-model="gamesValid">
+            <v-row v-for="(game, index) in newGames" :key="index" dense align="center">
+              <v-col cols="1" class="text-medium-emphasis">{{ index + 1 }}.</v-col>
+              <v-col cols="5"><v-text-field v-model="game.homeTeam" label="Home team" density="compact" :rules="[required]" /></v-col>
+              <v-col cols="1" class="text-center">vs</v-col>
+              <v-col cols="5"><v-text-field v-model="game.awayTeam" label="Away team" density="compact" :rules="[required]" /></v-col>
+            </v-row>
           </v-form>
         </v-card-text>
-        
         <v-card-actions>
-          <v-spacer></v-spacer>
-          <v-btn color="grey" text @click="showAddGamesDialog = false">
-            Cancel
-          </v-btn>
-          <v-btn
-            color="primary"
-            :disabled="!gamesFormValid"
-            :loading="addingGames"
-            @click="submitGames"
-          >
-            Add Games
-          </v-btn>
+          <v-spacer />
+          <v-btn @click="gamesDialog = false">Cancel</v-btn>
+          <v-btn color="primary" variant="flat" :disabled="!gamesValid" :loading="saving" @click="saveGames">Save games</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
 
-    <!-- Set Outcomes Dialog -->
-    <v-dialog v-model="showSetOutcomesDialog" max-width="800px">
-      <v-card>
-        <v-card-title>
-          <span class="text-h5">Set Event Outcomes</span>
-        </v-card-title>
-        
+    <v-dialog v-model="resultsDialog" max-width="800" scrollable>
+      <v-card :title="`Results for ${selected?.title}`">
         <v-card-text>
-          <div v-for="game in selectedEventGames" :key="game.id" class="mb-4">
-            <v-card outlined>
-              <v-card-text>
-                <div class="text-h6 mb-2">{{ game.homeTeam }} VS {{ game.awayTeam }}</div>
-                <v-radio-group v-model="gameOutcomes[game.id]" row>
-                  <v-radio
-                    label="Home Win"
-                    value="home"
-                    color="primary"
-                  ></v-radio>
-                  <v-radio
-                    label="Draw"
-                    value="draw"
-                    color="warning"
-                  ></v-radio>
-                  <v-radio
-                    label="Away Win"
-                    value="away"
-                    color="success"
-                  ></v-radio>
-                </v-radio-group>
-              </v-card-text>
-            </v-card>
+          <v-alert type="warning" variant="tonal" density="compact" class="mb-4">
+            Results cannot be changed after they are saved.
+          </v-alert>
+          <div v-for="(game, index) in selected?.games" :key="index" class="mb-2">
+            <div class="text-subtitle-1">{{ index + 1 }}. {{ game.homeTeam }} vs {{ game.awayTeam }}</div>
+            <v-radio-group v-model="results[index]" inline hide-details>
+              <v-radio v-for="o in outcomes" :key="o.value" :label="o.label" :value="o.value" />
+            </v-radio-group>
           </div>
         </v-card-text>
-        
         <v-card-actions>
-          <v-spacer></v-spacer>
-          <v-btn color="grey" text @click="showSetOutcomesDialog = false">
-            Cancel
-          </v-btn>
-          <v-btn
-            color="primary"
-            :loading="settingOutcomes"
-            @click="setEventOutcomes"
-          >
-            Set Outcomes
+          <v-spacer />
+          <v-btn @click="resultsDialog = false">Cancel</v-btn>
+          <v-btn color="primary" variant="flat" :disabled="!resultsComplete" :loading="saving" @click="saveResults">
+            Save results
           </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
 
-    <!-- Snackbar -->
-    <v-snackbar
-      v-model="snackbar.show"
-      :color="snackbar.color"
-      :timeout="snackbar.timeout"
-    >
-      {{ snackbar.text }}
-      <template v-slot:action="{ attrs }">
-        <v-btn
-          color="white"
-          text
-          v-bind="attrs"
-          @click="snackbar.show = false"
-        >
-          Close
-        </v-btn>
-      </template>
-    </v-snackbar>
+    <v-dialog :model-value="!!details" max-width="700" scrollable @update:model-value="details = null">
+      <v-card v-if="details" :title="details.title" :subtitle="details.description">
+        <v-card-text>
+          <p><strong>Status:</strong> {{ details.status }}</p>
+          <p><strong>Start (entries close):</strong> {{ formatDate(details.startTime) }}</p>
+          <p><strong>End:</strong> {{ formatDate(details.endTime) }}</p>
+          <p class="mb-4"><strong>Created by:</strong> <code>{{ details.createdBy }}</code></p>
+          <p v-if="details.games.length === 0" class="text-medium-emphasis">No games yet.</p>
+          <v-table v-else density="compact">
+            <thead><tr><th>#</th><th>Home</th><th>Away</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr v-for="(game, index) in details.games" :key="index">
+                <td>{{ index + 1 }}</td>
+                <td>{{ game.homeTeam }}</td>
+                <td>{{ game.awayTeam }}</td>
+                <td>{{ outcomeLabels[game.result] || '—' }}</td>
+              </tr>
+            </tbody>
+          </v-table>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn @click="details = null">Close</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-container>
 </template>
 
-<script>
-export default {
-  name: 'Admin',
-  data() {
-    return {
-      activeTab: 0,
-      loadingEvents: false,
-      creatingEvent: false,
-      addingGames: false,
-      settingOutcomes: false,
-      
-      // Events
-      events: [],
-      eventHeaders: [
-        { text: 'Title', value: 'title' },
-        { text: 'Status', value: 'status' },
-        { text: 'Games', value: 'gameCount' },
-        { text: 'Created', value: 'createdAt' },
-        { text: 'Actions', value: 'actions', sortable: false }
-      ],
-      
-      // Create Event Dialog
-      showCreateEventDialog: false,
-      eventFormValid: false,
-      newEvent: {
-        title: '',
-        description: '',
-        gameCount: 7,
-        startTime: '',
-        endTime: ''
-      },
-      
-      // Add Games Dialog
-      gamesFormValid: false,
-      
-      // Add Games Dialog
-      showAddGamesDialog: false,
-      selectedEvent: null,
-      newGames: [],
-      
-      // Set Outcomes Dialog
-      showSetOutcomesDialog: false,
-      selectedEventGames: [],
-      gameOutcomes: {},
-      
-      // Snackbar
-      snackbar: {
-        show: false,
-        text: '',
-        color: 'success',
-        timeout: 5000
-      }
-    }
-  },
-  
-  async mounted() {
-    await this.verifyAdminStatus()
-    await this.loadEvents()
-  },
-  
-  methods: {
-    // Safe navigation helper
-    safeNavigate(path) {
-      if (this.$route.path !== path) {
-        this.$router.push(path).catch(err => {
-          if (err.name !== 'NavigationDuplicated') {
-            console.error('Navigation error:', err)
-          }
-        })
-      }
-    },
+<script setup>
+import { computed, onMounted, ref } from 'vue'
+import { eventApi } from '@/services/api'
+import { notify, notifyError } from '@/stores/notify'
+import { formatDate, outcomeLabels, outcomes, statusColors } from '@/utils/format'
 
-    async verifyAdminStatus() {
-      try {
-        const { adminService } = await import('@/services/api')
-        const adminStatus = await adminService.checkAdminStatus()
-        
-        if (!adminStatus.isAdmin) {
-          this.safeNavigate('/')
-        }
-      } catch (error) {
-        console.error('Admin verification failed:', error)
-        this.safeNavigate('/')
-      }
-    },
+const headers = [
+  { title: 'Title', key: 'title' },
+  { title: 'Status', key: 'status' },
+  { title: 'Games', key: 'gameCount' },
+  { title: 'Entries close', key: 'startTime' },
+  { title: '', key: 'actions', sortable: false, align: 'end' }
+]
+const required = v => !!v?.trim?.() || 'Required'
 
-    async loadEvents() {
-      this.loadingEvents = true
-      try {
-        const { eventService } = await import('@/services/api')
-        this.events = await eventService.getEvents()
-      } catch (error) {
-        this.showSnackbar('Failed to load events: ' + error.message, 'error')
-      } finally {
-        this.loadingEvents = false
-      }
-    },
+const events = ref([])
+const loading = ref(false)
+const saving = ref(false)
+const selected = ref(null)
+const details = ref(null)
 
-    async createEvent() {
-      this.creatingEvent = true
-      try {
-        const { eventService } = await import('@/services/api')
-        
-        // Convert datetime-local values to ISO strings
-        const eventData = {
-          ...this.newEvent,
-          startTime: new Date(this.newEvent.startTime).toISOString(),
-          endTime: new Date(this.newEvent.endTime).toISOString()
-        }
-        
-        await eventService.createEvent(eventData)
-        
-        this.showSnackbar('Event created successfully!', 'success')
-        this.showCreateEventDialog = false
-        this.resetNewEvent()
-        await this.loadEvents()
-      } catch (error) {
-        this.showSnackbar('Failed to create event: ' + error.message, 'error')
-        console.error('Event creation error:', error)
-      } finally {
-        this.creatingEvent = false
-      }
-    },
+const createDialog = ref(false)
+const createValid = ref(false)
+const newEvent = ref({})
 
-    resetNewEvent() {
-      this.newEvent = {
-        title: '',
-        description: '',
-        gameCount: 7,
-        startTime: '',
-        endTime: ''
-      }
-    },
+const gamesDialog = ref(false)
+const gamesValid = ref(false)
+const newGames = ref([])
 
-    addGamesToEvent(event) {
-      this.selectedEvent = event
-      this.newGames = []
-      
-      // Initialize games array based on event game count
-      for (let i = 0; i < event.gameCount; i++) {
-        this.newGames.push({
-          homeTeam: '',
-          awayTeam: ''
-        })
-      }
-      
-      this.showAddGamesDialog = true
-    },
+const resultsDialog = ref(false)
+const results = ref([])
+const resultsComplete = computed(() =>
+  selected.value && results.value.filter(Boolean).length === selected.value.games.length)
 
-    async submitGames() {
-      // Validate form first
-      if (!this.gamesFormValid) {
-        this.showSnackbar('Please fill in all required fields', 'error')
-        return
-      }
-      
-      this.addingGames = true
-      try {
-        const { eventService } = await import('@/services/api')
-        
-        // Use the correct ID field (MongoDB uses _id)
-        const eventId = this.selectedEvent._id || this.selectedEvent.id
-        if (!eventId) {
-          throw new Error('Event ID not found')
-        }
-        
-        
-        await eventService.createGames(eventId, this.newGames)
-        
-        this.showSnackbar('Games added successfully!', 'success')
-        this.showAddGamesDialog = false
-        await this.loadEvents()
-      } catch (error) {
-        this.showSnackbar('Failed to add games: ' + error.message, 'error')
-        console.error('Add games error:', error)
-      } finally {
-        this.addingGames = false
-      }
-    },
-
-    async viewEvent(event) {
-      try {
-        const { eventService } = await import('@/services/api')
-        const eventId = event._id || event.id
-        if (!eventId) {
-          throw new Error('Event ID not found')
-        }
-        
-        const eventData = await eventService.getEvent(eventId)
-        
-        // Show event details in a dialog or navigate to event view
-        this.showSnackbar(`Event: ${eventData.event.title}`, 'info')
-      } catch (error) {
-        this.showSnackbar('Failed to load event details: ' + error.message, 'error')
-        console.error('View event error:', error)
-      }
-    },
-
-    async setEventOutcomes(event) {
-      try {
-        const { eventService } = await import('@/services/api')
-        const eventId = event._id || event.id
-        if (!eventId) {
-          throw new Error('Event ID not found')
-        }
-        
-        const eventData = await eventService.getEvent(eventId)
-        
-        this.selectedEvent = event
-        this.selectedEventGames = eventData.games
-        this.gameOutcomes = {}
-        
-        // Initialize outcomes for each game
-        eventData.games.forEach(game => {
-          const gameId = game._id || game.id
-          this.gameOutcomes[gameId] = ''
-        })
-        
-        this.showSetOutcomesDialog = true
-      } catch (error) {
-        this.showSnackbar('Failed to load event games: ' + error.message, 'error')
-        console.error('Set outcomes error:', error)
-      }
-    },
-
-    async setEventOutcomes() {
-      this.settingOutcomes = true
-      try {
-        const { eventService } = await import('@/services/api')
-        
-        // Get the correct event ID
-        const eventId = this.selectedEvent._id || this.selectedEvent.id
-        if (!eventId) {
-          throw new Error('Event ID not found')
-        }
-        
-        // Prepare game outcomes
-        const gameOutcomes = Object.keys(this.gameOutcomes).map(gameId => ({
-          gameId,
-          outcome: this.gameOutcomes[gameId]
-        }))
-        
-        await eventService.setEventOutcomes(eventId, gameOutcomes)
-        
-        this.showSnackbar('Event outcomes set successfully!', 'success')
-        this.showSetOutcomesDialog = false
-        await this.loadEvents()
-      } catch (error) {
-        this.showSnackbar('Failed to set outcomes: ' + error.message, 'error')
-        console.error('Set outcomes error:', error)
-      } finally {
-        this.settingOutcomes = false
-      }
-    },
-
-    getStatusColor(status) {
-      switch (status) {
-        case 'upcoming': return 'blue'
-        case 'active': return 'green'
-        case 'completed': return 'grey'
-        default: return 'grey'
-      }
-    },
-
-    showSnackbar(text, color = 'success') {
-      this.snackbar.text = text
-      this.snackbar.color = color
-      this.snackbar.show = true
-    }
+async function loadEvents () {
+  loading.value = true
+  try {
+    events.value = await eventApi.list()
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    loading.value = false
   }
 }
+
+async function save (action, successMessage, closeDialog) {
+  saving.value = true
+  try {
+    await action()
+    notify(successMessage)
+    closeDialog()
+    await loadEvents()
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    saving.value = false
+  }
+}
+
+function openCreate () {
+  newEvent.value = { title: '', description: '', gameCount: 7, startTime: '', endTime: '' }
+  createDialog.value = true
+}
+
+const createEvent = () => save(
+  () => eventApi.create({
+    ...newEvent.value,
+    startTime: new Date(newEvent.value.startTime).toISOString(),
+    endTime: new Date(newEvent.value.endTime).toISOString()
+  }),
+  'Event created',
+  () => { createDialog.value = false }
+)
+
+function openGames (event) {
+  selected.value = event
+  newGames.value = Array.from({ length: event.gameCount }, () => ({ homeTeam: '', awayTeam: '' }))
+  gamesDialog.value = true
+}
+
+const saveGames = () => save(
+  () => eventApi.setGames(selected.value.id, newGames.value),
+  'Games saved, the event is now open for entries',
+  () => { gamesDialog.value = false }
+)
+
+function openResults (event) {
+  selected.value = event
+  results.value = event.games.map(() => null)
+  resultsDialog.value = true
+}
+
+const saveResults = () => save(
+  () => eventApi.setResults(selected.value.id, results.value),
+  'Results saved',
+  () => { resultsDialog.value = false }
+)
+
+onMounted(loadEvents)
 </script>
