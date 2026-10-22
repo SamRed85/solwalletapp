@@ -12,17 +12,21 @@ import (
 )
 
 type App struct {
-	cfg    Config
-	db     *mongo.Database
-	nonces *nonceStore
+	cfg     Config
+	db      *mongo.Database
+	nonces  *nonceStore
+	limiter rateLimiter
 
 	users    *mongo.Collection
 	events   *mongo.Collection
 	entries  *mongo.Collection
+	payments *mongo.Collection
 	rollover *mongo.Collection
 
-	verifyPayment func(ctx context.Context, signature, payer, treasury string, lamports uint64) error
-	findDrawBlock func(ctx context.Context, t time.Time) (*blockRef, error)
+	verifyPayment         func(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string) error
+	verifyRecoveryPayment func(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string) error
+	verifyRefund          func(ctx context.Context, signature, treasury, recipient string, lamports uint64) error
+	findDrawBlock         func(ctx context.Context, t time.Time) (*blockRef, error)
 }
 
 func main() {
@@ -42,15 +46,18 @@ func main() {
 	db := client.Database(cfg.MongoDB)
 	rpc := newSolanaRPC(cfg.SolanaRPCURL)
 	app := &App{
-		cfg:           cfg,
-		db:            db,
-		nonces:        newNonceStore(),
-		users:         db.Collection("users"),
-		events:        db.Collection("events"),
-		entries:       db.Collection("entries"),
-		rollover:      db.Collection("rollover"),
-		verifyPayment: rpc.verifyPayment,
-		findDrawBlock: rpc.findDrawBlock,
+		cfg:                   cfg,
+		db:                    db,
+		nonces:                newNonceStore(),
+		users:                 db.Collection("users"),
+		events:                db.Collection("events"),
+		entries:               db.Collection("entries"),
+		payments:              db.Collection("payments"),
+		rollover:              db.Collection("rollover"),
+		verifyPayment:         rpc.verifyPayment,
+		verifyRecoveryPayment: rpc.verifyRecoveryPayment,
+		verifyRefund:          rpc.verifyRefund,
+		findDrawBlock:         rpc.findDrawBlock,
 	}
 	if err := app.ensureIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
@@ -73,23 +80,27 @@ func (a *App) routes() *http.ServeMux {
 
 	mux.HandleFunc("GET /health", a.handleHealth)
 	mux.HandleFunc("GET /api/config", a.handleConfig)
-	mux.HandleFunc("POST /api/auth/nonce", a.handleNonce)
-	mux.HandleFunc("POST /api/auth/login", a.handleLogin)
+	mux.HandleFunc("POST /api/auth/nonce", a.limitRequests("auth-nonce", 10, time.Minute, ipRateKey, a.handleNonce))
+	mux.HandleFunc("POST /api/auth/login", a.limitRequests("auth-login", 10, time.Minute, ipRateKey, a.handleLogin))
 
 	mux.HandleFunc("GET /api/me", a.requireAuth(a.handleMe))
 	mux.HandleFunc("PUT /api/me", a.requireAuth(a.handleUpdateMe))
 	mux.HandleFunc("GET /api/events", a.requireAuth(a.handleListEvents))
 	mux.HandleFunc("GET /api/events/{id}", a.requireAuth(a.handleGetEvent))
-	mux.HandleFunc("POST /api/events/{id}/entries", a.requireAuth(a.handleCreateEntry))
+	mux.HandleFunc("POST /api/events/{id}/entries", a.requireAuth(a.limitRequests("entry", 20, time.Minute, walletRateKey, a.handleCreateEntry)))
 	mux.HandleFunc("GET /api/entries", a.requireAuth(a.handleMyEntries))
+	mux.HandleFunc("POST /api/events/{id}/payment-recoveries", a.requireAuth(a.limitRequests("payment-recovery", 5, time.Minute, walletRateKey, a.handleCreatePaymentRecovery)))
 
 	mux.HandleFunc("GET /api/users", a.requireAdmin(a.handleListUsers))
 	mux.HandleFunc("PUT /api/users/{wallet}", a.requireAdmin(a.handleAdminUpdateUser))
 	mux.HandleFunc("DELETE /api/users/{wallet}", a.requireAdmin(a.handleAdminDeleteUser))
 	mux.HandleFunc("POST /api/events", a.requireAdmin(a.handleCreateEvent))
 	mux.HandleFunc("PUT /api/events/{id}/games", a.requireAdmin(a.handleSetGames))
+	mux.HandleFunc("PUT /api/events/{id}/chain", a.requireAdmin(a.handleSetChain))
 	mux.HandleFunc("POST /api/events/{id}/results", a.requireAdmin(a.handleSetResults))
 	mux.HandleFunc("GET /api/events/{id}/payouts", a.requireAdmin(a.handlePayouts))
+	mux.HandleFunc("GET /api/payment-recoveries", a.requireAdmin(a.handleListPaymentRecoveries))
+	mux.HandleFunc("PUT /api/payment-recoveries/{signature}", a.requireAdmin(a.handleRefundPaymentRecovery))
 
 	return mux
 }
@@ -109,6 +120,13 @@ func (a *App) ensureIndexes() error {
 		{Keys: bson.M{"signature": 1}, Options: unique},
 		{Keys: bson.D{{Key: "walletAddress", Value: 1}, {Key: "createdAt", Value: -1}}},
 		{Keys: bson.M{"eventId": 1}},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = a.payments.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.M{"refundSignature": 1},
+		Options: options.Index().SetUnique(true).SetSparse(true),
 	})
 	return err
 }

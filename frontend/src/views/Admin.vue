@@ -23,6 +23,10 @@
             color="success" title="Payouts" @click="openDetails(item)"
           />
           <v-btn
+            v-if="item.status === 'open' && !item.chain" icon="mdi-safe" size="small" variant="text"
+            color="primary" title="Open the on-chain vault" :loading="publishing === item.id" @click="publishVault(item)"
+          />
+          <v-btn
             v-if="item.status === 'draft'" icon="mdi-format-list-numbered" size="small" variant="text"
             color="success" title="Set games" @click="openGames(item)"
           />
@@ -32,6 +36,37 @@
           />
         </template>
       </v-data-table>
+    </v-card>
+
+    <v-card class="mt-4">
+      <v-card-title>Payment recoveries</v-card-title>
+      <v-card-subtitle>Finalized payments that did not become coupons. Refunds are verified on devnet before being marked complete.</v-card-subtitle>
+      <v-card-text>
+        <v-alert v-if="recoveries.length && auth.wallet !== config?.treasuryWallet" type="warning" variant="tonal" class="mb-3">
+          Connect the configured treasury wallet to send these refunds.
+        </v-alert>
+        <p v-if="recoveries.length === 0" class="text-medium-emphasis">No refunds are waiting.</p>
+        <v-table v-else density="compact">
+          <thead><tr><th>Wallet</th><th>Event</th><th>Amount</th><th /></tr></thead>
+          <tbody>
+            <tr v-for="recovery in recoveries" :key="recovery.signature">
+              <td><code>{{ recovery.walletAddress }}</code></td>
+              <td><code>{{ recovery.eventId }}</code></td>
+              <td>{{ formatSol(recovery.lamports) }}</td>
+              <td class="text-right">
+                <v-btn
+                  color="warning" size="small" variant="flat"
+                  :disabled="auth.wallet !== config?.treasuryWallet"
+                  :loading="refunding === recovery.signature"
+                  @click="refundRecovery(recovery)"
+                >
+                  Refund
+                </v-btn>
+              </td>
+            </tr>
+          </tbody>
+        </v-table>
+      </v-card-text>
     </v-card>
 
     <v-dialog v-model="createDialog" max-width="600">
@@ -209,7 +244,9 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { eventApi } from '@/services/api'
+import { eventApi, recoveryApi } from '@/services/api'
+import { PROGRAM_ID, RESULT_COSIGNER, createEventIx, sendProgramTransaction, vaultSchedule } from '@/services/program'
+import { sendPayment, waitForConfirmation } from '@/services/solana'
 import { auth, loadConfig } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { formatDate, formatSol, outcomeLabels, outcomes, statusColors, toLocalInput } from '@/utils/format'
@@ -232,6 +269,9 @@ const selected = ref(null)
 const details = ref(null)
 const payouts = ref(null)
 const config = computed(() => auth.config)
+const recoveries = ref([])
+const refunding = ref(null)
+const publishing = ref(null)
 
 const createDialog = ref(false)
 const createValid = ref(false)
@@ -275,6 +315,57 @@ async function loadEvents () {
     notifyError(error)
   } finally {
     loading.value = false
+  }
+}
+
+async function publishVault (item) {
+  publishing.value = item.id
+  try {
+    const schedule = vaultSchedule(item)
+    const nonce = Date.now()
+    const sent = await sendProgramTransaction(config.value.solanaRpcUrl, auth.wallet, [
+      createEventIx({
+        admin: auth.wallet,
+        other: RESULT_COSIGNER,
+        nonce,
+        ...schedule,
+        gameCount: item.gameCount,
+        price: item.couponPriceLamports,
+        tiers: item.tiers
+      })
+    ])
+    await waitForConfirmation(config.value.solanaRpcUrl, sent.signature, sent.lastValidBlockHeight)
+    await eventApi.setChain(item.id, { programId: PROGRAM_ID, admin: auth.wallet, cosigner: RESULT_COSIGNER, nonce })
+    notify('On-chain vault opened. Entries now pay the program, not the treasury.')
+    await loadEvents()
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    publishing.value = null
+  }
+}
+
+async function loadRecoveries () {
+  try {
+    recoveries.value = await recoveryApi.list()
+  } catch (error) {
+    notifyError(error)
+  }
+}
+
+async function refundRecovery (recovery) {
+  refunding.value = recovery.signature
+  try {
+    const memo = `sol-refund-v1:${recovery.signature}`
+    const sent = await sendPayment(config.value.solanaRpcUrl, auth.wallet, recovery.walletAddress, recovery.lamports, memo)
+    await waitForConfirmation(config.value.solanaRpcUrl, sent.signature, sent.lastValidBlockHeight)
+    await recoveryApi.refund(recovery.signature, sent.signature)
+    notify('Refund finalized and recorded')
+    await loadRecoveries()
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    refunding.value = null
   }
 }
 
@@ -370,6 +461,7 @@ async function openDetails (event) {
 
 onMounted(() => {
   loadEvents()
+  loadRecoveries()
   loadConfig().catch(notifyError)
 })
 </script>

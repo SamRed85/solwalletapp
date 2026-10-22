@@ -148,7 +148,7 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import CouponPicks from '@/components/CouponPicks.vue'
 import { eventApi } from '@/services/api'
-import { payAndEnter } from '@/services/entry'
+import { payAndEnter, placeOnChain } from '@/services/entry'
 import { auth, loadConfig, refreshBalance } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { combinationCount, expandCombinations, systemRows } from '@/utils/coupons'
@@ -162,11 +162,14 @@ const picks = ref([])
 const paying = ref(false)
 const step = ref('sign')
 
-const stepLabels = {
+const stepLabels = computed(() => event.value?.chain ? {
+  sign: 'Approve the entry in Phantom. The program vault holds this payment.',
+  confirm: 'Waiting for the entry to be finalized on devnet...'
+} : {
   sign: 'Approve the payment in Phantom (make sure Phantom is set to Devnet)...',
-  confirm: 'Waiting for the payment to be confirmed on devnet...',
+  confirm: 'Waiting for the payment to be finalized on devnet. This can take about a minute...',
   submit: 'Payment confirmed. Registering your coupons...'
-}
+})
 
 const maxCombinations = computed(() => auth.config?.maxCombinations ?? auth.config?.maxCouponsPerEntry ?? 44000)
 const houseCut = computed(() => auth.config?.houseCutPercent ?? 5)
@@ -235,15 +238,21 @@ async function load () {
 async function pay () {
   paying.value = true
   try {
-    await payAndEnter({
+    const entry = {
       config: auth.config,
       wallet: auth.wallet,
       event: event.value,
       system: systemRows(picks.value),
       combinations: combinationTotal.value,
       onStep: s => { step.value = s }
-    })
-    notify('Coupons placed. Good luck!')
+    }
+    if (event.value.chain) {
+      await placeOnChain(entry)
+      notify('Coupon entered in the program vault.')
+    } else {
+      await payAndEnter(entry)
+      notify('Coupons placed. Good luck!')
+    }
     refreshBalance()
     router.push('/coupons')
   } catch (error) {

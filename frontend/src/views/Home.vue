@@ -68,16 +68,25 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { eventApi } from '@/services/api'
 import { isPhantomInstalled } from '@/services/solana'
 import { auth, login } from '@/stores/auth'
 import { notifyError } from '@/stores/notify'
 import { formatDate, formatSol, statusColors } from '@/utils/format'
 
-const phantomInstalled = isPhantomInstalled()
+const phantomInstalled = ref(isPhantomInstalled())
 const events = ref([])
 const loading = ref(false)
+let phantomTimer
+
+onMounted(() => {
+  phantomTimer = setInterval(() => {
+    phantomInstalled.value = isPhantomInstalled()
+    if (phantomInstalled.value) clearInterval(phantomTimer)
+  }, 250)
+})
+onUnmounted(() => clearInterval(phantomTimer))
 
 async function loadEvents () {
   loading.value = true

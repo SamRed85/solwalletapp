@@ -47,7 +47,8 @@ Frontend: `VITE_API_URL` (default empty, uses the dev proxy) and `BACKEND_URL` f
 
 **Sign-in.** The frontend asks the backend for a one-time nonce, the wallet signs a message containing
 the wallet address and nonce, and the backend verifies the ed25519 signature. It then issues a session
-token (12 hours) that the frontend sends as `Authorization: Bearer <token>`.
+token (12 hours) that the frontend sends as `Authorization: Bearer <token>`. Nonce and login attempts
+are rate-limited per source IP; entry and payment-recovery attempts are rate-limited per wallet.
 
 **Events.** An event moves through `draft` (no games) → `open` (games set, entries allowed until the
 start time) → `closed` (started) → `completed` (results set). Games (each with its own kickoff) and
@@ -57,13 +58,14 @@ special events set their own game count, price and tiers.
 **Entries.** On the event page the user fills one coupon and can select more than one outcome
 per game, up to 44,000 combinations. Every combination is a paid row: selecting 1 and X on one
 game, and one outcome on the rest, makes two rows. The browser sends the selections, and the server
-counts the rows without storing each one. The frontend builds a single System Program transfer of `price × combinations`
-to the treasury (with
-a devnet blockhash, so a wallet left on mainnet rejects it), waits for confirmation and submits the
-signature with the coupons. The backend fetches the transaction from the RPC and accepts it only if it
-is confirmed, succeeded, is less than an hour old, and moved exactly that amount from the user's
-wallet to the treasury. Each signature can be used once. Until the entry is accepted the payment is
-kept in the browser, and My Coupons offers a retry.
+counts the rows without storing each one. The frontend builds a System Program transfer of
+`price × combinations` to the treasury plus a memo containing the event-and-coupon hash. A devnet
+blockhash makes a wallet left on mainnet reject the transaction instead of spending real SOL. The
+backend accepts only a finalized, successful transaction less than an hour old that has the expected
+memo and moved exactly that amount from the user's wallet to the treasury. Each signature can be used
+once. Until the entry is accepted the payment is kept in the browser. My Coupons offers a retry or a
+verified refund request; a refund is recorded only after its treasury transaction is finalized and
+verified.
 
 **Payouts.** When the admin saves the results the event is settled once and the settlement is
 stored. The house keeps 5% of ticket sales. The rest is split into tiers (standard: 50% for 13
@@ -91,11 +93,14 @@ weights are stored with the game so anyone can recompute the draw.
 | PUT | `/api/me` | signed in (set profile name) |
 | GET | `/api/events`, `/api/events/{id}` | signed in |
 | POST | `/api/events/{id}/entries` | signed in |
+| POST | `/api/events/{id}/payment-recoveries` | signed in (own stranded payment) |
 | GET | `/api/entries` | signed in (own entries) |
 | POST | `/api/events` | admin |
 | PUT | `/api/events/{id}/games` | admin |
 | POST | `/api/events/{id}/results` | admin (settles the event) |
 | GET | `/api/events/{id}/payouts` | admin |
+| GET | `/api/payment-recoveries` | admin |
+| PUT | `/api/payment-recoveries/{signature}` | admin (records verified refund) |
 | GET | `/api/users` | admin |
 | PUT | `/api/users/{wallet}` | admin (rename, only with no coupons still in play) |
 | DELETE | `/api/users/{wallet}` | admin (remove, only with no coupons still in play) |
@@ -109,3 +114,7 @@ cd frontend && npm run lint && npm run build
 # Optional: check the cancelled-game block search against real devnet
 SOLANA_LIVE_RPC=https://api.devnet.solana.com go test -run TestFindDrawBlockLive -v
 ```
+
+Before Phase 4, complete [`docs/devnet-acceptance.md`](docs/devnet-acceptance.md). A recorded
+payment can be checked independently with `node scripts/verify-devnet-payment.mjs`; the command
+recomputes its coupon memo and requires a successful finalized devnet transfer.

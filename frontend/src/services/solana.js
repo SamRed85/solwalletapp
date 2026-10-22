@@ -130,38 +130,61 @@ const compactU16 = n => {
   }
 }
 
-// Legacy transaction message with one System Program transfer:
-// header, account keys [payer (signer, writable), recipient (writable), system program], blockhash, instruction.
-export function transferMessage (from, to, lamports, blockhash) {
+const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
+
+// Legacy transaction message with a System Program transfer and a coupon-bound memo.
+// Account keys: payer (signer, writable), recipient (writable), system and memo programs (readonly).
+export function transferMessage (from, to, lamports, blockhash, memo) {
   if (from === to) throw new Error('Sender and recipient must differ')
   const data = new Uint8Array(12)
   const view = new DataView(data.buffer)
   view.setUint32(0, 2, true)
   view.setBigUint64(4, BigInt(lamports), true)
+  const memoData = new TextEncoder().encode(memo)
   return Uint8Array.from([
-    1, 0, 1,
-    ...compactU16(3), ...base58Decode(from, 32), ...base58Decode(to, 32), ...new Uint8Array(32),
+    1, 0, 2,
+    ...compactU16(4), ...base58Decode(from, 32), ...base58Decode(to, 32), ...new Uint8Array(32), ...base58Decode(MEMO_PROGRAM, 32),
     ...base58Decode(blockhash, 32),
-    ...compactU16(1), 2, ...compactU16(2), 0, 1, ...compactU16(data.length), ...data
+    ...compactU16(2),
+    2, ...compactU16(2), 0, 1, ...compactU16(data.length), ...data,
+    3, ...compactU16(0), ...compactU16(memoData.length), ...memoData
   ])
 }
 
 // Phantom deserializes the payload as a complete transaction: a signature count, one
 // 64-byte signature slot, then the message. Sending the message alone makes it treat
 // part of the recipient address as the message version.
-function unsignedTransaction (message) {
+export function phantomTransaction (message) {
   return Uint8Array.from([1, ...new Uint8Array(64), ...message])
+}
+
+export async function latestBlockhash (rpcUrl) {
+  return rpc(rpcUrl, 'getLatestBlockhash', [{ commitment: 'confirmed' }])
+}
+
+export async function getAccount (rpcUrl, address) {
+  const result = await rpc(rpcUrl, 'getAccountInfo', [address, { encoding: 'base64', commitment: 'confirmed' }])
+  if (!result?.value?.data?.[0]) return null
+  const binary = atob(result.value.data[0])
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
+  return out
+}
+
+export async function signAndSendMessage (message) {
+  const { signature } = await requireProvider().request({
+    method: 'signAndSendTransaction',
+    params: { message: base58Encode(phantomTransaction(message)) }
+  })
+  return signature
 }
 
 // Phantom submits the transaction to the network it is set to. The blockhash comes from devnet,
 // so a wallet left on mainnet rejects the transaction instead of spending real SOL.
-export async function sendPayment (rpcUrl, from, to, lamports) {
+export async function sendPayment (rpcUrl, from, to, lamports, memo) {
   const { value } = await rpc(rpcUrl, 'getLatestBlockhash', [{ commitment: 'confirmed' }])
-  const message = transferMessage(from, to, lamports, value.blockhash)
-  const { signature } = await requireProvider().request({
-    method: 'signAndSendTransaction',
-    params: { message: base58Encode(unsignedTransaction(message)) }
-  })
+  const message = transferMessage(from, to, lamports, value.blockhash, memo)
+  const signature = await signAndSendMessage(message)
   return { signature, lastValidBlockHeight: value.lastValidBlockHeight }
 }
 
@@ -170,12 +193,12 @@ export async function waitForConfirmation (rpcUrl, signature, lastValidBlockHeig
     const { value } = await rpc(rpcUrl, 'getSignatureStatuses', [[signature]])
     const status = value[0]
     if (status?.err) throw new Error('The payment failed on chain')
-    if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') return
+    if (status?.confirmationStatus === 'finalized') return
     if (lastValidBlockHeight && await rpc(rpcUrl, 'getBlockHeight', [{ commitment: 'confirmed' }]) > lastValidBlockHeight) {
       const { value: [final] } = await rpc(rpcUrl, 'getSignatureStatuses', [[signature], { searchTransactionHistory: true }])
       if (!final) throw new Error('The payment expired before it was confirmed. No SOL was sent.')
       if (final.err) throw new Error('The payment failed on chain')
-      return
+      if (final.confirmationStatus === 'finalized') return
     }
     await new Promise(resolve => setTimeout(resolve, 1500))
   }

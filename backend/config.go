@@ -18,6 +18,7 @@ type Config struct {
 	TreasuryWallet      string
 	CouponPriceLamports uint64
 	SolanaRPCURL        string
+	ProgramID           string
 }
 
 const defaultWallet = "4tyf8awFN919MwuhDs7AkPN4gY6RJNawSwqisK3dcHdy"
@@ -30,6 +31,7 @@ func loadConfig() Config {
 		AllowedOrigin:  env("ALLOWED_ORIGIN", "http://localhost:3000"),
 		TreasuryWallet: env("TREASURY_WALLET", defaultWallet),
 		SolanaRPCURL:   env("SOLANA_RPC_URL", "https://api.devnet.solana.com"),
+		ProgramID:      env("PROGRAM_ID", "35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca"),
 		AdminWallets:   map[string]bool{},
 	}
 

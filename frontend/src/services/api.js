@@ -56,6 +56,7 @@ export const eventApi = {
   get: id => data(api.get(`/api/events/${id}`)),
   create: event => data(api.post('/api/events', event)),
   setGames: (id, games) => data(api.put(`/api/events/${id}/games`, { games })),
+  setChain: (id, chain) => data(api.put(`/api/events/${id}/chain`, chain)),
   // Drawing cancelled games searches devnet blocks, which can take a while on the public RPC.
   setResults: (id, results) => data(api.post(`/api/events/${id}/results`, { results }, { timeout: 150000 })),
   payouts: id => data(api.get(`/api/events/${id}/payouts`))
@@ -63,5 +64,11 @@ export const eventApi = {
 
 export const entryApi = {
   create: (eventId, system, signature) => data(api.post(`/api/events/${eventId}/entries`, { system, signature })),
+  recover: (eventId, system, signature) => data(api.post(`/api/events/${eventId}/payment-recoveries`, { system, signature })),
   mine: () => data(api.get('/api/entries'))
+}
+
+export const recoveryApi = {
+  list: () => data(api.get('/api/payment-recoveries')),
+  refund: (signature, refundSignature) => data(api.put(`/api/payment-recoveries/${signature}`, { refundSignature }))
 }

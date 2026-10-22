@@ -12,7 +12,7 @@ todos:
       - phase0_consolidate
   - id: phase1_product_decisions
     content: "Phase 1: Decide payout economics, coupon price, deadlines, cancellation rules, fees"
-    status: in_progress
+    status: completed
     dependencies:
       - phase0_consolidate
   - id: phase1_session_auth
@@ -22,34 +22,49 @@ todos:
       - phase0_consolidate
   - id: phase2_spec
     content: "Phase 2: Write the rules spec (coupon format, lifecycle, deadline, payout formula, refunds, roles)"
-    status: pending
+    status: completed
     dependencies:
       - phase1_product_decisions
   - id: phase3_payment_verification
     content: "Phase 3: Real RPC payment verification (finalized, sender, recipient, amount, memo, no reuse)"
-    status: in_progress
+    status: completed
     dependencies:
       - phase2_spec
   - id: phase4_program_v1
     content: "Phase 4: Anchor program v1 with program-owned vault, deadline enforcement, claim, refund, no admin withdraw"
-    status: pending
+    status: completed
     dependencies:
       - phase3_payment_verification
   - id: phase5_trust_minimization
     content: "Phase 5: Oracle/multisig outcomes, upgrade multisig + timelock, limited pause, solvency, verifiable builds"
-    status: pending
+    status: completed
     dependencies:
       - phase4_program_v1
-  - id: phase6_scale_cost
-    content: "Phase 6: Apply the ultra-low cost plan (logs + indexer, Merkle claims with challenge window, batching)"
+  - id: phase6_single_money_path
+    content: "Phase 6: One money path per event (block treasury entries on vault events, verify the vault on-chain, admin lifecycle UI, coupon backup)"
     status: pending
     dependencies:
       - phase5_trust_minimization
-  - id: phase7_audit_mainnet
-    content: "Phase 7: Tests, fuzzing, external audit, bug bounty, capped mainnet launch"
+  - id: phase7_rules_parity
+    content: "Phase 7: Program and spec parity (void games, end time, unrevealed coupons, house share, production upgrade delay, capacity limits)"
     status: pending
     dependencies:
-      - phase6_scale_cost
+      - phase6_single_money_path
+  - id: phase8_operational_hardening
+    content: "Phase 8: Operational hardening (refund memo, shared limiter and nonces, atomic settlement, sessions, RPC, tests, full devnet runs)"
+    status: pending
+    dependencies:
+      - phase7_rules_parity
+  - id: phase9_scale_cost
+    content: "Phase 9: Apply the ultra-low cost plan (logs + indexer, Merkle claims with challenge window, batching)"
+    status: pending
+    dependencies:
+      - phase8_operational_hardening
+  - id: phase10_audit_mainnet
+    content: "Phase 10: Tests, fuzzing, external audit, bug bounty, capped mainnet launch"
+    status: pending
+    dependencies:
+      - phase9_scale_cost
 ---
 
 # Master Plan: Product First, Then Strict Safety
@@ -61,12 +76,12 @@ get the product right on test money first, then make it safe, then make it cheap
 
 ## Ground Rules (apply from day one)
 
-1. **Devnet only until Phase 7.** No real SOL is accepted before the audit. This is what
+1. **Devnet only until Phase 10.** No real SOL is accepted before the audit. This is what
    makes it acceptable to build the product before the safety work.
 2. **MongoDB never decides money.** It may store and display data. Balances, payments and
    payouts move to the chain over time; the database becomes a cache, not the source of truth.
 3. **Write every rule down when you decide it.** These notes become the program spec
-   (Phase 2) and the document an auditor reviews (Phase 7).
+   (Phase 2) and the document an auditor reviews (Phase 10).
 
 ## Current State (after the Phase 0 cleanup, Oct 2026)
 
@@ -131,12 +146,13 @@ Each caveat names the phase that resolves it.
 ### Payments (Phase 3)
 
 - **Not bound to coupon content.** No memo is required, so any matching transfer to the
-  treasury in the last hour can be used, once, for any coupons.
-- **`confirmed`, not `finalized`.** There is a small risk that a payment is rolled back after being accepted.
-- **Not tested with a live successful payment.** The devnet faucet was dry again in Phase 1, so
-  only rejections were tested live. The transfer encoding was checked with a devnet simulation,
-  and acceptance is covered by unit tests. Phantom's `signAndSendTransaction` request has not been
-  run yet. Run one real payment from Phantom through the coupon UI.
+  treasury in the last hour can be used, once, for any coupons. **Resolved:** payments now carry
+  a deterministic `sol-entry-v1` coupon hash memo.
+- **`confirmed`, not `finalized`.** **Resolved:** both entry and refund verification require finality.
+- **Live memo payment verified.** On 22 Oct 2026 Phantom wallet
+  `BvrkaYfUofi7bbuKqzs79xqp7V6v4h9CosiMKKjvUrQ4` paid 1,000,000 lamports for Test1. Finalized
+  devnet transaction `538dMDW3DuWQdccszpKMfSAy3q3cCHtky5AJzW5aK7Vgy28f1qd9mM8oPwg5sVGDTjtGgQmgKEYJWXmAUeVGJKjj`
+  (slot 513908456) contains the expected `sol-entry-v1` memo, and the backend accepted the entry.
 - **Public devnet RPC rate limits** (HTTP 429 seen in testing) can make verification and
   the balance display fail. Use a dedicated RPC endpoint.
 
@@ -146,13 +162,15 @@ Each caveat names the phase that resolves it.
 - **Admin is fully trusted.** One admin key creates events and sets results, and
   admin rights come from an env var.
 
-### Sessions and infrastructure (before any public deployment)
+### Sessions and infrastructure (Phase 8)
 
 - **Tokens cannot be revoked.** Logout only clears the browser. A stolen token works until
   it expires (12 hours). Tokens are kept in `localStorage`, which XSS can read.
 - **Single instance.** Sign-in nonces are held in memory. Without `SESSION_SECRET`, every
   restart signs everyone out.
-- **No rate limiting** on sign-in or entry endpoints.
+- **Rate limiting is now enabled** in memory: sign-in attempts are bounded per source IP, while
+  entries and payment-recovery requests are bounded per authenticated wallet. A shared limiter is
+  still required before running multiple backend instances.
 - **No database auth.** MongoDB has no authentication (it is now bound to localhost only).
   The optional Mongo Express UI uses default credentials.
 - **No production setup.** No HTTPS, no deployment config, no frontend tests. Backend tests
@@ -175,8 +193,9 @@ Each caveat names the phase that resolves it.
 - [x] Admin enters results; cancelled games are drawn; the event is settled once.
 - [x] Payouts are calculated and shown (event page, admin payout list per wallet).
 - [x] User sees their coupons, results and winnings in My Coupons (`views/MyCoupons.vue`).
-- [ ] Run a full event on devnet with several Phantom wallets (blocked so far: the devnet faucet was
-      dry, so no real payment has gone through the coupon UI yet).
+- [ ] Run a full event on devnet with several Phantom wallets. `Test2` completed the loop with one
+      wallet. `Test1` now has finalized entries from three wallets, including one post-memo payment,
+      but it starts on 31 Oct 2026 and cannot be resolved before then.
 
 ### Product decisions (the on-chain program will hard-code these later)
 
@@ -208,7 +227,8 @@ Decided Oct 2026. Code: `backend/payouts.go`.
       is used. The owner can change it later on the profile page. The wallet address cannot be changed.
       An admin can rename or remove another user only when that user has no coupons on an event whose
       results are not set yet. Removing a user does not delete finished coupons.
-- [ ] Unclaimed prize policy (expiry, rollover). Not decided; becomes relevant with `claim` in Phase 4.
+- [x] **Unclaimed prizes do not expire.** Awarded funds remain reserved and claimable indefinitely;
+      they are never redirected or rolled over.
 
 ### Cheap safety fix worth doing now
 
@@ -225,13 +245,15 @@ Decided Oct 2026. Code: `backend/payouts.go`.
 
 The spec defines:
 
-- [ ] Coupon format (e.g. the `1`/`X`/`2` string, one character per game) and cost.
-- [ ] Event lifecycle: `created -> open -> closed -> resolved | cancelled`, and who may
+- [x] Coupon format (the `1`/`X`/`2` string, one character per game) and cost.
+- [x] Event lifecycle: `created -> open -> closed -> resolved | cancelled`, and who may
       trigger each transition.
-- [ ] Deadline rule, based on chain time.
-- [ ] Payout formula, including rounding and how the pool is split.
-- [ ] Refund rules for cancelled events and voided games.
-- [ ] Roles and permissions (admin, result signer, user) and what each can never do.
+- [x] Deadline rule, based on chain time.
+- [x] Payout formula, including rounding and how the pool is split.
+- [x] Refund rules for cancelled events and voided games.
+- [x] Roles and permissions (admin, result signer, user) and what each can never do.
+
+Normative document: [`docs/rules-spec.md`](../../docs/rules-spec.md).
 
 **Done when:** someone else can compute every payout for an event by hand using only the spec.
 
@@ -243,13 +265,17 @@ The spec defines:
 
 The stub was replaced in Phase 0 (`backend/solana.go`). Remaining items:
 
-- [ ] Require `finalized` commitment (currently `confirmed`).
+- [x] Require `finalized` commitment.
 - [x] Check sender = authenticated wallet, recipient = treasury, exact amount.
-- [ ] Require a memo containing the coupon hash so a payment is bound to its coupons.
+- [x] Require a memo containing the coupon hash so a payment is bound to its coupons.
 - [x] Store used signatures with a unique index; reject reuse.
 - [x] Remove the `mock_tx_` / `real_tx_` shortcuts.
-- [ ] Refund or recovery path for payments whose entry was rejected.
-- [ ] Verify one real end-to-end payment from Phantom on devnet.
+- [x] Refund or recovery path for payments whose entry was rejected: users submit the finalized
+      payment to a recovery queue; the admin UI sends a treasury refund and the backend verifies
+      the finalized refund before recording it.
+- [x] Verify one real end-to-end payment from Phantom on devnet. Signature
+      `538dMDW3DuWQdccszpKMfSAy3q3cCHtky5AJzW5aK7Vgy28f1qd9mM8oPwg5sVGDTjtGgQmgKEYJWXmAUeVGJKjj`
+      was finalized, coupon-bound, and accepted.
 
 **Done when:** made-up, mismatched and replayed transaction hashes are all rejected.
 
@@ -260,15 +286,37 @@ The stub was replaced in Phase 0 (`backend/solana.go`). Remaining items:
 **Goal:** the program, not the backend, holds the money and enforces the rules.
 Keep it deliberately simple.
 
+Source is in `programs/predictions`. Payout math matches the rules spec and passes 7 host
+tests. The instructions below ran on an in-process Solana validator
+(`solana-program-test` 2.3, `cargo test --test lifecycle`: 8 passed, 0 failed). The app targets program `35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca` (devnet-testing build, deploy signature `4f25PffjvxYfxdbmbjWGWg4mUkscG6CbLKkmkTGUb7gS28d6frfZsnAq6pQ22gbdutfokMLFL68szTTj1FK198PA`, finalized). The deployer pubkey is
+`955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun`; the keypairs are gitignored under
+`programs/predictions/keys/`. Devnet is `4.4.0-beta.1`. The program account is executable. An event can
+hold at most 30 coupons in this version so resolution fits in one transaction. Rollover can
+only be forwarded to the earliest event that has not started. If none exists, `park_rollover`
+holds it for the next event created. A cancelled event keeps incoming rollover reserved for
+that same reassignment. The deployable binary `programs/predictions/target/deploy/predictions.so`
+was rebuilt from this source with Agave 4.3.2. Its sha256 is in `programs/predictions/build-hash.txt`.
+That same binary was loaded into a local Agave 4.3.2 validator and `examples/local_loop.rs`
+placed a coupon, rejected a late entry, resolved it with two signers, rejected a stranger's
+claim, and paid the owner from the vault. The settled prize was 950,000 lamports. The vault
+was left with its rent reserve plus the 50,000 lamport house share, and a second claim was
+rejected. `frontend/scripts/program-loop.mjs` repeated that result with the wallet transaction
+format in `frontend/src/services/program.js`. The event page, My Coupons, and the admin event
+list can sign those same transactions in Phantom once an event has a `chain` record. Until an
+admin opens that vault, entries still pay the treasury.
+
 ### Instructions
 
-- [ ] `create_event` - creates the event account and its vault (program-derived addresses).
-- [ ] `place_coupon` - transfers SOL into the vault and records the coupon. Rejected after
+- [x] `create_event` - creates the event account and its vault (program-derived addresses).
+- [x] `place_coupon` - transfers SOL into the vault and records the coupon. Rejected after
       the deadline (uses the Solana clock).
-- [ ] `resolve_event` - sets the outcomes. The admin is still trusted for results here.
-- [ ] `claim` - computes the payout from the stored coupon and pays it exactly once.
-- [ ] `cancel_event` / `refund` - refund path for cancelled events.
-- [ ] **No instruction lets the admin withdraw from a vault.**
+- [x] `resolve_event` - sets the outcomes. The admin is still trusted for results here.
+      Resolution without every coupon account is rejected.
+- [x] `claim` - computes the payout from the stored coupon and pays it exactly once.
+      A second claim fails, and the vault keeps the rent reserve plus the house share.
+- [x] `cancel_event` / `refund` - refund path for cancelled events. The vault returns to its
+      rent reserve.
+- [x] **No instruction lets the admin withdraw from a vault.**
 
 ### Notes
 
@@ -286,15 +334,30 @@ Keep it deliberately simple.
 
 **Goal:** no single key can change results, take funds, or silently replace the code.
 
-- [ ] **Outcomes:** oracle, or M-of-N multisig of independent result signers, instead of one key.
-- [ ] **Upgrade authority:** multisig plus timelock; eventually consider making the program immutable.
-- [ ] **Pause:** may only stop new coupons. It must never block claims or refunds.
-- [ ] **Permissionless refund:** if an event is not resolved within a set time, anyone can
-      trigger refunds.
-- [ ] **Front-running:** add commit-reveal if picks are visible and copyable before the deadline.
-- [ ] **Solvency:** the vault always covers the maximum possible payout under the payout model.
-- [ ] **Replay protection:** each claim is bound to event, wallet and coupon, and can succeed once.
-- [ ] **Verifiable builds:** prove the deployed program matches the published source.
+- [x] **Outcomes:** resolution and cancellation require at least two distinct result signers.
+      One signer is rejected. Tested in `one_signer_cannot_resolve_and_pause_spares_claims`.
+- [x] **Upgrade authority:** two council signers must schedule an upgrade. Production builds
+      wait one day; the devnet-testing build waits five minutes and exposes an explicit
+      test-only override that requires every council member. The local test reaches the
+      upgrade loader only after the delay or that unanimous override. Only the
+      deployer key can create the council. A local validator run rejected a stranger, created the
+      council once, and rejected a second create. The signers are the deployer and
+      `4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH` (gitignored `keys/council-signer.json`).
+      On devnet the loader authority is council `9ad7bFZNUVuvGkM2ZbepzK6wADV4LaWpW2weQPxXSWD2`.
+      Its threshold is 2 and its signers are the deployer and
+      `4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH`.
+- [x] **Pause:** may only stop new coupons. A paused event still pays a claim.
+- [x] **Permissionless refund:** after `resolve_timeout`, any caller can expire the event and the
+      player can refund. Before the timeout that call is rejected.
+- [x] **Front-running:** a coupon stores a commitment at entry. Picks are recorded only in a
+      later reveal, and only the committed picks score.
+- [x] **Solvency:** resolution rejects a vault that cannot cover prizes, house, and rollover.
+- [x] **Replay protection:** a claim is bound to its coupon owner, pays once, and a second wallet
+      cannot redirect it.
+- [x] **Verifiable builds:** `scripts/verify-program-binary.sh` compared `target/deploy/predictions.so`
+      and `solana program dump` of the devnet program. Both hashes are
+      `9a2de6c257a270b8f834ef0efc07dfcc55be9debb7d1026bb83654c0b2e5b456`, the same value as
+      `build-hash.txt`.
 
 ### Invariants an auditor should be able to confirm
 
@@ -312,7 +375,79 @@ Keep it deliberately simple.
 
 ---
 
-## Phase 6: Scale and Reduce Cost
+## Phase 6: One Money Path per Event
+
+**Goal:** every event has exactly one place where its money lives, and a vault event can be run
+from creation to payout in the app.
+
+- [ ] **Block treasury entries on vault events.** `POST /api/events/{id}/entries` (and payment
+      recovery for new payments) must reject events that have a `chain` record. Today only the
+      frontend switches to `place_coupon`, so the API still accepts treasury payments for a vault event.
+- [ ] **Verify the vault on-chain before saving it.** `PUT /api/events/{id}/chain` must read the
+      event account from the configured program and check admin, signers, nonce, price, game count,
+      tiers and deadlines against the MongoDB event.
+- [ ] **Do not settle vault events in MongoDB.** Results for a vault event come from `resolve_event`;
+      MongoDB only mirrors the on-chain outcome and payouts.
+- [ ] **Admin lifecycle UI:** resolve (with real results and both result signers), cancel, expire,
+      pause and unpause, forward and park rollover. Replace the hardcoded results in `resolveEventIx`.
+- [ ] **My Coupons follows chain state:** show Reveal only during the reveal window, Claim only
+      after `Resolved`, Refund after `Cancelled`, and read revealed/claimed state from the coupon
+      account instead of `localStorage`.
+- [ ] **Coupon backup and recovery.** The reveal nonce is only in the browser. Add a way to
+      export/import it (or derive it from a wallet signature) and to rediscover a wallet's coupon
+      accounts on-chain, so a cleared browser or a new device does not forfeit the stake.
+
+**Done when:** a vault event is created, entered from several wallets, revealed, resolved, claimed or
+refunded, and its rollover forwarded, all from the UI, and the API rejects treasury payments for it.
+
+---
+
+## Phase 7: Program and Spec Parity
+
+**Goal:** the program, the backend and `docs/rules-spec.md` describe the same game.
+
+- [ ] **Cancelled single games.** MongoDB draws a weighted outcome for a game marked `C`; the
+      program has no draw. Implement the draw on-chain or change the spec for vault events.
+- [ ] **End time.** The program stores `end_time` but never reads it after `create_event`.
+      Enforce it (for example as the earliest resolution time) or remove it.
+- [ ] **Unrevealed coupons.** Their stake stays in the pool but can never win. Decide the rule
+      (forfeit, refund, or count as no picks) and write it into the spec and the program.
+- [ ] **House share.** The 5% stays in each vault forever. Decide whether it stays locked or a
+      restricted, delayed withdrawal of only the settled house amount is added.
+- [ ] **Production upgrade delay.** The deployed devnet-testing build has a five-minute delay and a
+      unanimous override. Deploy the 24-hour build without the override before any public test.
+- [ ] **Capacity limits.** 30 coupons per event and 16 scheduled events per admin. Either raise
+      them (batched resolution) or enforce and show them in the backend and UI.
+
+**Done when:** every rule in the spec is enforced by the program or explicitly marked off-chain,
+and the program tests cover each decision above.
+
+---
+
+## Phase 8: Operational Hardening
+
+**Goal:** the app survives restarts, multiple instances and ordinary failures before cost work starts.
+
+- [ ] **Refund memo.** The backend must require the `sol-refund-v1:<payment signature>` memo when
+      recording a treasury refund.
+- [ ] **Shared state.** Move rate limits and sign-in nonces out of process memory so several backend
+      instances can run.
+- [ ] **Atomic settlement.** Run MongoDB as a replica set and save results, settlement and rollover
+      in one transaction.
+- [ ] **Sessions.** Revocable sessions and a token store that XSS cannot read.
+- [ ] **RPC.** A dedicated devnet RPC endpoint instead of the public, rate-limited one.
+- [ ] **Tests.** Frontend tests, HTTP tests for the payment and recovery handlers, and an automated
+      multi-wallet run for both the treasury and the vault flow.
+- [ ] **Full devnet runs.** Settle `Test1` (starts 31 Oct 2026) with several wallets, and repeat the
+      Phase 6 vault run.
+- [ ] **Source control.** Commit `programs/predictions` and `frontend/src/services/program.js`.
+
+**Done when:** both flows pass repeated multi-wallet runs, and a backend restart or a second
+instance does not lose sessions, limits, or settlement data.
+
+---
+
+## Phase 9: Scale and Reduce Cost
 
 **Goal:** apply the ultra-low cost plan once volume justifies it.
 
@@ -330,7 +465,7 @@ Every change here adds trust assumptions. Re-check each one against the Phase 5 
 
 ---
 
-## Phase 7: Audit and Mainnet
+## Phase 10: Audit and Mainnet
 
 - [ ] Internal review against the spec and invariants.
 - [ ] Fuzz tests on `place_coupon`, `claim` and `refund`.
@@ -350,9 +485,12 @@ Every change here adds trust assumptions. Re-check each one against the Phase 5 
 | 3 | Fake payments on devnet hide real bugs |
 | 4 | The admin can take the funds |
 | 5 | The admin can rig results or swap the code |
-| 6 | Only costly at high volume, so it can wait |
-| 7 | Real users lose real money |
+| 6 | One event's money is split between the treasury and a vault, and vault events cannot finish |
+| 7 | The program and the spec disagree, so payouts cannot be checked against the rules |
+| 8 | Restarts, failures or a second instance lose data or let abuse through |
+| 9 | Only costly at high volume, so it can wait |
+| 10 | Real users lose real money |
 
-**Next step:** finish Phase 1 by running a full event on devnet with several Phantom wallets
-(fund them at https://faucet.solana.com). Then decide the unclaimed prize policy and start the
-Phase 2 spec from the decisions above.
+**Next step:** Phase 6. Program `35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca` is live on devnet. Its upgrade authority is
+council `9ad7bFZNUVuvGkM2ZbepzK6wADV4LaWpW2weQPxXSWD2` (2 of 2, five-minute delay, unanimous override).
+The cost work (Phase 9) waits until Phases 6 to 8 are done.

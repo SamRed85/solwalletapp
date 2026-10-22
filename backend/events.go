@@ -56,6 +56,15 @@ type Event struct {
 	Settlement          *Settlement   `json:"settlement,omitempty" bson:"settlement,omitempty"`
 	Status              string        `json:"status" bson:"-"`
 	CouponsSold         int           `json:"couponsSold" bson:"-"`
+	Chain               *ChainVault   `json:"chain,omitempty" bson:"chain,omitempty"`
+}
+
+// ChainVault is the on-chain event created by the admin wallet. The program holds the funds.
+type ChainVault struct {
+	ProgramID string `json:"programId" bson:"programId"`
+	Admin     string `json:"admin" bson:"admin"`
+	Cosigner  string `json:"cosigner" bson:"cosigner"`
+	Nonce     uint64 `json:"nonce" bson:"nonce"`
 }
 
 func (e *Event) results() string {
@@ -81,6 +90,9 @@ func (a *App) prepare(e *Event, now time.Time) {
 		if e.Games[i].Kickoff.IsZero() {
 			e.Games[i].Kickoff = e.StartTime
 		}
+	}
+	if e.Chain != nil && e.Chain.ProgramID != a.cfg.ProgramID {
+		e.Chain = nil
 	}
 }
 
@@ -334,6 +346,58 @@ func (a *App) handleSetGames(w http.ResponseWriter, r *http.Request) {
 	}
 	if res.MatchedCount == 0 {
 		writeError(w, http.StatusConflict, "games can only be set once, before the event starts")
+		return
+	}
+	a.handleGetEvent(w, r)
+}
+
+func solanaPubkey(s string) bool {
+	raw, err := base58Decode(s)
+	return err == nil && len(raw) == 32
+}
+
+func validateChainVault(vault ChainVault, games int, start, now time.Time) string {
+	if games == 0 {
+		return "set the games before opening the on-chain vault"
+	}
+	if !start.After(now) {
+		return "the on-chain vault can only be opened before entries close"
+	}
+	if !solanaPubkey(vault.Admin) || !solanaPubkey(vault.Cosigner) || vault.Admin == vault.Cosigner {
+		return "the event needs two different Solana result signers"
+	}
+	return ""
+}
+
+func (a *App) handleSetChain(w http.ResponseWriter, r *http.Request) {
+	e, ok := a.loadEvent(w, r)
+	if !ok {
+		return
+	}
+	var vault ChainVault
+	if !decodeJSON(w, r, &vault) {
+		return
+	}
+	vault.ProgramID = a.cfg.ProgramID
+	if msg := validateChainVault(vault, len(e.Games), e.StartTime, time.Now()); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	res, err := a.events.UpdateOne(ctx,
+		bson.M{"_id": e.ID, "startTime": bson.M{"$gt": time.Now()}, "$or": bson.A{
+			bson.M{"chain": bson.M{"$exists": false}},
+			bson.M{"chain.programId": bson.M{"$ne": a.cfg.ProgramID}},
+		}},
+		bson.M{"$set": bson.M{"chain": vault}},
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save the on-chain vault")
+		return
+	}
+	if res.MatchedCount == 0 {
+		writeError(w, http.StatusConflict, "this event already has an on-chain vault or entries have closed")
 		return
 	}
 	a.handleGetEvent(w, r)

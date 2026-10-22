@@ -1,0 +1,32 @@
+[package]
+name = "predictions"
+version = "0.1.0"
+edition = "2021"
+description = "Devnet prediction vault. The program holds entry funds and pays claims or refunds."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "predictions"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+devnet-testing = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+
+[dev-dependencies]
+bincode = "1"
+serde_json = "1"
+solana-program-error = "2.2.2"
+solana-program-test = "2.3"
+solana-sdk = "2.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+overflow-checks = true

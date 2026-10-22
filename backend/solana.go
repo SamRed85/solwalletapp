@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -20,18 +22,21 @@ type rpcTransaction struct {
 	Transaction struct {
 		Message struct {
 			Instructions []struct {
-				Program string `json:"program"`
-				Parsed  *struct {
-					Type string `json:"type"`
-					Info struct {
-						Source      string `json:"source"`
-						Destination string `json:"destination"`
-						Lamports    uint64 `json:"lamports"`
-					} `json:"info"`
-				} `json:"parsed"`
+				Program   string          `json:"program"`
+				ProgramID string          `json:"programId"`
+				Parsed    json.RawMessage `json:"parsed"`
 			} `json:"instructions"`
 		} `json:"message"`
 	} `json:"transaction"`
+}
+
+type parsedTransfer struct {
+	Type string `json:"type"`
+	Info struct {
+		Source      string `json:"source"`
+		Destination string `json:"destination"`
+		Lamports    uint64 `json:"lamports"`
+	} `json:"info"`
 }
 
 type solanaRPC struct {
@@ -97,7 +102,7 @@ func (s *solanaRPC) getTransaction(ctx context.Context, signature string) (*rpcT
 	var tx *rpcTransaction
 	err := s.call(ctx, "getTransaction", []any{signature, map[string]any{
 		"encoding":                       "jsonParsed",
-		"commitment":                     "confirmed",
+		"commitment":                     "finalized",
 		"maxSupportedTransactionVersion": 0,
 	}}, &tx)
 	return tx, err
@@ -207,9 +212,27 @@ func (s *solanaRPC) findDrawBlock(ctx context.Context, t time.Time) (*blockRef, 
 	return &blockRef{Slot: hi, Blockhash: block.Blockhash, Time: time.Unix(*block.BlockTime, 0).UTC()}, nil
 }
 
-// verifyPayment checks that a confirmed transaction moved exactly the expected lamports
-// from the payer to the treasury. Reuse of a signature is prevented by a unique index.
-func (s *solanaRPC) verifyPayment(ctx context.Context, signature, payer, treasury string, lamports uint64) error {
+func paymentMemo(eventID string, system []string) string {
+	canonical := eventID + "\n" + strings.Join(system, ",")
+	sum := sha256.Sum256([]byte(canonical))
+	return fmt.Sprintf("sol-entry-v1:%x", sum)
+}
+
+// verifyPayment checks that a finalized transaction moved exactly the expected lamports
+// and carries the coupon-bound memo. Reuse of a signature is prevented by a unique index.
+func (s *solanaRPC) verifyPayment(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string) error {
+	return s.verifyPaymentWithAge(ctx, signature, payer, treasury, lamports, memo, maxPaymentAge)
+}
+
+func (s *solanaRPC) verifyRecoveryPayment(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string) error {
+	return s.verifyPaymentWithAge(ctx, signature, payer, treasury, lamports, memo, 0)
+}
+
+func (s *solanaRPC) verifyRefund(ctx context.Context, signature, treasury, recipient string, lamports uint64) error {
+	return s.verifyPaymentWithAge(ctx, signature, treasury, recipient, lamports, "", 0)
+}
+
+func (s *solanaRPC) verifyPaymentWithAge(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string, maxAge time.Duration) error {
 	raw, err := base58Decode(signature)
 	if err != nil || len(raw) != 64 {
 		return errors.New("invalid transaction signature")
@@ -218,30 +241,52 @@ func (s *solanaRPC) verifyPayment(ctx context.Context, signature, payer, treasur
 	if err != nil {
 		return err
 	}
-	return checkPayment(tx, payer, treasury, lamports, time.Now())
+	return checkPaymentWithAge(tx, payer, treasury, lamports, memo, time.Now(), maxAge)
 }
 
-func checkPayment(tx *rpcTransaction, payer, treasury string, lamports uint64, now time.Time) error {
+func checkPayment(tx *rpcTransaction, payer, treasury string, lamports uint64, memo string, now time.Time) error {
+	return checkPaymentWithAge(tx, payer, treasury, lamports, memo, now, maxPaymentAge)
+}
+
+func checkPaymentWithAge(tx *rpcTransaction, payer, treasury string, lamports uint64, memo string, now time.Time, maxAge time.Duration) error {
 	if tx == nil {
-		return errors.New("transaction not found or not confirmed yet")
+		return errors.New("transaction not found or not finalized yet")
 	}
 	if tx.Meta == nil || tx.Meta.Err != nil {
 		return errors.New("transaction failed on chain")
 	}
-	if tx.BlockTime == nil || now.Sub(time.Unix(*tx.BlockTime, 0)) > maxPaymentAge {
-		return errors.New("payment is too old to be used for a new entry")
+	if tx.BlockTime == nil {
+		return errors.New("transaction has no block time")
+	}
+	if maxAge > 0 && now.Sub(time.Unix(*tx.BlockTime, 0)) > maxAge {
+		return errors.New("payment is too old to be used for a new entry; request a recovery instead")
 	}
 	var paid uint64
+	memos := 0
 	for _, ix := range tx.Transaction.Message.Instructions {
-		if ix.Program != "system" || ix.Parsed == nil || ix.Parsed.Type != "transfer" {
+		if ix.Program == "spl-memo" {
+			var value string
+			if json.Unmarshal(ix.Parsed, &value) == nil && value == memo {
+				memos++
+			}
 			continue
 		}
-		if ix.Parsed.Info.Source == payer && ix.Parsed.Info.Destination == treasury {
-			paid += ix.Parsed.Info.Lamports
+		if ix.Program != "system" {
+			continue
+		}
+		var transfer parsedTransfer
+		if json.Unmarshal(ix.Parsed, &transfer) != nil || transfer.Type != "transfer" {
+			continue
+		}
+		if transfer.Info.Source == payer && transfer.Info.Destination == treasury {
+			paid += transfer.Info.Lamports
 		}
 	}
 	if paid != lamports {
 		return fmt.Errorf("payment mismatch: expected %d lamports from your wallet to the treasury, found %d", lamports, paid)
+	}
+	if memo != "" && memos != 1 {
+		return errors.New("payment memo does not match this event and coupon")
 	}
 	return nil
 }

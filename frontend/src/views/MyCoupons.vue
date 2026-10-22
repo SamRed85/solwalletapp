@@ -10,13 +10,13 @@
       but the coupons were not registered.
       <a :href="explorerTx(p.signature)" target="_blank" rel="noopener">View payment</a>
       <div v-if="expired(p)" class="mt-2">
-        This payment is more than an hour old and can no longer be registered automatically.
-        Send the transaction link to the admin for a refund.
+        This payment is more than an hour old and can no longer become an entry. Request a verified refund below.
       </div>
       <template #append>
         <div class="d-flex flex-column ga-2">
           <v-btn v-if="!expired(p)" color="warning" variant="flat" :loading="retrying === p.signature" @click="retry(p)">Retry</v-btn>
-          <v-btn v-else variant="text" size="small" @click="dismiss(p)">Dismiss</v-btn>
+          <v-btn variant="text" size="small" :loading="recovering === p.signature" @click="recover(p)">Request refund</v-btn>
+          <v-btn variant="text" size="small" @click="dismiss(p)">Dismiss</v-btn>
         </div>
       </template>
     </v-alert>
@@ -26,6 +26,23 @@
         <v-icon class="mr-2">mdi-trophy</v-icon>
         Total winnings: {{ formatSol(totalWinnings) }}
         <div class="text-body-2 mt-1">Winnings are paid to your wallet by the admin from the devnet treasury.</div>
+      </v-card-text>
+    </v-card>
+
+    <v-card v-for="coupon in chainCoupons" :key="coupon.signature" class="mb-4" variant="outlined">
+      <v-card-title class="d-flex align-center flex-wrap ga-2">
+        {{ coupon.eventTitle || 'On-chain coupon' }}
+        <v-spacer />
+        <v-chip size="small" variant="flat" color="primary">Vault</v-chip>
+      </v-card-title>
+      <v-card-subtitle>
+        {{ coupon.combinations.toLocaleString() }} combination(s) · paid {{ formatSol(coupon.lamports) }} ·
+        <a :href="explorerTx(coupon.signature)" target="_blank" rel="noopener">entry</a>
+      </v-card-subtitle>
+      <v-card-text class="d-flex flex-wrap ga-2">
+        <v-btn v-if="!coupon.revealed" color="primary" variant="flat" :loading="acting === coupon.signature" @click="reveal(coupon)">Reveal picks</v-btn>
+        <v-btn v-if="coupon.revealed && !coupon.claimed" color="success" variant="flat" :loading="acting === coupon.signature" @click="claim(coupon)">Claim from vault</v-btn>
+        <span v-if="coupon.claimed" class="text-success">Claimed from the vault</span>
       </v-card-text>
     </v-card>
 
@@ -84,8 +101,8 @@
 import { computed, onMounted, ref } from 'vue'
 import CouponPicks from '@/components/CouponPicks.vue'
 import { entryApi } from '@/services/api'
-import { PAYMENT_MAX_AGE_MS, loadPending, removePending, submitPending } from '@/services/entry'
-import { auth } from '@/stores/auth'
+import { PAYMENT_MAX_AGE_MS, claimOnChain, loadChainCoupons, loadPending, removePending, revealOnChain, submitPending } from '@/services/entry'
+import { auth, loadConfig } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { explorerTx, formatDate, formatSol, statusColors } from '@/utils/format'
 
@@ -93,6 +110,9 @@ const entries = ref([])
 const pending = ref([])
 const loading = ref(false)
 const retrying = ref(null)
+const recovering = ref(null)
+const chainCoupons = ref([])
+const acting = ref(null)
 
 const totalWinnings = computed(() => entries.value.reduce((sum, e) => sum + e.winningsLamports, 0))
 const gameLabel = (entry, index) => {
@@ -103,6 +123,7 @@ const expired = p => Date.now() - p.paidAt > PAYMENT_MAX_AGE_MS
 
 async function load () {
   pending.value = loadPending(auth.wallet)
+  chainCoupons.value = loadChainCoupons(auth.wallet)
   loading.value = true
   try {
     entries.value = await entryApi.mine()
@@ -127,6 +148,48 @@ async function retry (p) {
   } finally {
     retrying.value = null
     await load()
+  }
+}
+
+async function recover (p) {
+  recovering.value = p.signature
+  try {
+    await entryApi.recover(p.eventId, p.system, p.signature)
+    removePending(auth.wallet, p.signature)
+    notify('Refund requested; the admin can now verify and return the payment')
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    recovering.value = null
+    pending.value = loadPending(auth.wallet)
+  }
+}
+
+async function reveal (coupon) {
+  acting.value = coupon.signature
+  try {
+    await loadConfig()
+    await revealOnChain({ config: auth.config, wallet: auth.wallet, coupon })
+    notify('Picks revealed')
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    acting.value = null
+    chainCoupons.value = loadChainCoupons(auth.wallet)
+  }
+}
+
+async function claim (coupon) {
+  acting.value = coupon.signature
+  try {
+    await loadConfig()
+    await claimOnChain({ config: auth.config, wallet: auth.wallet, coupon })
+    notify('Claim sent from the vault')
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    acting.value = null
+    chainCoupons.value = loadChainCoupons(auth.wallet)
   }
 }
 

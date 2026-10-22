@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -146,26 +150,21 @@ func payment(source, dest string, lamports uint64, age time.Duration, failed boo
 		tx.Meta.Err = map[string]any{"InstructionError": 1}
 	}
 	tx.Transaction.Message.Instructions = append(tx.Transaction.Message.Instructions, struct {
-		Program string `json:"program"`
-		Parsed  *struct {
-			Type string `json:"type"`
-			Info struct {
-				Source      string `json:"source"`
-				Destination string `json:"destination"`
-				Lamports    uint64 `json:"lamports"`
-			} `json:"info"`
-		} `json:"parsed"`
+		Program   string          `json:"program"`
+		ProgramID string          `json:"programId"`
+		Parsed    json.RawMessage `json:"parsed"`
 	}{Program: "system"})
 	ix := &tx.Transaction.Message.Instructions[0]
-	ix.Parsed = &struct {
-		Type string `json:"type"`
-		Info struct {
-			Source      string `json:"source"`
-			Destination string `json:"destination"`
-			Lamports    uint64 `json:"lamports"`
-		} `json:"info"`
-	}{Type: "transfer"}
-	ix.Parsed.Info.Source, ix.Parsed.Info.Destination, ix.Parsed.Info.Lamports = source, dest, lamports
+	ix.Parsed, _ = json.Marshal(map[string]any{
+		"type": "transfer",
+		"info": map[string]any{"source": source, "destination": dest, "lamports": lamports},
+	})
+	memo, _ := json.Marshal("expected-memo")
+	tx.Transaction.Message.Instructions = append(tx.Transaction.Message.Instructions, struct {
+		Program   string          `json:"program"`
+		ProgramID string          `json:"programId"`
+		Parsed    json.RawMessage `json:"parsed"`
+	}{Program: "spl-memo", Parsed: memo})
 	return tx
 }
 
@@ -186,10 +185,106 @@ func TestCheckPayment(t *testing.T) {
 		{"too old", payment("payer", "treasury", 3000, 2*time.Hour, false), false},
 	}
 	for _, c := range cases {
-		err := checkPayment(c.tx, "payer", "treasury", 3000, now)
+		err := checkPayment(c.tx, "payer", "treasury", 3000, "expected-memo", now)
 		if (err == nil) != c.ok {
 			t.Errorf("%s: got err=%v, want ok=%v", c.name, err, c.ok)
 		}
+	}
+	if err := checkPayment(payment("payer", "treasury", 3000, time.Minute, false), "payer", "treasury", 3000, "other-memo", now); err == nil {
+		t.Fatal("payment with a mismatched coupon memo was accepted")
+	}
+}
+
+func TestPaymentMemo(t *testing.T) {
+	got := paymentMemo("0123456789abcdef01234567", []string{"1X", "2", "12"})
+	want := "sol-entry-v1:589e18e1039533ed869223442c572df7e13ecd6c1cfd05238f6b14f8222edfd5"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestRecoveryCanVerifyHistoricalPayment(t *testing.T) {
+	tx := payment("payer", "treasury", 3000, 2*time.Hour, false)
+	if err := checkPayment(tx, "payer", "treasury", 3000, "expected-memo", time.Now()); err == nil {
+		t.Fatal("old payment was accepted as a new entry")
+	}
+	if err := checkPaymentWithAge(tx, "payer", "treasury", 3000, "expected-memo", time.Now(), 0); err != nil {
+		t.Fatalf("historical payment was rejected for recovery: %v", err)
+	}
+	if err := checkPaymentWithAge(tx, "payer", "treasury", 3000, "", time.Now(), 0); err != nil {
+		t.Fatalf("historical treasury transfer was rejected as a refund: %v", err)
+	}
+}
+
+func TestGetTransactionRequiresFinality(t *testing.T) {
+	var commitment string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Params []json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		var options map[string]any
+		if len(request.Params) != 2 {
+			t.Fatalf("got %d params, want 2", len(request.Params))
+		}
+		if err := json.Unmarshal(request.Params[1], &options); err != nil {
+			t.Fatal(err)
+		}
+		commitment, _ = options["commitment"].(string)
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": nil})
+	}))
+	defer server.Close()
+
+	if _, err := newSolanaRPC(server.URL).getTransaction(context.Background(), "signature"); err != nil {
+		t.Fatal(err)
+	}
+	if commitment != "finalized" {
+		t.Fatalf("got commitment %q, want finalized", commitment)
+	}
+}
+
+func TestRateLimiterWindow(t *testing.T) {
+	var limiter rateLimiter
+	now := time.Now()
+	if !limiter.allow("wallet", 2, time.Minute, now) || !limiter.allow("wallet", 2, time.Minute, now) {
+		t.Fatal("requests inside the limit were rejected")
+	}
+	if limiter.allow("wallet", 2, time.Minute, now) {
+		t.Fatal("request over the limit was accepted")
+	}
+	if !limiter.allow("wallet", 2, time.Minute, now.Add(time.Minute)) {
+		t.Fatal("request was rejected after the window reset")
+	}
+	if !limiter.allow("other-wallet", 2, time.Minute, now) {
+		t.Fatal("one key limited a different key")
+	}
+}
+
+func TestRateLimitResponse(t *testing.T) {
+	app := &App{}
+	calls := 0
+	handler := app.limitRequests("login", 1, time.Minute, ipRateKey, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	request := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+		r.RemoteAddr = "192.0.2.1:1234"
+		w := httptest.NewRecorder()
+		handler(w, r)
+		return w
+	}
+	if got := request().Code; got != http.StatusNoContent {
+		t.Fatalf("first status = %d", got)
+	}
+	blocked := request()
+	if blocked.Code != http.StatusTooManyRequests || blocked.Header().Get("Retry-After") != "60" {
+		t.Fatalf("blocked response = %d, Retry-After %q", blocked.Code, blocked.Header().Get("Retry-After"))
+	}
+	if calls != 1 {
+		t.Fatalf("handler called %d times, want 1", calls)
 	}
 }
 
@@ -208,6 +303,43 @@ func TestValidateCoupons(t *testing.T) {
 		if validateCoupons(c, 7) == "" {
 			t.Errorf("invalid coupons accepted: %v", c)
 		}
+	}
+}
+
+func TestPrepareHidesOtherProgram(t *testing.T) {
+	app := &App{cfg: Config{ProgramID: "35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca", CouponPriceLamports: 1_000_000}}
+	event := Event{
+		GameCount: 7,
+		StartTime: time.Now().Add(time.Hour),
+		Chain:     &ChainVault{ProgramID: "11111111111111111111111111111111", Admin: "955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun", Cosigner: "4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH", Nonce: 1},
+	}
+	app.prepare(&event, time.Now())
+	if event.Chain != nil {
+		t.Fatal("a vault from another program was returned")
+	}
+	event.Chain = &ChainVault{ProgramID: app.cfg.ProgramID, Admin: "955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun", Cosigner: "4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH", Nonce: 1}
+	app.prepare(&event, time.Now())
+	if event.Chain == nil {
+		t.Fatal("the current program vault was hidden")
+	}
+}
+
+func TestValidateChainVault(t *testing.T) {
+	admin := "955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun"
+	other := "4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH"
+	start := time.Now().Add(time.Hour)
+	vault := ChainVault{Admin: admin, Cosigner: other, Nonce: 1}
+	if msg := validateChainVault(vault, 7, start, time.Now()); msg != "" {
+		t.Fatal(msg)
+	}
+	if validateChainVault(vault, 0, start, time.Now()) == "" {
+		t.Fatal("games are required")
+	}
+	if validateChainVault(vault, 7, time.Now().Add(-time.Minute), time.Now()) == "" {
+		t.Fatal("a started event cannot open a vault")
+	}
+	if validateChainVault(ChainVault{Admin: admin, Cosigner: admin, Nonce: 1}, 7, start, time.Now()) == "" {
+		t.Fatal("signers must differ")
 	}
 }
 

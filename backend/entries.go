@@ -236,14 +236,25 @@ func (a *App) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 
 	wallet := walletFrom(r)
 	lamports := e.CouponPriceLamports * uint64(combinations)
-	if err := a.verifyPayment(ctx, req.Signature, wallet, a.cfg.TreasuryWallet, lamports); err != nil {
+	memo := paymentMemo(e.ID.Hex(), system)
+	if err := a.verifyPayment(ctx, req.Signature, wallet, a.cfg.TreasuryWallet, lamports, memo); err != nil {
 		writeError(w, http.StatusPaymentRequired, err.Error())
+		return
+	}
+	payment := newPaymentRecord(req.Signature, wallet, e.ID, system, combinations, lamports, memo, paymentProcessing)
+	if err := a.reservePayment(ctx, payment); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			writeError(w, http.StatusConflict, "this payment has already been used")
+		} else {
+			writeError(w, http.StatusConflict, err.Error())
+		}
 		return
 	}
 
 	now := time.Now()
 	if !now.Before(e.StartTime) {
-		writeError(w, http.StatusConflict, "entries closed while the payment was being verified")
+		_ = a.setPaymentStatus(ctx, req.Signature, paymentRecoveryPending, "entries closed while the payment was being verified")
+		writeError(w, http.StatusConflict, "entries closed while the payment was being verified; request a payment recovery")
 		return
 	}
 	coupons := req.Coupons
@@ -262,13 +273,15 @@ func (a *App) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:     now,
 	}
 	if _, err := a.entries.InsertOne(ctx, entry); err != nil {
+		_ = a.setPaymentStatus(ctx, req.Signature, paymentRecoveryPending, "database rejected the entry after payment verification")
 		if mongo.IsDuplicateKeyError(err) {
 			writeError(w, http.StatusConflict, "this payment has already been used")
 		} else {
-			writeError(w, http.StatusInternalServerError, "failed to save entry")
+			writeError(w, http.StatusInternalServerError, "failed to save entry; the payment is in the recovery queue")
 		}
 		return
 	}
+	_ = a.setPaymentStatus(ctx, req.Signature, paymentAccepted, "")
 	entry.EventTitle = e.Title
 	writeJSON(w, http.StatusCreated, entry)
 }
