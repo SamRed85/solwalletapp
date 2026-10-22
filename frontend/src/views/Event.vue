@@ -1,0 +1,267 @@
+<template>
+  <v-container class="py-6" max-width="1100">
+    <v-btn variant="text" prepend-icon="mdi-arrow-left" to="/" class="mb-2">Events</v-btn>
+    <v-progress-linear v-if="loading && !event" indeterminate />
+
+    <template v-if="event">
+      <v-card class="mb-4">
+        <v-card-title class="d-flex align-center flex-wrap ga-2">
+          {{ event.title }}
+          <v-chip :color="statusColors[event.status]" size="small" variant="flat">{{ event.status }}</v-chip>
+          <v-chip v-if="event.rolloverInLamports" color="amber" size="small" variant="flat" prepend-icon="mdi-trophy">
+            Jackpot +{{ formatSol(event.rolloverInLamports) }}
+          </v-chip>
+        </v-card-title>
+        <v-card-subtitle class="text-wrap">
+          {{ event.gameCount }} games · {{ formatSol(event.couponPriceLamports) }} per coupon ·
+          entries close {{ formatDate(event.startTime) }}
+        </v-card-subtitle>
+        <v-card-text>
+          <p v-if="event.description" class="mb-4">{{ event.description }}</p>
+          <v-table density="compact">
+            <thead>
+              <tr>
+                <th>Correct picks</th><th>Share</th><th>{{ settlement ? 'Pot' : 'Pot so far' }}</th>
+                <th v-if="settlement">Winning coupons</th><th v-if="settlement">Each wins</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="tier in tierRows" :key="tier.correct">
+                <td>{{ tier.correct }} of {{ event.gameCount }}</td>
+                <td>{{ tier.percent }}%</td>
+                <td>{{ formatSol(tier.potLamports) }}</td>
+                <template v-if="settlement">
+                  <td>{{ tier.winners }}</td>
+                  <td>{{ tier.winners ? formatSol(tier.perWinnerLamports) : 'rolls over' }}</td>
+                </template>
+              </tr>
+            </tbody>
+          </v-table>
+          <p class="text-caption text-medium-emphasis mt-2">
+            {{ event.couponsSold }} coupon{{ event.couponsSold === 1 ? '' : 's' }} sold. The house keeps {{ houseCut }}% of ticket sales.
+            A prize tier without winners rolls over to the jackpot (all games correct) of the next event.
+          </p>
+          <p v-if="settlement?.rolloverOutLamports" class="text-caption mt-1">
+            {{ formatSol(settlement.rolloverOutLamports) }} rolled over to
+            <router-link v-if="settlement.rolloverToEventId" :to="`/events/${settlement.rolloverToEventId}`">the next event</router-link>
+            <span v-else>the next event that is created</span>.
+          </p>
+        </v-card-text>
+      </v-card>
+
+      <v-card v-if="event.status !== 'open'" class="mb-4" title="Games">
+        <v-table density="compact">
+          <thead><tr><th>#</th><th>Game</th><th>Kickoff</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr v-for="(game, index) in event.games" :key="index">
+              <td>{{ index + 1 }}</td>
+              <td>{{ game.homeTeam }} vs {{ game.awayTeam }}</td>
+              <td>{{ formatDate(game.kickoff) }}</td>
+              <td>
+                <template v-if="game.result">
+                  <strong>{{ game.result }}</strong>
+                  <v-chip v-if="game.cancelled" size="x-small" color="warning" class="ml-2">cancelled, drawn</v-chip>
+                  <div v-if="game.draw" class="text-caption text-medium-emphasis">
+                    Weights 1/X/2: {{ game.draw.weights.join(' / ') }} ·
+                    <a :href="explorerBlock(game.draw.slot)" target="_blank" rel="noopener">block {{ game.draw.slot }}</a>
+                  </div>
+                </template>
+                <span v-else class="text-medium-emphasis">—</span>
+              </td>
+            </tr>
+          </tbody>
+        </v-table>
+        <v-card-actions v-if="event.status === 'completed'">
+          <v-btn color="primary" prepend-icon="mdi-ticket" to="/coupons">See my coupons</v-btn>
+        </v-card-actions>
+      </v-card>
+
+      <v-card v-if="event.status === 'open'">
+        <v-card-title>Your coupon</v-card-title>
+        <v-card-subtitle class="text-wrap">
+          Select one or more of 1 (home win), X (draw) and 2 (away win) for every game.
+          Every combination becomes its own paid row.
+        </v-card-subtitle>
+        <v-card-text>
+          <v-alert type="info" variant="tonal" class="mb-4">
+            Example: 1 and X on one game, and only 2 on the others, makes 2 combinations.
+            Selecting two outcomes on two games makes 4.
+          </v-alert>
+          <v-alert v-if="isTreasury" type="warning" variant="tonal" class="mb-4">
+            This wallet is the treasury wallet and cannot pay itself. Sign in with another wallet to play.
+          </v-alert>
+          <div class="d-flex flex-wrap ga-2 mb-4">
+            <v-btn size="small" color="success" variant="tonal" prepend-icon="mdi-home" :disabled="paying" @click="selectAll('1')">All 1</v-btn>
+            <v-btn size="small" color="warning" variant="tonal" prepend-icon="mdi-minus" :disabled="paying" @click="selectAll('X')">All X</v-btn>
+            <v-btn size="small" color="info" variant="tonal" prepend-icon="mdi-arrow-right" :disabled="paying" @click="selectAll('2')">All 2</v-btn>
+            <v-btn size="small" color="error" variant="tonal" prepend-icon="mdi-close" :disabled="paying" @click="clearPicks">Clear</v-btn>
+          </div>
+          <div v-for="(game, g) in event.games" :key="g" class="d-flex align-center flex-wrap ga-3 py-2 game-row">
+            <div class="game-cell">
+              <div class="font-weight-medium">{{ g + 1 }}. {{ game.homeTeam }} vs {{ game.awayTeam }}</div>
+              <div class="text-caption text-medium-emphasis">{{ formatDate(game.kickoff) }}</div>
+            </div>
+            <v-btn
+              v-for="o in outcomes" :key="o.value" :title="o.label" min-width="44" :disabled="paying"
+              :color="isSelected(g, o.value) ? 'primary' : undefined"
+              :variant="isSelected(g, o.value) ? 'flat' : 'outlined'"
+              @click="togglePick(g, o.value)"
+            >
+              {{ o.value }}
+            </v-btn>
+          </div>
+          <div v-if="preview.length" class="mt-4">
+            <div class="text-subtitle-2 mb-2">Combinations</div>
+            <div class="d-flex flex-column ga-2">
+              <CouponPicks v-for="coupon in preview" :key="coupon" :coupon="coupon" :games="event.games" />
+            </div>
+          </div>
+        </v-card-text>
+        <v-divider />
+        <v-card-actions class="flex-wrap ga-2 pa-4">
+          <div>
+            <div class="text-subtitle-1">
+              {{ combinationTotal.toLocaleString() }} combination{{ combinationTotal === 1 ? '' : 's' }} × {{ formatSol(event.couponPriceLamports) }} =
+              <strong>{{ formatSol(totalLamports) }}</strong>
+            </div>
+            <div class="text-caption text-medium-emphasis">
+              {{ statusText }}
+            </div>
+            <div v-if="lowBalance" class="text-caption text-error">Your devnet balance looks too low for this payment.</div>
+          </div>
+          <v-spacer />
+          <v-btn
+            color="primary" variant="flat" size="large" prepend-icon="mdi-wallet"
+            :disabled="!complete || isTreasury" :loading="paying" @click="pay"
+          >
+            Pay with Phantom
+          </v-btn>
+        </v-card-actions>
+        <v-alert v-if="paying" type="info" variant="tonal" class="ma-4 mt-0">{{ stepLabels[step] }}</v-alert>
+      </v-card>
+    </template>
+  </v-container>
+</template>
+
+<script setup>
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import CouponPicks from '@/components/CouponPicks.vue'
+import { eventApi } from '@/services/api'
+import { payAndEnter } from '@/services/entry'
+import { auth, loadConfig, refreshBalance } from '@/stores/auth'
+import { notify, notifyError } from '@/stores/notify'
+import { combinationCount, expandCombinations, systemRows } from '@/utils/coupons'
+import { explorerBlock, formatDate, formatSol, outcomes, statusColors } from '@/utils/format'
+
+const route = useRoute()
+const router = useRouter()
+const event = ref(null)
+const loading = ref(false)
+const picks = ref([])
+const paying = ref(false)
+const step = ref('sign')
+
+const stepLabels = {
+  sign: 'Approve the payment in Phantom (make sure Phantom is set to Devnet)...',
+  confirm: 'Waiting for the payment to be confirmed on devnet...',
+  submit: 'Payment confirmed. Registering your coupons...'
+}
+
+const maxCombinations = computed(() => auth.config?.maxCombinations ?? auth.config?.maxCouponsPerEntry ?? 44000)
+const houseCut = computed(() => auth.config?.houseCutPercent ?? 5)
+const isTreasury = computed(() => auth.config && auth.wallet === auth.config.treasuryWallet)
+const settlement = computed(() => event.value?.settlement)
+const combinationTotal = computed(() => combinationCount(picks.value))
+const preview = computed(() => expandCombinations(picks.value))
+const missingGames = computed(() => picks.value.filter(game => game.length === 0).length)
+const tooMany = computed(() => combinationTotal.value > maxCombinations.value)
+const totalLamports = computed(() => combinationTotal.value * (event.value?.couponPriceLamports ?? 0))
+const complete = computed(() => missingGames.value === 0 && combinationTotal.value > 0 && !tooMany.value)
+const lowBalance = computed(() => auth.balance !== null && auth.balance * 1e9 < totalLamports.value + 10000)
+const statusText = computed(() => {
+  if (missingGames.value) return `${missingGames.value} game${missingGames.value === 1 ? '' : 's'} still need a pick`
+  if (tooMany.value) return `At most ${maxCombinations.value.toLocaleString()} combinations per payment. Remove some extra picks.`
+  return 'Plus a small Solana network fee, paid from your wallet.'
+})
+
+const tierRows = computed(() => {
+  const e = event.value
+  if (settlement.value) return settlement.value.tiers
+  const sales = e.couponsSold * e.couponPriceLamports
+  return e.tiers.map(t => ({
+    ...t,
+    potLamports: Math.floor(sales * t.percent / 100) + (t.correct === e.gameCount ? e.rolloverInLamports : 0)
+  }))
+})
+
+function resetPicks () {
+  picks.value = event.value.games.map(() => [])
+}
+
+function isSelected (game, outcome) {
+  return picks.value[game]?.includes(outcome)
+}
+
+function togglePick (game, outcome) {
+  const selected = picks.value[game]
+  picks.value[game] = selected.includes(outcome)
+    ? selected.filter(value => value !== outcome)
+    : [...selected, outcome]
+}
+
+function selectAll (outcome) {
+  picks.value = picks.value.map(() => [outcome])
+}
+
+function clearPicks () {
+  resetPicks()
+}
+
+async function load () {
+  loading.value = true
+  try {
+    await loadConfig()
+    event.value = await eventApi.get(route.params.id)
+    if (event.value.status === 'open') resetPicks()
+  } catch (error) {
+    notifyError(error)
+    router.push('/')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function pay () {
+  paying.value = true
+  try {
+    await payAndEnter({
+      config: auth.config,
+      wallet: auth.wallet,
+      event: event.value,
+      system: systemRows(picks.value),
+      combinations: combinationTotal.value,
+      onStep: s => { step.value = s }
+    })
+    notify('Coupons placed. Good luck!')
+    refreshBalance()
+    router.push('/coupons')
+  } catch (error) {
+    if (step.value === 'sign' || /No SOL was sent|failed on chain/.test(error.message)) notifyError(error)
+    else notify(`${error.message} Your payment is saved; retry it from My Coupons.`, 'warning')
+  } finally {
+    paying.value = false
+  }
+}
+
+watch(() => route.params.id, id => {
+  if (!id) return
+  picks.value = []
+  load()
+}, { immediate: true })
+</script>
+
+<style scoped>
+.game-row { border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
+.game-cell { flex: 1 1 220px; }
+</style>

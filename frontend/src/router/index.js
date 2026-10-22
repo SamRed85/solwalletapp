@@ -7,6 +7,24 @@ const router = createRouter({
   routes: [
     { path: '/', name: 'Home', component: Home },
     {
+      path: '/events/:id',
+      name: 'Event',
+      component: () => import('@/views/Event.vue'),
+      meta: { requiresAuth: true }
+    },
+    {
+      path: '/profile',
+      name: 'Profile',
+      component: () => import('@/views/Profile.vue'),
+      meta: { requiresAuth: true }
+    },
+    {
+      path: '/coupons',
+      name: 'MyCoupons',
+      component: () => import('@/views/MyCoupons.vue'),
+      meta: { requiresAuth: true }
+    },
+    {
       path: '/admin',
       name: 'Admin',
       component: () => import('@/views/Admin.vue'),
@@ -26,6 +44,7 @@ const router = createRouter({
 router.beforeEach(async to => {
   await authReady
   if (to.meta.requiresAdmin && !auth.isAdmin) return '/'
+  if (to.meta.requiresAuth && !auth.wallet) return '/'
 })
 
 export default router

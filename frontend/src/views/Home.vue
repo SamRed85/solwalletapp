@@ -45,18 +45,24 @@
         </v-card-text>
         <v-list v-else lines="two">
           <v-list-item
-            v-for="event in events" :key="event.id" :title="event.title"
-            :subtitle="`${event.gameCount} games · entries close ${formatDate(event.startTime)}`"
+            v-for="event in events" :key="event.id" :title="event.title" :to="`/events/${event.id}`" lines="three"
+            :disabled="event.status === 'draft' && !auth.isAdmin"
+            :subtitle="`${event.gameCount} games · ${formatSol(event.couponPriceLamports)} per coupon · entries close ${formatDate(event.startTime)}`"
           >
             <template #append>
-              <v-chip :color="statusColors[event.status]" size="small" variant="flat">{{ event.status }}</v-chip>
+              <v-chip v-if="event.rolloverInLamports" color="amber" size="small" variant="flat" class="mr-2" prepend-icon="mdi-trophy">
+                +{{ formatSol(event.rolloverInLamports) }}
+              </v-chip>
+              <v-chip :color="statusColors[event.status]" size="small" variant="flat">
+                {{ event.status === 'open' ? 'play' : event.status }}
+              </v-chip>
             </template>
           </v-list-item>
         </v-list>
       </v-card>
-      <v-alert type="info" variant="tonal" class="mt-4">
-        Placing coupons is not available in the app yet.
-      </v-alert>
+      <div class="text-center mt-4">
+        <v-btn variant="text" prepend-icon="mdi-ticket" to="/coupons">My Coupons</v-btn>
+      </div>
     </template>
   </v-container>
 </template>
@@ -67,7 +73,7 @@ import { eventApi } from '@/services/api'
 import { isPhantomInstalled } from '@/services/solana'
 import { auth, login } from '@/stores/auth'
 import { notifyError } from '@/stores/notify'
-import { formatDate, statusColors } from '@/utils/format'
+import { formatDate, formatSol, statusColors } from '@/utils/format'
 
 const phantomInstalled = isPhantomInstalled()
 const events = ref([])

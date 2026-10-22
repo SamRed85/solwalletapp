@@ -16,11 +16,13 @@ type App struct {
 	db     *mongo.Database
 	nonces *nonceStore
 
-	users   *mongo.Collection
-	events  *mongo.Collection
-	entries *mongo.Collection
+	users    *mongo.Collection
+	events   *mongo.Collection
+	entries  *mongo.Collection
+	rollover *mongo.Collection
 
 	verifyPayment func(ctx context.Context, signature, payer, treasury string, lamports uint64) error
+	findDrawBlock func(ctx context.Context, t time.Time) (*blockRef, error)
 }
 
 func main() {
@@ -38,6 +40,7 @@ func main() {
 	defer client.Disconnect(context.Background())
 
 	db := client.Database(cfg.MongoDB)
+	rpc := newSolanaRPC(cfg.SolanaRPCURL)
 	app := &App{
 		cfg:           cfg,
 		db:            db,
@@ -45,7 +48,9 @@ func main() {
 		users:         db.Collection("users"),
 		events:        db.Collection("events"),
 		entries:       db.Collection("entries"),
-		verifyPayment: newSolanaRPC(cfg.SolanaRPCURL).verifyPayment,
+		rollover:      db.Collection("rollover"),
+		verifyPayment: rpc.verifyPayment,
+		findDrawBlock: rpc.findDrawBlock,
 	}
 	if err := app.ensureIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
@@ -56,7 +61,7 @@ func main() {
 		Handler:           app.cors(app.routes()),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      150 * time.Second,
 	}
 	log.Printf("Sol backend listening on :%s (db %q, RPC %s, treasury %s)",
 		cfg.Port, cfg.MongoDB, cfg.SolanaRPCURL, cfg.TreasuryWallet)
@@ -72,15 +77,19 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/auth/login", a.handleLogin)
 
 	mux.HandleFunc("GET /api/me", a.requireAuth(a.handleMe))
+	mux.HandleFunc("PUT /api/me", a.requireAuth(a.handleUpdateMe))
 	mux.HandleFunc("GET /api/events", a.requireAuth(a.handleListEvents))
 	mux.HandleFunc("GET /api/events/{id}", a.requireAuth(a.handleGetEvent))
 	mux.HandleFunc("POST /api/events/{id}/entries", a.requireAuth(a.handleCreateEntry))
 	mux.HandleFunc("GET /api/entries", a.requireAuth(a.handleMyEntries))
 
 	mux.HandleFunc("GET /api/users", a.requireAdmin(a.handleListUsers))
+	mux.HandleFunc("PUT /api/users/{wallet}", a.requireAdmin(a.handleAdminUpdateUser))
+	mux.HandleFunc("DELETE /api/users/{wallet}", a.requireAdmin(a.handleAdminDeleteUser))
 	mux.HandleFunc("POST /api/events", a.requireAdmin(a.handleCreateEvent))
 	mux.HandleFunc("PUT /api/events/{id}/games", a.requireAdmin(a.handleSetGames))
 	mux.HandleFunc("POST /api/events/{id}/results", a.requireAdmin(a.handleSetResults))
+	mux.HandleFunc("GET /api/events/{id}/payouts", a.requireAdmin(a.handlePayouts))
 
 	return mux
 }
@@ -121,6 +130,11 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"solanaRpcUrl":        a.cfg.SolanaRPCURL,
 		"minGames":            minGames,
 		"maxGames":            maxGames,
-		"maxCouponsPerEntry":  maxCouponsPerEntry,
+		"maxCouponsPerEntry":  maxCombinations,
+		"maxCombinations":     maxCombinations,
+		"defaultGameCount":    defaultGameCount,
+		"defaultTiers":        defaultTiers(defaultGameCount),
+		"houseCutPercent":     houseCutPercent,
+		"tierPercentTotal":    tierPercentTotal,
 	})
 }

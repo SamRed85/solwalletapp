@@ -41,11 +41,14 @@ export const configApi = {
 export const authApi = {
   nonce: publicKey => data(api.post('/api/auth/nonce', { publicKey })),
   login: (publicKey, nonce, signature) => data(api.post('/api/auth/login', { publicKey, nonce, signature })),
-  me: () => data(api.get('/api/me'))
+  me: () => data(api.get('/api/me')),
+  updateProfile: displayName => data(api.put('/api/me', { displayName }))
 }
 
 export const userApi = {
-  list: () => data(api.get('/api/users'))
+  list: () => data(api.get('/api/users')),
+  update: (wallet, displayName) => data(api.put(`/api/users/${wallet}`, { displayName })),
+  remove: wallet => api.delete(`/api/users/${wallet}`)
 }
 
 export const eventApi = {
@@ -53,5 +56,12 @@ export const eventApi = {
   get: id => data(api.get(`/api/events/${id}`)),
   create: event => data(api.post('/api/events', event)),
   setGames: (id, games) => data(api.put(`/api/events/${id}/games`, { games })),
-  setResults: (id, results) => data(api.post(`/api/events/${id}/results`, { results }))
+  // Drawing cancelled games searches devnet blocks, which can take a while on the public RPC.
+  setResults: (id, results) => data(api.post(`/api/events/${id}/results`, { results }, { timeout: 150000 })),
+  payouts: id => data(api.get(`/api/events/${id}/payouts`))
+}
+
+export const entryApi = {
+  create: (eventId, system, signature) => data(api.post(`/api/events/${eventId}/entries`, { system, signature })),
+  mine: () => data(api.get('/api/entries'))
 }
