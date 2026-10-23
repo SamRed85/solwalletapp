@@ -17,7 +17,7 @@ if ! command -v solana >/dev/null 2>&1; then
   exit 0
 fi
 
-program="35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca"
+program="H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr"
 dump="$(mktemp)"
 if ! solana program dump "${program}" "${dump}" --url https://api.devnet.solana.com; then
   echo "recorded hash matches; program is not deployed on devnet"

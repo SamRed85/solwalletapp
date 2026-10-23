@@ -208,6 +208,10 @@ func (a *App) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if e.hasVault {
+		writeError(w, http.StatusConflict, "this event takes entries only through its on-chain vault")
+		return
+	}
 	if e.Status != "open" {
 		writeError(w, http.StatusConflict, "this event is not open for entries")
 		return
@@ -251,6 +255,13 @@ func (a *App) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The reservation above is visible to handleSetChain, which refuses events with payments.
+	// Checking again here covers a vault attached while this payment was being verified.
+	if n, err := a.events.CountDocuments(ctx, bson.M{"_id": e.ID, "chain": bson.M{"$exists": true}}); err != nil || n > 0 {
+		_ = a.setPaymentStatus(ctx, req.Signature, paymentRecoveryPending, "the event moved to an on-chain vault while the payment was being verified")
+		writeError(w, http.StatusConflict, "this event now takes entries only through its on-chain vault; your payment is in the refund queue")
+		return
+	}
 	now := time.Now()
 	if !now.Before(e.StartTime) {
 		_ = a.setPaymentStatus(ctx, req.Signature, paymentRecoveryPending, "entries closed while the payment was being verified")

@@ -15,7 +15,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-const COUNCIL: &str = "9ad7bFZNUVuvGkM2ZbepzK6wADV4LaWpW2weQPxXSWD2";
+const COUNCIL: &str = "D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt";
 
 fn main() {
     let mut url = "http://127.0.0.1:8899".to_string();

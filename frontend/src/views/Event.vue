@@ -18,36 +18,44 @@
         </v-card-subtitle>
         <v-card-text>
           <p v-if="event.description" class="mb-4">{{ event.description }}</p>
-          <v-table density="compact">
-            <thead>
-              <tr>
-                <th>Correct picks</th><th>Share</th><th>{{ settlement ? 'Pot' : 'Pot so far' }}</th>
-                <th v-if="settlement">Winning coupons</th><th v-if="settlement">Each wins</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="tier in tierRows" :key="tier.correct">
-                <td>{{ tier.correct }} of {{ event.gameCount }}</td>
-                <td>{{ tier.percent }}%</td>
-                <td>{{ formatSol(tier.potLamports) }}</td>
-                <template v-if="settlement">
-                  <td>{{ tier.winners }}</td>
-                  <td>{{ tier.winners ? formatSol(tier.perWinnerLamports) : 'rolls over' }}</td>
-                </template>
-              </tr>
-            </tbody>
-          </v-table>
-          <p class="text-caption text-medium-emphasis mt-2">
-            {{ event.couponsSold }} coupon{{ event.couponsSold === 1 ? '' : 's' }} sold. The house keeps {{ houseCut }}% of ticket sales.
-            A prize tier without winners rolls over to the jackpot (all games correct) of the next event.
+          <p v-if="event.chain" class="text-body-2">
+            Entries are held by the on-chain vault below. Reveal your picks in My Coupons after entries close; a coupon that
+            is not revealed before {{ formatDate(event.endTime) }} cannot win and its stake stays in the prize pool.
           </p>
-          <p v-if="settlement?.rolloverOutLamports" class="text-caption mt-1">
-            {{ formatSol(settlement.rolloverOutLamports) }} rolled over to
-            <router-link v-if="settlement.rolloverToEventId" :to="`/events/${settlement.rolloverToEventId}`">the next event</router-link>
-            <span v-else>the next event that is created</span>.
-          </p>
+          <template v-if="!event.chain">
+            <v-table density="compact">
+              <thead>
+                <tr>
+                  <th>Correct picks</th><th>Share</th><th>{{ settlement ? 'Pot' : 'Pot so far' }}</th>
+                  <th v-if="settlement">Winning coupons</th><th v-if="settlement">Each wins</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="tier in tierRows" :key="tier.correct">
+                  <td>{{ tier.correct }} of {{ event.gameCount }}</td>
+                  <td>{{ tier.percent }}%</td>
+                  <td>{{ formatSol(tier.potLamports) }}</td>
+                  <template v-if="settlement">
+                    <td>{{ tier.winners }}</td>
+                    <td>{{ tier.winners ? formatSol(tier.perWinnerLamports) : 'rolls over' }}</td>
+                  </template>
+                </tr>
+              </tbody>
+            </v-table>
+            <p class="text-caption text-medium-emphasis mt-2">
+              {{ event.couponsSold }} coupon{{ event.couponsSold === 1 ? '' : 's' }} sold. The house keeps {{ houseCut }}% of ticket sales.
+              A prize tier without winners rolls over to the jackpot (all games correct) of the next event.
+            </p>
+            <p v-if="settlement?.rolloverOutLamports" class="text-caption mt-1">
+              {{ formatSol(settlement.rolloverOutLamports) }} rolled over to
+              <router-link v-if="settlement.rolloverToEventId" :to="`/events/${settlement.rolloverToEventId}`">the next event</router-link>
+              <span v-else>the next event that is created</span>.
+            </p>
+          </template>
         </v-card-text>
       </v-card>
+
+      <VaultPanel v-if="event.chain" :event="event" class="mb-4" @changed="refreshEvent" />
 
       <v-card v-if="event.status !== 'open'" class="mb-4" title="Games">
         <v-table density="compact">
@@ -59,8 +67,9 @@
               <td>{{ formatDate(game.kickoff) }}</td>
               <td>
                 <template v-if="game.result">
-                  <strong>{{ game.result }}</strong>
-                  <v-chip v-if="game.cancelled" size="x-small" color="warning" class="ml-2">cancelled, drawn</v-chip>
+                  <strong>{{ game.result === 'C' ? 'Void' : game.result }}</strong>
+                  <v-chip v-if="game.result === 'C'" size="x-small" color="warning" class="ml-2">counts for every pick</v-chip>
+                  <v-chip v-else-if="game.cancelled" size="x-small" color="warning" class="ml-2">cancelled, drawn</v-chip>
                   <div v-if="game.draw" class="text-caption text-medium-emphasis">
                     Weights 1/X/2: {{ game.draw.weights.join(' / ') }} ·
                     <a :href="explorerBlock(game.draw.slot)" target="_blank" rel="noopener">block {{ game.draw.slot }}</a>
@@ -147,6 +156,7 @@
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import CouponPicks from '@/components/CouponPicks.vue'
+import VaultPanel from '@/components/VaultPanel.vue'
 import { eventApi } from '@/services/api'
 import { payAndEnter, placeOnChain } from '@/services/entry'
 import { auth, loadConfig, refreshBalance } from '@/stores/auth'
@@ -232,6 +242,17 @@ async function load () {
     router.push('/')
   } finally {
     loading.value = false
+  }
+}
+
+async function refreshEvent () {
+  try {
+    const fresh = await eventApi.get(route.params.id)
+    const wasOpen = event.value?.status === 'open'
+    event.value = fresh
+    if (!wasOpen && fresh.status === 'open') resetPicks()
+  } catch (error) {
+    notifyError(error)
   }
 }
 

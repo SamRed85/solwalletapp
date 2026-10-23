@@ -19,6 +19,7 @@ type Config struct {
 	CouponPriceLamports uint64
 	SolanaRPCURL        string
 	ProgramID           string
+	ResultCosigner      string
 }
 
 const defaultWallet = "4tyf8awFN919MwuhDs7AkPN4gY6RJNawSwqisK3dcHdy"
@@ -31,8 +32,12 @@ func loadConfig() Config {
 		AllowedOrigin:  env("ALLOWED_ORIGIN", "http://localhost:3000"),
 		TreasuryWallet: env("TREASURY_WALLET", defaultWallet),
 		SolanaRPCURL:   env("SOLANA_RPC_URL", "https://api.devnet.solana.com"),
-		ProgramID:      env("PROGRAM_ID", "35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca"),
+		ProgramID:      env("PROGRAM_ID", "H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr"),
+		ResultCosigner: env("RESULT_COSIGNER", "4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH"),
 		AdminWallets:   map[string]bool{},
+	}
+	if strings.Contains(env("ADMIN_WALLETS", defaultWallet), cfg.ResultCosigner) {
+		log.Fatal("RESULT_COSIGNER must not be an admin wallet: an admin would then hold both result keys")
 	}
 
 	for _, w := range strings.Split(env("ADMIN_WALLETS", defaultWallet), ",") {

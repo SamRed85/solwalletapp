@@ -1,9 +1,10 @@
 import { entryApi } from './api'
 import {
-  couponCommitment, couponCount, couponPda, eventPda, picksFromSystem, placeCouponIx,
-  PROGRAM_ID, revealCouponIx, claimIx, sendProgramTransaction
+  COUPON_KEY_MESSAGE, couponCommitment, couponCount, couponKeyFromSignature, couponPda, eventPda, picksFromSystem,
+  placeCouponIx, PROGRAM_ID, refundIx, revealCouponIx, claimIx, sealCoupon, sendProgramTransaction, systemFromPicks,
+  unsealCoupon
 } from './program'
-import { sendPayment, waitForConfirmation } from './solana'
+import { sendPayment, signMessageBytes, waitForConfirmation } from './solana'
 
 // Payments are kept here until the backend has accepted the entry, so a closed tab or a
 // failed request does not lose a paid coupon. The backend accepts payments up to 1 hour old.
@@ -67,8 +68,25 @@ function saveChainCoupons (wallet, list) {
   else localStorage.removeItem(chainKey(wallet))
 }
 
-export function updateChainCoupon (wallet, signature, patch) {
-  saveChainCoupons(wallet, loadChainCoupons(wallet).map(coupon => coupon.signature === signature ? { ...coupon, ...patch } : coupon))
+// Coupons are identified by their on-chain address; the entry signature is only known for
+// coupons placed in this browser.
+export const couponId = coupon => coupon.address || couponPda(eventPda(coupon.admin, coupon.nonce), coupon.index)
+
+function rememberCoupon (wallet, coupon) {
+  const id = couponId(coupon)
+  saveChainCoupons(wallet, [...loadChainCoupons(wallet).filter(saved => couponId(saved) !== id), coupon])
+}
+
+const keyCacheName = wallet => `sol.couponKey.${wallet}`
+
+// The key is derived from a deterministic wallet signature, so it can be recreated on any
+// device. It is kept for this browser session only.
+export async function couponKey (wallet) {
+  const cached = sessionStorage.getItem(keyCacheName(wallet))
+  if (cached) return Uint8Array.from(atob(cached), char => char.charCodeAt(0))
+  const key = couponKeyFromSignature(await signMessageBytes(COUPON_KEY_MESSAGE(wallet)))
+  sessionStorage.setItem(keyCacheName(wallet), btoa(String.fromCharCode(...key)))
+  return key
 }
 
 export async function placeOnChain ({ config, wallet, event, system, combinations, onStep = () => {} }) {
@@ -76,19 +94,31 @@ export async function placeOnChain ({ config, wallet, event, system, combination
   const admin = event.chain.admin
   const nonce = event.chain.nonce
   const eventAddress = eventPda(admin, nonce)
+  const key = await couponKey(wallet)
   const index = await couponCount(config.solanaRpcUrl, eventAddress)
   const picks = picksFromSystem(system)
   const revealNonce = crypto.getRandomValues(new BigUint64Array(1))[0]
   const commitment = couponCommitment(wallet, picks, revealNonce)
-  const { signature, lastValidBlockHeight } = await sendProgramTransaction(config.solanaRpcUrl, wallet, [
-    placeCouponIx({ player: wallet, admin, nonce, index, commitment, combinations })
-  ])
+  const sealed = sealCoupon(key, commitment, picks, revealNonce)
+  if (!unsealCoupon(key, { owner: wallet, commitment, sealed })) throw new Error('The coupon backup could not be verified')
+  let sent
+  try {
+    sent = await sendProgramTransaction(config.solanaRpcUrl, wallet, [
+      placeCouponIx({ player: wallet, admin, nonce, index, commitment, combinations, sealed })
+    ])
+  } catch (error) {
+    if (/already in use/i.test(error.message)) {
+      throw new Error('Another player took this coupon number at the same moment. Nothing was paid; please submit again.', { cause: error })
+    }
+    throw error
+  }
+  const { signature, lastValidBlockHeight } = sent
   const coupon = {
     signature, programId: PROGRAM_ID, eventId: event.id, eventTitle: event.title, admin, nonce, index,
-    revealNonce: revealNonce.toString(), system, combinations,
+    address: couponPda(eventAddress, index), revealNonce: revealNonce.toString(), system, combinations,
     lamports: event.couponPriceLamports * combinations, placedAt: Date.now(), revealed: false
   }
-  saveChainCoupons(wallet, [...loadChainCoupons(wallet), coupon])
+  rememberCoupon(wallet, coupon)
   onStep('confirm')
   try {
     await waitForConfirmation(config.solanaRpcUrl, signature, lastValidBlockHeight)
@@ -101,6 +131,11 @@ export async function placeOnChain ({ config, wallet, event, system, combination
   return coupon
 }
 
+function patchCoupon (wallet, coupon, patch) {
+  const id = couponId(coupon)
+  saveChainCoupons(wallet, loadChainCoupons(wallet).map(saved => couponId(saved) === id ? { ...saved, ...patch } : saved))
+}
+
 export async function revealOnChain ({ config, wallet, coupon }) {
   const picks = picksFromSystem(coupon.system)
   const { signature, lastValidBlockHeight } = await sendProgramTransaction(config.solanaRpcUrl, wallet, [
@@ -110,7 +145,7 @@ export async function revealOnChain ({ config, wallet, coupon }) {
     })
   ])
   await waitForConfirmation(config.solanaRpcUrl, signature, lastValidBlockHeight)
-  updateChainCoupon(wallet, coupon.signature, { revealed: true })
+  patchCoupon(wallet, coupon, { revealed: true })
 }
 
 export async function claimOnChain ({ config, wallet, coupon }) {
@@ -119,7 +154,67 @@ export async function claimOnChain ({ config, wallet, coupon }) {
     claimIx({ owner: wallet, event, coupon: couponPda(event, coupon.index) })
   ])
   await waitForConfirmation(config.solanaRpcUrl, signature, lastValidBlockHeight)
-  updateChainCoupon(wallet, coupon.signature, { claimed: true })
+  patchCoupon(wallet, coupon, { claimed: true })
+}
+
+export async function refundOnChain ({ config, wallet, coupon }) {
+  const event = eventPda(coupon.admin, coupon.nonce)
+  const { signature, lastValidBlockHeight } = await sendProgramTransaction(config.solanaRpcUrl, wallet, [
+    refundIx({ owner: wallet, event, coupon: couponPda(event, coupon.index) })
+  ])
+  await waitForConfirmation(config.solanaRpcUrl, signature, lastValidBlockHeight)
+  patchCoupon(wallet, coupon, { refunded: true })
+}
+
+// Opens the sealed backups of on-chain coupons that this browser does not know, using the
+// wallet-signature key. Returns how many coupons were restored.
+export async function recoverFromChain ({ wallet, onChain, events }) {
+  const known = new Set(loadChainCoupons(wallet).filter(saved => saved.revealNonce).map(couponId))
+  const missing = onChain.filter(coupon => !coupon.revealed && !known.has(coupon.address))
+  if (!missing.length) return 0
+  const key = await couponKey(wallet)
+  let restored = 0
+  for (const coupon of missing) {
+    const opened = unsealCoupon(key, coupon)
+    const event = events.get(coupon.event)
+    if (!opened || !event) continue
+    rememberCoupon(wallet, {
+      programId: PROGRAM_ID, eventId: event.id, eventTitle: event.title, admin: event.chain.admin, nonce: event.chain.nonce,
+      index: coupon.index, address: coupon.address, revealNonce: opened.revealNonce.toString(),
+      system: systemFromPicks(opened.picks, coupon.gameCount), combinations: coupon.combinations,
+      lamports: Number(coupon.lamportsPaid), placedAt: Date.now(), revealed: false
+    })
+    restored++
+  }
+  if (restored < missing.length) {
+    throw new Error(`Restored ${restored} of ${missing.length} coupons. The rest need a backup file from the browser that placed them.`)
+  }
+  return restored
+}
+
+export function exportCouponBackup (wallet) {
+  return JSON.stringify({ version: 1, wallet, programId: PROGRAM_ID, coupons: loadChainCoupons(wallet) }, null, 2)
+}
+
+export function importCouponBackup (wallet, textValue) {
+  const backup = JSON.parse(textValue)
+  if (backup?.version !== 1 || backup.wallet !== wallet || backup.programId !== PROGRAM_ID || !Array.isArray(backup.coupons)) {
+    throw new Error('This backup belongs to a different wallet or program')
+  }
+  let added = 0
+  for (const coupon of backup.coupons) {
+    if (!coupon.revealNonce || !Array.isArray(coupon.system) || coupon.programId !== PROGRAM_ID) continue
+    rememberCoupon(wallet, { ...coupon, address: couponId(coupon) })
+    added++
+  }
+  return added
+}
+
+// True when the saved picks and nonce open the on-chain commitment, so a reveal will succeed.
+export function backupMatches (wallet, saved, onChain) {
+  if (!saved?.revealNonce || !saved.system) return false
+  const commitment = couponCommitment(wallet, picksFromSystem(saved.system), BigInt(saved.revealNonce))
+  return commitment.every((byte, index) => byte === onChain.commitment[index])
 }
 
 export async function submitPending (wallet, pending) {

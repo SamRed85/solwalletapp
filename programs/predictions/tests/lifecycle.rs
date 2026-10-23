@@ -1,6 +1,9 @@
 use std::convert::TryFrom;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use predictions::{CreateEventArgs, Escrow, Event, EventStatus, TierArg, UpgradeCouncil};
 use solana_program_error::ProgramResult;
 use solana_program_test::{processor, ProgramTest, ProgramTestContext};
@@ -28,9 +31,13 @@ async fn send(context: &mut ProgramTestContext, payer: &Keypair, instruction: In
     send_all(context, &[payer], instruction).await
 }
 
+static SENT: AtomicU32 = AtomicU32::new(0);
+
 async fn send_all(context: &mut ProgramTestContext, signers: &[&Keypair], instruction: Instruction) -> Result<(), solana_program_test::BanksClientError> {
     let blockhash = context.banks_client.get_latest_blockhash().await.unwrap();
-    let transaction = Transaction::new_signed_with_payer(&[instruction], Some(&signers[0].pubkey()), signers, blockhash);
+    // A distinct compute limit keeps repeated instructions from being dropped as duplicates.
+    let budget = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000 - SENT.fetch_add(1, Ordering::Relaxed));
+    let transaction = Transaction::new_signed_with_payer(&[budget, instruction], Some(&signers[0].pubkey()), signers, blockhash);
     context.banks_client.process_transaction(transaction).await
 }
 
@@ -58,7 +65,7 @@ fn event_args(nonce: u64, deadline: i64) -> CreateEventArgs {
         price: 1_000_000,
         deadline,
         reveal_deadline: deadline + 20,
-        end_time: deadline + 3_600,
+        end_time: deadline + 20,
         resolve_timeout: deadline + 100_000,
         threshold: 2,
         signers: vec![],
@@ -80,6 +87,10 @@ fn gate_of(admin: &Pubkey) -> Pubkey {
     pda(&[b"gate", admin.as_ref()])
 }
 
+fn escrow_of(admin: &Pubkey) -> Pubkey {
+    pda(&[b"rollover-escrow", admin.as_ref()])
+}
+
 fn signers_of(event: &Pubkey) -> Pubkey {
     pda(&[b"signers", event.as_ref()])
 }
@@ -89,7 +100,7 @@ fn create_ix(admin: Pubkey, other: Pubkey, nonce: u64, deadline: i64) -> (Instru
     args.signers = vec![admin, other];
     let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
     let vault = pda(&[b"vault", event.as_ref()]);
-    let escrow = pda(&[b"rollover-escrow"]);
+    let escrow = escrow_of(&admin);
     let schedule = schedule_of(&admin);
     let instruction = Instruction {
         program_id: predictions::ID,
@@ -110,6 +121,10 @@ fn create_ix(admin: Pubkey, other: Pubkey, nonce: u64, deadline: i64) -> (Instru
 }
 
 fn place_ix(player: Pubkey, admin: Pubkey, nonce: u64, index: u32) -> (Instruction, Pubkey) {
+    place_picks_ix(player, admin, nonce, index, all_home(), 1)
+}
+
+fn place_picks_ix(player: Pubkey, admin: Pubkey, nonce: u64, index: u32, picks: [u8; 13], combinations: u32) -> (Instruction, Pubkey) {
     let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
     let vault = pda(&[b"vault", event.as_ref()]);
     let coupon = pda(&[b"coupon", event.as_ref(), &index.to_le_bytes()]);
@@ -125,8 +140,9 @@ fn place_ix(player: Pubkey, admin: Pubkey, nonce: u64, index: u32) -> (Instructi
         }
         .to_account_metas(None),
         data: predictions::instruction::PlaceCoupon {
-            commitment: predictions::coupon_commitment(&player, &all_home(), REVEAL_NONCE),
-            combinations: 1,
+            commitment: predictions::coupon_commitment(&player, &picks, REVEAL_NONCE),
+            combinations,
+            sealed: [index as u8; predictions::SEALED_LEN],
         }
         .data(),
     };
@@ -134,12 +150,24 @@ fn place_ix(player: Pubkey, admin: Pubkey, nonce: u64, index: u32) -> (Instructi
 }
 
 fn reveal_ix(player: Pubkey, admin: Pubkey, nonce: u64, index: u32) -> Instruction {
+    reveal_picks_ix(player, admin, nonce, index, all_home())
+}
+
+fn reveal_picks_ix(player: Pubkey, admin: Pubkey, nonce: u64, index: u32, picks: [u8; 13]) -> Instruction {
     let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
     let coupon = pda(&[b"coupon", event.as_ref(), &index.to_le_bytes()]);
     Instruction {
         program_id: predictions::ID,
         accounts: predictions::accounts::RevealCoupon { player, coupon, event }.to_account_metas(None),
-        data: predictions::instruction::RevealCoupon { picks: all_home(), nonce: REVEAL_NONCE }.data(),
+        data: predictions::instruction::RevealCoupon { picks, nonce: REVEAL_NONCE }.data(),
+    }
+}
+
+fn claim_ix(coupon: Pubkey, event: Pubkey, owner: Pubkey) -> Instruction {
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::Claim { coupon, event, vault: pda(&[b"vault", event.as_ref()]), owner }.to_account_metas(None),
+        data: predictions::instruction::Claim {}.data(),
     }
 }
 
@@ -152,9 +180,8 @@ async fn load_event(context: &mut ProgramTestContext, event: Pubkey) -> Event {
     Event::try_deserialize(&mut account.data.as_slice()).unwrap()
 }
 
-async fn load_escrow(context: &mut ProgramTestContext) -> Escrow {
-    let escrow = pda(&[b"rollover-escrow"]);
-    let account = context.banks_client.get_account(escrow).await.unwrap().unwrap();
+async fn load_escrow(context: &mut ProgramTestContext, admin: &Pubkey) -> Escrow {
+    let account = context.banks_client.get_account(escrow_of(admin)).await.unwrap().unwrap();
     Escrow::try_deserialize(&mut account.data.as_slice()).unwrap()
 }
 
@@ -163,32 +190,46 @@ async fn load_council(context: &mut ProgramTestContext, council: Pubkey) -> Upgr
     UpgradeCouncil::try_deserialize(&mut account.data.as_slice()).unwrap()
 }
 
-fn resolve_ix(admin: Pubkey, other: Pubkey, event: Pubkey, results: Vec<u8>) -> Instruction {
+fn approve_ix(signer: Pubkey, admin: Pubkey, event: Pubkey, results: Vec<u8>) -> Instruction {
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::Approve { signer, event, signers: signers_of(&event), schedule: schedule_of(&admin) }.to_account_metas(None),
+        data: predictions::instruction::ApproveResolution { results }.data(),
+    }
+}
+
+fn approve_cancel_ix(signer: Pubkey, admin: Pubkey, event: Pubkey) -> Instruction {
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::Approve { signer, event, signers: signers_of(&event), schedule: schedule_of(&admin) }.to_account_metas(None),
+        data: predictions::instruction::ApproveCancel {}.data(),
+    }
+}
+
+fn tally_ix(admin: Pubkey, event: Pubkey, coupons: &[Pubkey]) -> Instruction {
     let mut instruction = Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::ResolveEvent {
-            event,
-            signers: signers_of(&event),
-            vault: pda(&[b"vault", event.as_ref()]),
-            schedule: schedule_of(&admin),
-        }
-        .to_account_metas(None),
-        data: predictions::instruction::ResolveEvent { results, signer_count: 2 }.data(),
+        accounts: predictions::accounts::Tally { event, vault: pda(&[b"vault", event.as_ref()]), schedule: schedule_of(&admin) }.to_account_metas(None),
+        data: predictions::instruction::Tally {}.data(),
     };
-    instruction.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(admin, true));
-    instruction.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(other, true));
+    for coupon in coupons {
+        instruction.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(*coupon, false));
+    }
     instruction
 }
 
-fn cancel_ix(admin: Pubkey, other: Pubkey, event: Pubkey) -> Instruction {
-    let mut instruction = Instruction {
-        program_id: predictions::ID,
-        accounts: predictions::accounts::CancelEvent { event, signers: signers_of(&event), schedule: schedule_of(&admin) }.to_account_metas(None),
-        data: predictions::instruction::CancelEvent { signer_count: 2 }.data(),
-    };
-    instruction.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(admin, true));
-    instruction.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(other, true));
-    instruction
+/// Both result signers approve in separate transactions, then a stranger tallies every coupon.
+async fn resolve(context: &mut ProgramTestContext, admin: &Keypair, other: &Keypair, event: Pubkey, results: Vec<u8>, coupons: &[Pubkey]) {
+    send(context, admin, approve_ix(admin.pubkey(), admin.pubkey(), event, results.clone())).await.unwrap();
+    fund(context, &other.pubkey(), 10_000_000).await;
+    send(context, other, approve_ix(other.pubkey(), admin.pubkey(), event, results)).await.unwrap();
+    send(context, admin, tally_ix(admin.pubkey(), event, coupons)).await.unwrap();
+}
+
+async fn cancel(context: &mut ProgramTestContext, admin: &Keypair, other: &Keypair, event: Pubkey) {
+    send(context, admin, approve_cancel_ix(admin.pubkey(), admin.pubkey(), event)).await.unwrap();
+    fund(context, &other.pubkey(), 10_000_000).await;
+    send(context, other, approve_cancel_ix(other.pubkey(), admin.pubkey(), event)).await.unwrap();
 }
 
 fn forward_ix(admin: Pubkey, source_nonce: u64, destination_nonce: u64) -> Instruction {
@@ -215,7 +256,7 @@ fn park_ix(admin: Pubkey, source_nonce: u64) -> Instruction {
         accounts: predictions::accounts::ParkRollover {
             source,
             source_vault: pda(&[b"vault", source.as_ref()]),
-            escrow: pda(&[b"rollover-escrow"]),
+            escrow: escrow_of(&admin),
             schedule: schedule_of(&admin),
         }
         .to_account_metas(None),
@@ -242,15 +283,24 @@ async fn winner_is_paid_once_from_the_vault() {
     assert!(send(&mut context, &player, late_place).await.is_err());
     send(&mut context, &player, reveal_ix(player.pubkey(), admin.pubkey(), 1, 0)).await.unwrap();
 
+    set_clock(&mut context, deadline + 19);
+    assert!(
+        send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), event, vec![b'1'; 7])).await.is_err(),
+        "results cannot be approved before the end time"
+    );
     set_clock(&mut context, deadline + 20);
-    let mut resolve = resolve_ix(admin.pubkey(), other.pubkey(), event, vec![b'1'; 7]);
-    assert!(send_all(&mut context, &[&admin, &other], resolve.clone()).await.is_err(), "resolution must include every coupon");
-    resolve.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(coupon, false));
-    send_all(&mut context, &[&admin, &other], resolve).await.unwrap();
+    send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), event, vec![b'1'; 7])).await.unwrap();
+    send(&mut context, &admin, tally_ix(admin.pubkey(), event, &[])).await.expect_err("one approval does not lock results");
+    fund(&mut context, &other.pubkey(), 10_000_000).await;
+    send(&mut context, &other, approve_ix(other.pubkey(), admin.pubkey(), event, vec![b'1'; 7])).await.unwrap();
+    assert_eq!(load_event(&mut context, event).await.status, EventStatus::Tallying);
+    send(&mut context, &admin, tally_ix(admin.pubkey(), event, &[])).await.unwrap();
+    assert_eq!(load_event(&mut context, event).await.status, EventStatus::Tallying, "settlement waits for every coupon");
+    send(&mut context, &admin, tally_ix(admin.pubkey(), event, &[coupon])).await.unwrap();
 
     let settled = load_event(&mut context, event).await;
     assert_eq!(settled.status, EventStatus::Resolved);
-    assert_eq!(settled.per_winner[7], 950_000);
+    assert_eq!(settled.per_winner[6], 950_000);
     assert_eq!(settled.house, 50_000);
     let stranger = Keypair::new();
     fund(&mut context, &stranger.pubkey(), 1_000_000).await;
@@ -292,7 +342,7 @@ async fn cancelled_event_refunds_the_entry_price() {
     let reserve = load_event(&mut context, event).await.rent_reserve;
     let (place, coupon) = place_ix(player.pubkey(), admin.pubkey(), 2, 0);
     send(&mut context, &player, place).await.unwrap();
-    send_all(&mut context, &[&admin, &other], cancel_ix(admin.pubkey(), other.pubkey(), event)).await.unwrap();
+    cancel(&mut context, &admin, &other, event).await;
     let before = context.banks_client.get_balance(player.pubkey()).await.unwrap();
     let refund = Instruction {
         program_id: predictions::ID,
@@ -326,9 +376,7 @@ async fn rollover_reaches_only_the_earliest_future_event() {
     set_clock(&mut context, now + 11);
     send(&mut context, &player, reveal_ix(player.pubkey(), admin.pubkey(), 10, 0)).await.unwrap();
     set_clock(&mut context, now + 30);
-    let mut resolve = resolve_ix(admin.pubkey(), other.pubkey(), event_a, vec![b'2'; 7]);
-    resolve.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(coupon, false));
-    send_all(&mut context, &[&admin, &other], resolve).await.unwrap();
+    resolve(&mut context, &admin, &other, event_a, vec![b'2'; 7], &[coupon]).await;
     let source = load_event(&mut context, event_a).await;
     assert_eq!(source.rollover_out, 950_000);
     assert!(send(&mut context, &admin, park_ix(admin.pubkey(), 10)).await.is_err(), "an open future event must receive the rollover");
@@ -359,17 +407,23 @@ async fn parked_rollover_is_assigned_to_the_next_event() {
     set_clock(&mut context, now + 11);
     send(&mut context, &player, reveal_ix(player.pubkey(), admin.pubkey(), 20, 0)).await.unwrap();
     set_clock(&mut context, now + 30);
-    let mut resolve = resolve_ix(admin.pubkey(), other.pubkey(), event_a, vec![b'2'; 7]);
-    resolve.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(coupon, false));
-    send_all(&mut context, &[&admin, &other], resolve).await.unwrap();
+    resolve(&mut context, &admin, &other, event_a, vec![b'2'; 7], &[coupon]).await;
     send(&mut context, &admin, park_ix(admin.pubkey(), 20)).await.unwrap();
-    assert_eq!(load_escrow(&mut context).await.pending, 950_000);
+    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, 950_000);
+
+    let intruder = Keypair::new();
+    let accomplice = Keypair::new();
+    fund(&mut context, &intruder.pubkey(), 2_000_000_000).await;
+    let (create_x, event_x, _) = create_ix(intruder.pubkey(), accomplice.pubkey(), 99, now + 400);
+    send(&mut context, &intruder, create_x).await.unwrap();
+    assert_eq!(load_event(&mut context, event_x).await.rollover_in, 0, "another admin's event must not take parked rollover");
+    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, 950_000);
 
     let (create_b, event_b, _) = create_ix(admin.pubkey(), other.pubkey(), 21, now + 500);
     send(&mut context, &admin, create_b).await.unwrap();
     assert_eq!(load_event(&mut context, event_b).await.rollover_in, 950_000);
-    assert_eq!(load_escrow(&mut context).await.pending, 0);
-    send_all(&mut context, &[&admin, &other], cancel_ix(admin.pubkey(), other.pubkey(), event_b)).await.unwrap();
+    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, 0);
+    cancel(&mut context, &admin, &other, event_b).await;
     assert_eq!(load_event(&mut context, event_b).await.rollover_out, 950_000);
 
     let (create_c, event_c, vault_c) = create_ix(admin.pubkey(), other.pubkey(), 22, now + 5_000);
@@ -399,7 +453,7 @@ async fn forwarding_rollover_leaves_unclaimed_winnings() {
             admin: admin.pubkey(),
             event,
             vault,
-            escrow: pda(&[b"rollover-escrow"]),
+            escrow: escrow_of(&admin.pubkey()),
             schedule: schedule_of(&admin.pubkey()),
             signers: signers_of(&event),
             gate: gate_of(&admin.pubkey()),
@@ -417,11 +471,9 @@ async fn forwarding_rollover_leaves_unclaimed_winnings() {
     set_clock(&mut context, now + 11);
     send(&mut context, &player, reveal_ix(player.pubkey(), admin.pubkey(), 30, 0)).await.unwrap();
     set_clock(&mut context, now + 30);
-    let mut resolve = resolve_ix(admin.pubkey(), other.pubkey(), event, vec![b'1'; 7]);
-    resolve.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(coupon, false));
-    send_all(&mut context, &[&admin, &other], resolve).await.unwrap();
+    resolve(&mut context, &admin, &other, event, vec![b'1'; 7], &[coupon]).await;
     let settled = load_event(&mut context, event).await;
-    assert_eq!(settled.per_winner[7], 500_000);
+    assert_eq!(settled.per_winner[6], 500_000);
     assert_eq!(settled.rollover_out, 450_000);
     send(&mut context, &admin, forward_ix(admin.pubkey(), 30, 31)).await.unwrap();
     assert_eq!(
@@ -471,14 +523,21 @@ async fn one_signer_cannot_resolve_and_pause_spares_claims() {
     set_clock(&mut context, deadline + 1);
     send(&mut context, &player, reveal_ix(player.pubkey(), admin.pubkey(), 40, 0)).await.unwrap();
     set_clock(&mut context, deadline + 20);
-    let mut alone = resolve_ix(admin.pubkey(), other.pubkey(), event, vec![b'1'; 7]);
-    alone.accounts.pop();
-    alone.data = predictions::instruction::ResolveEvent { results: vec![b'1'; 7], signer_count: 1 }.data();
-    alone.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(coupon, false));
-    assert!(send(&mut context, &admin, alone).await.is_err(), "one result signer is not enough");
-    let mut resolve = resolve_ix(admin.pubkey(), other.pubkey(), event, vec![b'1'; 7]);
-    resolve.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(coupon, false));
-    send_all(&mut context, &[&admin, &other], resolve).await.unwrap();
+    let outsider = Keypair::new();
+    fund(&mut context, &outsider.pubkey(), 10_000_000).await;
+    assert!(
+        send(&mut context, &outsider, approve_ix(outsider.pubkey(), admin.pubkey(), event, vec![b'1'; 7])).await.is_err(),
+        "only a listed result signer can approve"
+    );
+    send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), event, vec![b'1'; 7])).await.unwrap();
+    // The second signer disagrees, which restarts the count instead of locking anything.
+    fund(&mut context, &other.pubkey(), 10_000_000).await;
+    send(&mut context, &other, approve_ix(other.pubkey(), admin.pubkey(), event, vec![b'2'; 7])).await.unwrap();
+    assert_eq!(load_event(&mut context, event).await.status, EventStatus::Open, "conflicting approvals must not lock results");
+    assert_eq!(load_event(&mut context, event).await.approvals.count_ones(), 1);
+    send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), event, vec![b'1'; 7])).await.unwrap();
+    assert_eq!(load_event(&mut context, event).await.status, EventStatus::Open, "one signer is not enough");
+    resolve(&mut context, &admin, &other, event, vec![b'1'; 7], &[coupon]).await;
     send(&mut context, &admin, pause).await.unwrap();
     let claim = Instruction {
         program_id: predictions::ID,
@@ -522,6 +581,155 @@ async fn anyone_can_refund_after_the_resolution_timeout() {
     assert_eq!(load_event(&mut context, event).await.status, EventStatus::Cancelled);
 }
 
+fn withdraw_house_ix(admin: Pubkey, event: Pubkey) -> Instruction {
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::WithdrawHouse { admin, event, vault: pda(&[b"vault", event.as_ref()]) }.to_account_metas(None),
+        data: predictions::instruction::WithdrawHouse {}.data(),
+    }
+}
+
+#[tokio::test]
+async fn batched_tally_settles_a_full_thirteen_game_event() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    let stranger = Keypair::new();
+    fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    fund(&mut context, &stranger.pubkey(), 10_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let deadline = now + 100;
+    let nonce = 50u64;
+    let mut args = event_args(nonce, deadline);
+    args.game_count = 13;
+    args.signers = vec![admin.pubkey(), other.pubkey()];
+    args.tiers = vec![
+        TierArg { correct: 13, percent: 50 },
+        TierArg { correct: 12, percent: 25 },
+        TierArg { correct: 11, percent: 15 },
+        TierArg { correct: 10, percent: 5 },
+    ];
+    let event = pda(&[b"event", admin.pubkey().as_ref(), &nonce.to_le_bytes()]);
+    let vault = pda(&[b"vault", event.as_ref()]);
+    let create = Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::CreateEvent {
+            admin: admin.pubkey(),
+            event,
+            vault,
+            escrow: escrow_of(&admin.pubkey()),
+            schedule: schedule_of(&admin.pubkey()),
+            signers: signers_of(&event),
+            gate: gate_of(&admin.pubkey()),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::CreateEvent { args }.data(),
+    };
+    send(&mut context, &admin, create).await.unwrap();
+
+    let home = [0b001u8; 13];
+    let away = [0b100u8; 13];
+    let count = 35u32;
+    let mut coupons = Vec::new();
+    for index in 0..count {
+        let picks = if index == 0 { home } else { away };
+        let (place, coupon) = place_picks_ix(player.pubkey(), admin.pubkey(), nonce, index, picks, 1);
+        send(&mut context, &player, place).await.unwrap();
+        coupons.push(coupon);
+    }
+    let first = context.banks_client.get_account(coupons[3]).await.unwrap().unwrap();
+    let stored = predictions::Coupon::try_deserialize(&mut first.data.as_slice()).unwrap();
+    assert_eq!(stored.sealed, [3u8; predictions::SEALED_LEN], "the sealed backup is stored as given");
+
+    set_clock(&mut context, deadline + 1);
+    for index in 0..count {
+        // Coupon 1 is never revealed: its stake stays in the pool and it cannot win.
+        if index == 1 {
+            continue;
+        }
+        let picks = if index == 0 { home } else { away };
+        send(&mut context, &player, reveal_picks_ix(player.pubkey(), admin.pubkey(), nonce, index, picks)).await.unwrap();
+    }
+
+    set_clock(&mut context, deadline + 20);
+    let mut results = vec![b'1'; 13];
+    results[12] = b'C';
+    send(&mut context, &admin, approve_cancel_ix(admin.pubkey(), admin.pubkey(), event)).await.unwrap();
+    assert_eq!(load_event(&mut context, event).await.status, EventStatus::Open, "one cancel approval is not enough");
+    send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), event, results.clone())).await.unwrap();
+    fund(&mut context, &other.pubkey(), 10_000_000).await;
+    send(&mut context, &other, approve_ix(other.pubkey(), admin.pubkey(), event, results.clone())).await.unwrap();
+    assert!(
+        send(&mut context, &other, approve_cancel_ix(other.pubkey(), admin.pubkey(), event)).await.is_err(),
+        "locked results cannot be cancelled"
+    );
+    assert!(
+        send(&mut context, &player, reveal_picks_ix(player.pubkey(), admin.pubkey(), nonce, 1, away)).await.is_err(),
+        "no reveal after results are locked"
+    );
+    assert!(
+        send(&mut context, &stranger, tally_ix(admin.pubkey(), event, &coupons[1..3])).await.is_err(),
+        "coupons must be tallied in index order"
+    );
+    for batch in coupons.chunks(10) {
+        send(&mut context, &stranger, tally_ix(admin.pubkey(), event, batch)).await.unwrap();
+    }
+
+    let settled = load_event(&mut context, event).await;
+    assert_eq!(settled.status, EventStatus::Resolved);
+    assert_eq!(settled.tallied, count);
+    assert_eq!(settled.winners[13], 1, "the void game counts as correct for the home coupon");
+    assert_eq!(settled.winners[1], 33, "away coupons only score the void game");
+    let sales = u64::from(count) * 1_000_000;
+    assert_eq!(settled.per_winner[12], sales / 2);
+    assert_eq!(settled.rollover_out, sales * 45 / 100);
+    assert_eq!(settled.house, sales * 5 / 100);
+
+    let expire = Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::ExpireEvent { caller: stranger.pubkey(), event, schedule: schedule_of(&admin.pubkey()) }.to_account_metas(None),
+        data: predictions::instruction::ExpireEvent {}.data(),
+    };
+    set_clock(&mut context, deadline + 200_000);
+    assert!(send(&mut context, &stranger, expire).await.is_err(), "a resolved event cannot expire");
+
+    let before = context.banks_client.get_balance(player.pubkey()).await.unwrap();
+    send(&mut context, &player, claim_ix(coupons[0], event, player.pubkey())).await.unwrap();
+    assert!(context.banks_client.get_balance(player.pubkey()).await.unwrap() > before + sales / 2 - 10_000_000);
+    send(&mut context, &player, claim_ix(coupons[1], event, player.pubkey())).await.unwrap();
+    assert!(context.banks_client.get_account(coupons[1]).await.unwrap().is_none(), "an unrevealed coupon closes with no payout");
+
+    assert!(send(&mut context, &stranger, withdraw_house_ix(stranger.pubkey(), event)).await.is_err(), "only the event admin takes the house share");
+    let admin_before = context.banks_client.get_balance(admin.pubkey()).await.unwrap();
+    send(&mut context, &admin, withdraw_house_ix(admin.pubkey(), event)).await.unwrap();
+    assert!(context.banks_client.get_balance(admin.pubkey()).await.unwrap() > admin_before);
+    assert!(send(&mut context, &admin, withdraw_house_ix(admin.pubkey(), event)).await.is_err(), "the house share is taken once");
+    assert_eq!(
+        context.banks_client.get_balance(vault).await.unwrap(),
+        settled.rent_reserve + settled.rollover_out,
+        "only the unforwarded rollover remains"
+    );
+}
+
+#[tokio::test]
+async fn house_share_waits_for_resolution() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let (create, event, _) = create_ix(admin.pubkey(), other.pubkey(), 60, now + 100);
+    send(&mut context, &admin, create).await.unwrap();
+    let (place, _) = place_ix(player.pubkey(), admin.pubkey(), 60, 0);
+    send(&mut context, &player, place).await.unwrap();
+    assert!(send(&mut context, &admin, withdraw_house_ix(admin.pubkey(), event)).await.is_err(), "no house share while open");
+    cancel(&mut context, &admin, &other, event).await;
+    assert!(send(&mut context, &admin, withdraw_house_ix(admin.pubkey(), event)).await.is_err(), "a cancelled event has no house share");
+}
+
 #[tokio::test]
 async fn upgrade_is_public_and_delayed() {
     let mut context = start().await;
@@ -552,10 +760,12 @@ async fn upgrade_is_public_and_delayed() {
     schedule.data = predictions::instruction::ScheduleUpgrade { signer_count: 2 }.data();
     send_all(&mut context, &[&admin, &other], schedule.clone()).await.unwrap();
 
+    let loader = Pubkey::from_str("BPFLoaderUpgradeab1e11111111111111111111111").unwrap();
     let execute = Instruction {
         program_id: predictions::ID,
         accounts: predictions::accounts::ExecuteUpgrade {
             council,
+            program_data: Pubkey::find_program_address(&[predictions::ID.as_ref()], &loader).0,
             program_account: predictions::ID,
             buffer,
             spill,

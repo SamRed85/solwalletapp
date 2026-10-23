@@ -1,8 +1,8 @@
 import { ed25519 } from '@noble/curves/ed25519'
 import { base58Encode } from '../src/services/solana.js'
 import {
-  claimIx, compileMessage, couponCommitment, couponPda, createEventIx, escrowPda, eventPda,
-  findPda, picksFromSystem, placeCouponIx, PROGRAM_ID, resolveEventIx, revealCouponIx, vaultPda
+  approveResolutionIx, claimIx, compileMessage, couponCommitment, couponPda, createEventIx, decodeEvent, escrowPda, eventPda,
+  findPda, picksFromSystem, placeCouponIx, PROGRAM_ID, revealCouponIx, tallyIx, vaultPda
 } from '../src/services/program.js'
 
 const url = process.env.SOLANA_URL || 'http://127.0.0.1:8899'
@@ -109,7 +109,7 @@ for (let attempt = 0; attempt < 60; attempt++) {
 }
 
 const council = findPda([new TextEncoder().encode('upgrade-council')])
-if (council !== '9ad7bFZNUVuvGkM2ZbepzK6wADV4LaWpW2weQPxXSWD2') {
+if (council !== 'D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt') {
   throw new Error(`PDA derivation drifted: ${council}`)
 }
 
@@ -144,15 +144,20 @@ const revealed = await send(player, [player], [revealCouponIx({ player: player.a
 if (revealed instanceof Error) throw revealed
 await waitUntil(revealDeadline)
 
-const missing = await send(admin, [admin, other], [resolveEventIx({ admin: admin.address, other: other.address, event })])
-if (!(missing instanceof Error)) throw new Error('resolution must include every coupon')
-const resolved = await send(admin, [admin, other], [resolveEventIx({ admin: admin.address, other: other.address, event, coupon })])
-if (resolved instanceof Error) throw resolved
+const results = '1111111'
+const first = await send(admin, [admin], [approveResolutionIx({ signer: admin.address, admin: admin.address, event, results })])
+if (first instanceof Error) throw first
+if (decodeEvent(await account(event)).status !== 'open') throw new Error('one signer must not settle the event')
+const second = await send(other, [other], [approveResolutionIx({ signer: other.address, admin: admin.address, event, results })])
+if (second instanceof Error) throw second
+const tallied = await send(stranger, [stranger], [tallyIx({ admin: admin.address, event, coupons: [coupon] })])
+if (tallied instanceof Error) throw tallied
 
 const eventData = await account(event)
-const house = eventData.readBigUInt64LE(8 + 142)
-const perWinner = eventData.readBigUInt64LE(8 + 167 + 56)
-if (perWinner !== 950_000n || house !== 50_000n) {
+const settled = decodeEvent(eventData)
+const house = settled.house
+const perWinner = settled.perWinner[6]
+if (settled.status !== 'resolved' || perWinner !== 950_000n || house !== 50_000n) {
   throw new Error(`unexpected settlement perWinner=${perWinner} house=${house}`)
 }
 
@@ -166,11 +171,11 @@ if (after <= before) throw new Error('the vault must pay the winner')
 if (await account(coupon)) throw new Error('a paid coupon account must close')
 const repeated = await send(player, [player], [claimIx({ owner: player.address, event, coupon })])
 if (!(repeated instanceof Error)) throw new Error('a claim cannot be repeated')
-const reserve = eventData.readBigUInt64LE(8 + 273)
+const reserve = settled.rentReserve
 if (BigInt(await balance(vault)) !== reserve + house) throw new Error('the vault did not keep the house share')
 
 console.log('wallet client placed, won, and claimed against the built program')
 console.log(`player gained ${after - before} lamports`)
 console.log(`program ${PROGRAM_ID}`)
 console.log(`event ${event}`)
-console.log(`escrow ${escrowPda()}`)
+console.log(`escrow ${escrowPda(admin.address)}`)

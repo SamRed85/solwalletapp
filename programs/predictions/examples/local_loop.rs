@@ -16,7 +16,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-const PROGRAM: &str = "35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca";
+const PROGRAM: &str = "H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr";
 const CLOCK: &str = "SysvarC1ock11111111111111111111111111111111";
 const REVEAL_NONCE: u64 = 7;
 
@@ -52,14 +52,17 @@ fn main() {
     rpc.send(&player, &[reveal_ix(&player, &admin, nonce, 0)], true).unwrap();
     rpc.wait_until(reveal_deadline);
 
-    let mut missing = resolve_ix(&admin, &other, event, false);
-    assert!(rpc.send_all(&[&admin, &other], &[missing.clone()], true).is_err(), "resolution must include every coupon");
-    missing.accounts.push(AccountMeta::new_readonly(coupon, false));
-    rpc.send_all(&[&admin, &other], &[missing], true).unwrap();
+    rpc.send(&admin, &[approve_ix(&admin, &admin.pubkey(), event)], true).unwrap();
+    assert_eq!(rpc.event(&event).status, EventStatus::Open, "one signer must not lock results");
+    rpc.send_all(&[&player, &other], &[approve_ix(&other, &admin.pubkey(), event)], true).unwrap();
+    assert_eq!(rpc.event(&event).status, EventStatus::Tallying);
+    let mut tally = tally_ix(&admin, event);
+    tally.accounts.push(AccountMeta::new_readonly(coupon, false));
+    rpc.send(&stranger, &[tally], true).unwrap();
 
     let settled = rpc.event(&event);
     assert_eq!(settled.status, EventStatus::Resolved);
-    assert_eq!(settled.per_winner[7], 950_000);
+    assert_eq!(settled.per_winner[6], 950_000);
     assert_eq!(settled.house, 50_000);
 
     let claim = claim_ix(coupon, event, vault, player.pubkey());
@@ -87,7 +90,7 @@ fn create_ix(admin: &Keypair, other: &Keypair, nonce: u64, deadline: i64, reveal
             admin: admin_key,
             event,
             vault: pda(&[b"vault", event.as_ref()]),
-            escrow: pda(&[b"rollover-escrow"]),
+            escrow: pda(&[b"rollover-escrow", admin_key.as_ref()]),
             schedule: pda(&[b"schedule", admin_key.as_ref()]),
             signers: pda(&[b"signers", event.as_ref()]),
             gate: pda(&[b"gate", admin_key.as_ref()]),
@@ -134,6 +137,7 @@ fn place_ix(player: &Keypair, admin: &Keypair, nonce: u64, index: u32) -> Instru
         data: predictions::instruction::PlaceCoupon {
             commitment: predictions::coupon_commitment(&player.pubkey(), &picks(), REVEAL_NONCE),
             combinations: 1,
+            sealed: [0; predictions::SEALED_LEN],
         }
         .data(),
     }
@@ -153,24 +157,31 @@ fn reveal_ix(player: &Keypair, admin: &Keypair, nonce: u64, index: u32) -> Instr
     }
 }
 
-fn resolve_ix(admin: &Keypair, other: &Keypair, event: Pubkey, include_coupon: bool) -> Instruction {
-    let mut instruction = Instruction {
+fn approve_ix(signer: &Keypair, admin: &Pubkey, event: Pubkey) -> Instruction {
+    Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::ResolveEvent {
+        accounts: predictions::accounts::Approve {
+            signer: signer.pubkey(),
             event,
             signers: pda(&[b"signers", event.as_ref()]),
+            schedule: pda(&[b"schedule", admin.as_ref()]),
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::ApproveResolution { results: vec![b'1'; 7] }.data(),
+    }
+}
+
+fn tally_ix(admin: &Keypair, event: Pubkey) -> Instruction {
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::Tally {
+            event,
             vault: pda(&[b"vault", event.as_ref()]),
             schedule: pda(&[b"schedule", admin.pubkey().as_ref()]),
         }
         .to_account_metas(None),
-        data: predictions::instruction::ResolveEvent { results: vec![b'1'; 7], signer_count: 2 }.data(),
-    };
-    instruction.accounts.push(AccountMeta::new_readonly(admin.pubkey(), true));
-    instruction.accounts.push(AccountMeta::new_readonly(other.pubkey(), true));
-    if include_coupon {
-        instruction.accounts.push(AccountMeta::new_readonly(pda(&[b"coupon", event.as_ref(), &0u32.to_le_bytes()]), false));
+        data: predictions::instruction::Tally {}.data(),
     }
-    instruction
 }
 
 fn claim_ix(coupon: Pubkey, event: Pubkey, vault: Pubkey, owner: Pubkey) -> Instruction {

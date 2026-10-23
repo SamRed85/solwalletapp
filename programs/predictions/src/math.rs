@@ -19,6 +19,8 @@ pub struct Settlement {
     pub per_winner: Vec<u64>,
 }
 
+pub const VOID_RESULT: u8 = b'C';
+
 pub fn mask_for(outcome: u8) -> Option<u8> {
     match outcome {
         b'1' => Some(0b001),
@@ -26,6 +28,14 @@ pub fn mask_for(outcome: u8) -> Option<u8> {
         b'2' => Some(0b100),
         _ => None,
     }
+}
+
+/// A voided game scores every pick as correct, so it changes no coupon's relative standing.
+pub fn result_mask(result: u8) -> Option<u8> {
+    if result == VOID_RESULT {
+        return Some(0b111);
+    }
+    mask_for(result)
 }
 
 pub fn combination_count(picks: &[u8]) -> Result<u32, &'static str> {
@@ -43,24 +53,27 @@ pub fn combination_count(picks: &[u8]) -> Result<u32, &'static str> {
     Ok(combinations)
 }
 
-pub fn correct_counts(picks: &[u8], results: &[u8]) -> Result<Vec<u32>, &'static str> {
-    if picks.len() != results.len() {
+/// Rows of one system entry by number of correct picks. Index `n` holds the rows with
+/// exactly `n` correct; indexes above the game count stay zero.
+pub fn correct_counts(picks: &[u8], results: &[u8]) -> Result<[u32; MAX_GAMES + 1], &'static str> {
+    if picks.len() != results.len() || picks.len() > MAX_GAMES {
         return Err("result count does not match the games");
     }
-    let mut counts = vec![1u32];
-    for (&mask, &result) in picks.iter().zip(results) {
-        let result_bit = mask_for(result).ok_or("result must be 1, X, or 2")?;
-        let choices = mask.count_ones();
-        let correct = u32::from(mask & result_bit != 0);
+    let mut counts = [0u32; MAX_GAMES + 1];
+    counts[0] = 1;
+    for (game, (&mask, &result)) in picks.iter().zip(results).enumerate() {
+        let result_bits = result_mask(result).ok_or("result must be 1, X, 2 or C")?;
+        let choices = (mask & 0b111).count_ones();
+        let correct = (mask & result_bits).count_ones();
         let wrong = choices - correct;
-        let mut next = vec![0u32; counts.len() + 1];
-        for (score, &rows) in counts.iter().enumerate() {
-            if wrong > 0 {
-                next[score] += rows * wrong;
+        let mut next = [0u32; MAX_GAMES + 1];
+        for score in 0..=game {
+            let rows = counts[score];
+            if rows == 0 {
+                continue;
             }
-            if correct > 0 {
-                next[score + 1] += rows * correct;
-            }
+            next[score] = next[score].checked_add(rows.checked_mul(wrong).ok_or("row count overflows")?).ok_or("row count overflows")?;
+            next[score + 1] = next[score + 1].checked_add(rows.checked_mul(correct).ok_or("row count overflows")?).ok_or("row count overflows")?;
         }
         counts = next;
     }
@@ -97,9 +110,9 @@ pub fn validate_tiers(tiers: &[Tier], game_count: u8) -> Result<(), &'static str
     Ok(())
 }
 
-pub fn settle(sales: u64, rollover_in: u64, game_count: u8, tiers: &[Tier], winners: &[u32]) -> Result<Settlement, &'static str> {
+pub fn settle(sales: u64, rollover_in: u64, game_count: u8, tiers: &[Tier], winners: &[u64]) -> Result<Settlement, &'static str> {
     validate_tiers(tiers, game_count)?;
-    if winners.len() != game_count as usize + 1 {
+    if winners.len() < game_count as usize + 1 {
         return Err("winner table does not cover every score");
     }
     let mut settlement = Settlement {
@@ -116,7 +129,7 @@ pub fn settle(sales: u64, rollover_in: u64, game_count: u8, tiers: &[Tier], winn
             pot += u128::from(rollover_in);
         }
         let pot = u64::try_from(pot).map_err(|_| "tier pot overflows")?;
-        let winner_count = u64::from(winners[tier.correct as usize]);
+        let winner_count = winners[tier.correct as usize];
         if winner_count == 0 {
             settlement.rollover_out = settlement.rollover_out.checked_add(pot).ok_or("rollover overflows")?;
         } else {
@@ -146,12 +159,12 @@ mod tests {
         text.bytes().map(|outcome| mask_for(outcome).unwrap()).collect()
     }
 
-    fn winners_for(rows: &[&str], results: &str) -> Vec<u32> {
-        let mut winners = vec![0u32; results.len() + 1];
+    fn winners_for(rows: &[&str], results: &str) -> Vec<u64> {
+        let mut winners = vec![0u64; results.len() + 1];
         for row_text in rows {
             let counts = correct_counts(&row(row_text), &results.as_bytes()).unwrap();
-            for (score, count) in counts.iter().enumerate() {
-                winners[score] += count;
+            for (score, winner) in winners.iter_mut().enumerate() {
+                *winner += u64::from(counts[score]);
             }
         }
         winners
@@ -207,8 +220,21 @@ mod tests {
                 .count();
             expanded[score] += 1;
         }
-        assert_eq!(counts, expanded);
+        assert_eq!(&counts[..4], &expanded);
+        assert!(counts[4..].iter().all(|rows| *rows == 0));
         assert_eq!(combination_count(&picks).unwrap(), 4);
+    }
+
+    #[test]
+    fn void_game_scores_every_pick_as_correct() {
+        let picks = [0b011, 0b001, 0b100];
+        let counts = correct_counts(&picks, b"C12").unwrap();
+        assert_eq!(&counts[..4], &[0, 0, 0, 2]);
+        let counts = correct_counts(&picks, b"C21").unwrap();
+        assert_eq!(&counts[..4], &[0, 2, 0, 0]);
+        let unrevealed = correct_counts(&[0, 0, 0], b"C12").unwrap();
+        assert!(unrevealed.iter().all(|rows| *rows == 0), "an unrevealed coupon has no rows");
+        assert!(correct_counts(&picks, b"Z12").is_err());
     }
 
     #[test]

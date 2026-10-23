@@ -57,6 +57,7 @@ export const eventApi = {
   create: event => data(api.post('/api/events', event)),
   setGames: (id, games) => data(api.put(`/api/events/${id}/games`, { games })),
   setChain: (id, chain) => data(api.put(`/api/events/${id}/chain`, chain)),
+  syncChain: id => data(api.post(`/api/events/${id}/chain/sync`)),
   // Drawing cancelled games searches devnet blocks, which can take a while on the public RPC.
   setResults: (id, results) => data(api.post(`/api/events/${id}/results`, { results }, { timeout: 150000 })),
   payouts: id => data(api.get(`/api/events/${id}/payouts`))

@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url'
 import { ed25519 } from '@noble/curves/ed25519'
 import { base58Encode } from '../src/services/solana.js'
 import {
-  claimIx, compileMessage, couponCommitment, couponPda, createEventIx, eventPda,
-  picksFromSystem, placeCouponIx, PROGRAM_ID, resolveEventIx, revealCouponIx, vaultPda
+  approveResolutionIx, claimIx, compileMessage, couponCommitment, couponPda, createEventIx, decodeEvent, eventPda,
+  picksFromSystem, placeCouponIx, PROGRAM_ID, revealCouponIx, tallyIx, vaultPda
 } from '../src/services/program.js'
 
 const url = 'https://api.devnet.solana.com'
@@ -37,14 +37,25 @@ function concat (parts) {
 }
 
 async function rpc (method, params) {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
-  })
-  const body = await response.json()
-  if (body.error) throw new Error(`${method} failed: ${JSON.stringify(body.error)}`)
-  return body.result
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
+    })
+    if (response.status === 429) {
+      await new Promise(resolve => setTimeout(resolve, 3000 * (attempt + 1)))
+      continue
+    }
+    const body = await response.json()
+    if (body.error && /429|Too many requests/i.test(JSON.stringify(body.error)) && attempt < 7) {
+      await new Promise(resolve => setTimeout(resolve, 3000 * (attempt + 1)))
+      continue
+    }
+    if (body.error) throw new Error(`${method} failed: ${JSON.stringify(body.error)}`)
+    return body.result
+  }
+  throw new Error(`${method} was rate limited`)
 }
 
 async function confirm (signature) {
@@ -123,15 +134,20 @@ const revealed = await send(admin, [admin], [revealCouponIx({ player: admin.addr
 if (revealed instanceof Error) throw revealed
 await waitUntil(revealDeadline)
 
-const missing = await send(admin, [admin, other], [resolveEventIx({ admin: admin.address, other: other.address, event })])
-if (!(missing instanceof Error)) throw new Error('resolution must include every coupon')
-const resolved = await send(admin, [admin, other], [resolveEventIx({ admin: admin.address, other: other.address, event, coupon })])
-if (resolved instanceof Error) throw resolved
+const results = '1111111'
+const first = await send(admin, [admin], [approveResolutionIx({ signer: admin.address, admin: admin.address, event, results })])
+if (first instanceof Error) throw first
+// The second signer holds no SOL, so the deployer pays its fee.
+const second = await send(admin, [admin, other], [approveResolutionIx({ signer: other.address, admin: admin.address, event, results })])
+if (second instanceof Error) throw second
+const tallied = await send(admin, [admin], [tallyIx({ admin: admin.address, event, coupons: [coupon] })])
+if (tallied instanceof Error) throw tallied
 
 const eventData = await account(event)
-const house = eventData.readBigUInt64LE(8 + 142)
-const perWinner = eventData.readBigUInt64LE(8 + 167 + 56)
-if (perWinner !== 950_000n || house !== 50_000n) {
+const settled = decodeEvent(eventData)
+const house = settled.house
+const perWinner = settled.perWinner[6]
+if (settled.status !== 'resolved' || perWinner !== 950_000n || house !== 50_000n) {
   throw new Error(`unexpected settlement perWinner=${perWinner} house=${house}`)
 }
 
@@ -143,7 +159,7 @@ if (after <= before) throw new Error('the vault must pay the winner')
 if (await account(coupon)) throw new Error('a paid coupon account must close')
 const repeated = await send(admin, [admin], [claimIx({ owner: admin.address, event, coupon })])
 if (!(repeated instanceof Error)) throw new Error('a claim cannot be repeated')
-const reserve = eventData.readBigUInt64LE(8 + 273)
+const reserve = settled.rentReserve
 if (BigInt(await balance(vault)) !== reserve + house) throw new Error('the vault did not keep the house share')
 
 console.log('devnet wallet placed, won, and claimed without the backend')

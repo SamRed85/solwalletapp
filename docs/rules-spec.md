@@ -9,7 +9,8 @@ normative input for the first on-chain program. All amounts are integer lamports
   winnings or refunds belonging to that wallet.
 - An **event administrator** creates events and games. In the current devnet product the
   administrator also submits results. The on-chain design must never let this role withdraw
-  from an event vault, redirect a claim, alter an accepted coupon, or block claims/refunds.
+  from an event vault (other than the settled house share, see section 10), redirect a claim,
+  alter an accepted coupon, or block claims/refunds.
 - A **result signer** resolves outcomes. Phase 4 may use the administrator; Phase 5 replaces
   that single signer with an oracle or M-of-N independent signers.
 
@@ -168,8 +169,42 @@ funds.
 2. No coupon is accepted at or after the deadline.
 3. Total claims plus refunds cannot exceed vault liabilities.
 4. A claim or refund cannot be repeated or redirected.
-5. The administrator cannot withdraw event funds.
+5. The administrator cannot withdraw event funds other than the settled house share, once.
 6. Settlement and every draw can be recomputed from public inputs.
 7. Claims remain available without administrator or indexer cooperation.
 8. Cancellation or timeout provides a permissionless refund path.
 9. Every state transition is one-way and resolution occurs at most once.
+
+## 10. Vault events (on-chain program)
+
+An event attached to the on-chain program follows sections 1 to 9 with these differences. The
+program is authoritative; MongoDB only mirrors its status.
+
+- **Hidden picks.** `place_coupon` stores `SHA-256(owner || picks || nonce)` and the paid row
+  count. Picks are revealed with the nonce from the entry deadline until the reveal deadline,
+  which equals the event end time. A coupon that is not revealed in time cannot win; its
+  payment stays in the pool and claiming it only closes the account (its rent goes back to the
+  owner). A refund for unrevealed coupons would let a player reveal only winning coupons.
+- **Picks backup.** Each coupon stores 21 encrypted bytes: the 13 pick masks and the nonce,
+  XORed with `SHA-256(key || commitment)[0..21]`, where `key = SHA-256(wallet signature of a
+  fixed message)`. The program never reads it. It lets the owner rebuild a coupon on another
+  device; a wallet whose message signatures are not deterministic cannot use it.
+- **Void games.** A result of `C` scores every pick on that game as correct. There is no
+  weighted draw for vault events.
+- **Resolution.** The vault names two result signers: the event administrator and the
+  configured cosigner, which must not be an administrator. Each approves the same results, or
+  approves cancellation, in its own transaction, no earlier than the end time and before the
+  resolution timeout (end time + 7 days). A different proposal restarts the count. When both
+  agree on results they are locked and the event enters **tallying**, which cannot be cancelled
+  or expired. Anyone then counts the coupons in index order, in batches, and the last batch
+  settles the event under section 7. When both agree on cancellation the event is cancelled.
+- **Timeout.** If neither happens before the resolution timeout, anyone can cancel the event.
+- **House share.** After resolution the event administrator may withdraw exactly the settled
+  house amount, once. Winnings, rollover and refunds cannot be reached by this instruction.
+- **Rollover.** Anyone may forward an event's rollover out to the earliest scheduled vault
+  event of the same administrator that has not started, or park it in the program escrow when
+  none exists; the next event created by that administrator takes it.
+- **Capacity.** One administrator wallet can have at most 16 vault events that are not yet
+  resolved or cancelled. A coupon holds at most 44,000 rows, as in section 3.
+- **Treasury payments.** An event with a vault never turns a treasury transfer into an entry;
+  such a transfer is recorded for manual refund.

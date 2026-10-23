@@ -3,31 +3,14 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/binary"
 	"encoding/json"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
-
-func base58Encode(b []byte) string {
-	n := new(big.Int).SetBytes(b)
-	radix, mod := big.NewInt(58), new(big.Int)
-	var out []byte
-	for n.Sign() > 0 {
-		n.DivMod(n, radix, mod)
-		out = append([]byte{base58Alphabet[mod.Int64()]}, out...)
-	}
-	for _, c := range b {
-		if c != 0 {
-			break
-		}
-		out = append([]byte{'1'}, out...)
-	}
-	return string(out)
-}
 
 func testWallet(t *testing.T) (string, ed25519.PrivateKey) {
 	t.Helper()
@@ -307,7 +290,7 @@ func TestValidateCoupons(t *testing.T) {
 }
 
 func TestPrepareHidesOtherProgram(t *testing.T) {
-	app := &App{cfg: Config{ProgramID: "35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca", CouponPriceLamports: 1_000_000}}
+	app := &App{cfg: Config{ProgramID: "H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr", CouponPriceLamports: 1_000_000}}
 	event := Event{
 		GameCount: 7,
 		StartTime: time.Now().Add(time.Hour),
@@ -328,9 +311,12 @@ func TestValidateChainVault(t *testing.T) {
 	admin := "955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun"
 	other := "4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH"
 	start := time.Now().Add(time.Hour)
-	vault := ChainVault{Admin: admin, Cosigner: other, Nonce: 1}
+	vault := ChainVault{Admin: admin, Cosigner: other, Nonce: 1, Address: other}
 	if msg := validateChainVault(vault, 7, start, time.Now()); msg != "" {
 		t.Fatal(msg)
+	}
+	if validateChainVault(ChainVault{Admin: admin, Cosigner: other, Nonce: 1}, 7, start, time.Now()) == "" {
+		t.Fatal("the event address is required")
 	}
 	if validateChainVault(vault, 0, start, time.Now()) == "" {
 		t.Fatal("games are required")
@@ -356,8 +342,155 @@ func TestEventStatus(t *testing.T) {
 	if s := e.statusAt(now.Add(2 * time.Hour)); s != "closed" {
 		t.Fatalf("want closed, got %s", s)
 	}
+	e.Chain = &ChainVault{Status: "cancelled"}
+	if s := e.statusAt(now.Add(2 * time.Hour)); s != "cancelled" {
+		t.Fatalf("want cancelled, got %s", s)
+	}
 	e.ResultsSetAt = &now
 	if s := e.statusAt(now); s != "completed" {
 		t.Fatalf("want completed, got %s", s)
+	}
+}
+
+func TestPrepareRemembersHiddenVault(t *testing.T) {
+	app := &App{cfg: Config{ProgramID: "H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr"}}
+	event := Event{GameCount: 7, Chain: &ChainVault{ProgramID: "11111111111111111111111111111111"}}
+	app.prepare(&event, time.Now())
+	if event.Chain != nil || !event.hasVault {
+		t.Fatal("a vault from another deployment must stay hidden but still block treasury entries")
+	}
+	plain := Event{GameCount: 7}
+	app.prepare(&plain, time.Now())
+	if plain.hasVault {
+		t.Fatal("a treasury event was treated as a vault event")
+	}
+}
+
+const testProgram = "H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr"
+
+func pubkeyBytes(t *testing.T, address string) []byte {
+	t.Helper()
+	raw, err := base58Decode(address)
+	if err != nil || len(raw) != 32 {
+		t.Fatalf("bad test pubkey %s", address)
+	}
+	return raw
+}
+
+func eventAccountFor(t *testing.T, e *Event, admin string, nonce uint64) *chainAccount {
+	t.Helper()
+	d := make([]byte, 8+448)
+	copy(d, anchorDiscriminator("Event"))
+	copy(d[eventAdminOffset:], pubkeyBytes(t, admin))
+	binary.LittleEndian.PutUint64(d[eventNonceOffset:], nonce)
+	d[eventGameCountOffset] = byte(e.GameCount)
+	binary.LittleEndian.PutUint64(d[eventPriceOffset:], e.CouponPriceLamports)
+	d[eventTierCountOffset] = byte(len(e.Tiers))
+	for i, tier := range e.Tiers {
+		d[eventTiersOffset+2*i] = byte(tier.Correct)
+		d[eventTiersOffset+2*i+1] = byte(tier.Percent)
+	}
+	binary.LittleEndian.PutUint64(d[eventDeadlineOffset:], uint64(e.StartTime.Unix()))
+	binary.LittleEndian.PutUint64(d[eventRevealOffset:], uint64(e.EndTime.Unix()))
+	binary.LittleEndian.PutUint64(d[eventEndOffset:], uint64(e.EndTime.Unix()))
+	binary.LittleEndian.PutUint64(d[eventTimeoutOffset:], uint64(e.EndTime.Add(vaultResolveWindow).Unix()))
+	return &chainAccount{Owner: testProgram, Data: d}
+}
+
+func signersAccountFor(t *testing.T, event string, members ...string) *chainAccount {
+	t.Helper()
+	d := make([]byte, 8+195)
+	copy(d, anchorDiscriminator("ResultSigners"))
+	copy(d[signersEventOffset:], pubkeyBytes(t, event))
+	d[signersThresholdOffset] = 2
+	d[signersCountOffset] = byte(len(members))
+	for i, m := range members {
+		copy(d[signersListOffset+32*i:], pubkeyBytes(t, m))
+	}
+	return &chainAccount{Owner: testProgram, Data: d}
+}
+
+func TestVaultMustMatchTheEvent(t *testing.T) {
+	admin, cosigner := "955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun", "4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH"
+	address := "9ad7bFZNUVuvGkM2ZbepzK6wADV4LaWpW2weQPxXSWD2"
+	start := time.Now().Add(time.Hour).Truncate(time.Second)
+	e := &Event{
+		GameCount:           7,
+		CouponPriceLamports: 1_000_000,
+		Tiers:               []Tier{{Correct: 7, Percent: 95}},
+		StartTime:           start,
+		EndTime:             start.Add(3 * time.Hour),
+		Games:               make([]Game, 7),
+	}
+	vault := ChainVault{Admin: admin, Cosigner: cosigner, Nonce: 9, Address: address}
+	check := func(account, signers *chainAccount) string {
+		ev, err := decodeChainEvent(account, testProgram)
+		if err != nil {
+			return err.Error()
+		}
+		s, err := decodeChainSigners(signers, testProgram)
+		if err != nil {
+			return err.Error()
+		}
+		return checkVaultMatches(e, vault, ev, s)
+	}
+	good := eventAccountFor(t, e, admin, 9)
+	goodSigners := signersAccountFor(t, address, cosigner, admin)
+	if msg := check(good, goodSigners); msg != "" {
+		t.Fatalf("matching vault rejected: %s", msg)
+	}
+
+	mutate := func(edit func(d []byte)) *chainAccount {
+		d := append([]byte(nil), good.Data...)
+		edit(d)
+		return &chainAccount{Owner: good.Owner, Data: d}
+	}
+	bad := map[string]*chainAccount{
+		"price":    mutate(func(d []byte) { binary.LittleEndian.PutUint64(d[eventPriceOffset:], 2_000_000) }),
+		"tiers":    mutate(func(d []byte) { d[eventTiersOffset+1] = 90 }),
+		"deadline": mutate(func(d []byte) { binary.LittleEndian.PutUint64(d[eventDeadlineOffset:], uint64(start.Unix()+1)) }),
+		"reveal":   mutate(func(d []byte) { binary.LittleEndian.PutUint64(d[eventRevealOffset:], uint64(start.Unix()+60)) }),
+		"timeout":  mutate(func(d []byte) { binary.LittleEndian.PutUint64(d[eventTimeoutOffset:], uint64(start.Unix()+60)) }),
+		"games":    mutate(func(d []byte) { d[eventGameCountOffset] = 8 }),
+		"nonce":    mutate(func(d []byte) { binary.LittleEndian.PutUint64(d[eventNonceOffset:], 10) }),
+		"status":   mutate(func(d []byte) { d[eventStatusOffset] = 2 }),
+		"type":     mutate(func(d []byte) { d[0] ^= 1 }),
+		"owner":    {Owner: "11111111111111111111111111111111", Data: good.Data},
+		"missing":  nil,
+		"short":    {Owner: testProgram, Data: good.Data[:100]},
+	}
+	for name, account := range bad {
+		if check(account, goodSigners) == "" {
+			t.Errorf("%s mismatch accepted", name)
+		}
+	}
+	for name, signers := range map[string]*chainAccount{
+		"other event": signersAccountFor(t, admin, admin, cosigner),
+		"one signer":  signersAccountFor(t, address, admin),
+		"stranger":    signersAccountFor(t, address, admin, address),
+		"owner":       {Owner: "11111111111111111111111111111111", Data: goodSigners.Data},
+	} {
+		if check(good, signers) == "" {
+			t.Errorf("%s signer list accepted", name)
+		}
+	}
+}
+
+func TestDecodeChainOutcome(t *testing.T) {
+	admin := "955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun"
+	e := &Event{GameCount: 7, CouponPriceLamports: 1, Tiers: []Tier{{Correct: 7, Percent: 95}}, StartTime: time.Now(), EndTime: time.Now()}
+	account := eventAccountFor(t, e, admin, 1)
+	account.Data[eventStatusOffset] = 1
+	copy(account.Data[eventResultsOffset:], "1X2C111")
+	ev, err := decodeChainEvent(account, testProgram)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Status != "resolved" || ev.Results != "1X2C111" {
+		t.Fatalf("got %s %q", ev.Status, ev.Results)
+	}
+	account.Data[eventStatusOffset] = 9
+	if _, err := decodeChainEvent(account, testProgram); err == nil {
+		t.Fatal("unknown status accepted")
 	}
 }

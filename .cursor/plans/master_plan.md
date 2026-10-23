@@ -42,12 +42,12 @@ todos:
       - phase4_program_v1
   - id: phase6_single_money_path
     content: "Phase 6: One money path per event (block treasury entries on vault events, verify the vault on-chain, admin lifecycle UI, coupon backup)"
-    status: pending
+    status: in_progress
     dependencies:
       - phase5_trust_minimization
   - id: phase7_rules_parity
     content: "Phase 7: Program and spec parity (void games, end time, unrevealed coupons, house share, production upgrade delay, capacity limits)"
-    status: pending
+    status: in_progress
     dependencies:
       - phase6_single_money_path
   - id: phase8_operational_hardening
@@ -380,25 +380,32 @@ admin opens that vault, entries still pay the treasury.
 **Goal:** every event has exactly one place where its money lives, and a vault event can be run
 from creation to payout in the app.
 
-- [ ] **Block treasury entries on vault events.** `POST /api/events/{id}/entries` (and payment
-      recovery for new payments) must reject events that have a `chain` record. Today only the
-      frontend switches to `place_coupon`, so the API still accepts treasury payments for a vault event.
-- [ ] **Verify the vault on-chain before saving it.** `PUT /api/events/{id}/chain` must read the
-      event account from the configured program and check admin, signers, nonce, price, game count,
-      tiers and deadlines against the MongoDB event.
-- [ ] **Do not settle vault events in MongoDB.** Results for a vault event come from `resolve_event`;
-      MongoDB only mirrors the on-chain outcome and payouts.
-- [ ] **Admin lifecycle UI:** resolve (with real results and both result signers), cancel, expire,
-      pause and unpause, forward and park rollover. Replace the hardcoded results in `resolveEventIx`.
-- [ ] **My Coupons follows chain state:** show Reveal only during the reveal window, Claim only
-      after `Resolved`, Refund after `Cancelled`, and read revealed/claimed state from the coupon
-      account instead of `localStorage`.
-- [ ] **Coupon backup and recovery.** The reveal nonce is only in the browser. Add a way to
-      export/import it (or derive it from a wallet signature) and to rediscover a wallet's coupon
-      accounts on-chain, so a cleared browser or a new device does not forfeit the stake.
+- [x] **Block treasury entries on vault events.** The entry handler rejects any event with a vault
+      (also one from another program ID) and re-checks after reserving the payment, so a vault
+      attached at the same moment turns the payment into a refund-only recovery. Recovery stays
+      open for vault events because a recovery is never turned into an entry; it is labelled refund-only.
+- [x] **Verify the vault on-chain before saving it.** `PUT /api/events/{id}/chain` reads the event
+      and signer accounts (owner, discriminator, admin, nonce, status, games, price, tiers, deadline,
+      end and reveal time, 7-day timeout, 2-of-2 signers) and rejects the vault if any entry or payment
+      exists. The cosigner must be the configured `RESULT_COSIGNER`, which may not be an admin wallet.
+- [x] **Do not settle vault events in MongoDB.** `POST /results` rejects vault events and they are
+      never a rollover target. `POST /api/events/{id}/chain/sync` mirrors the chain status and results.
+- [x] **Admin lifecycle UI.** `VaultPanel` (admin dialog and event page): each signer approves results
+      (1, X, 2 or Void) or cancellation in its own transaction, anyone runs the batched count, expire,
+      forward or park rollover, house withdrawal and pause. Publishing checks the 16-event limit and
+      keeps the nonce until the backend accepts the vault, so a failed save can be retried.
+- [x] **My Coupons follows chain state.** Rows come from coupon accounts and the event account:
+      Reveal only in the reveal window, Claim after `Resolved` (an unrevealed coupon only returns its
+      rent), Refund after `Cancelled`.
+- [x] **Coupon backup and recovery.** Each coupon stores its picks and nonce encrypted with a key
+      derived from a wallet signature; My Coupons can rediscover and decrypt a wallet's coupons on a
+      new device, and export or import a JSON backup.
+- [ ] **Multi-wallet devnet run from the UI.** Blocked on deploying the new binary (see the end of
+      this plan).
 
 **Done when:** a vault event is created, entered from several wallets, revealed, resolved, claimed or
 refunded, and its rollover forwarded, all from the UI, and the API rejects treasury payments for it.
+Code and local-validator runs are done; the devnet run waits for the deployment.
 
 ---
 
@@ -406,18 +413,31 @@ refunded, and its rollover forwarded, all from the UI, and the API rejects treas
 
 **Goal:** the program, the backend and `docs/rules-spec.md` describe the same game.
 
-- [ ] **Cancelled single games.** MongoDB draws a weighted outcome for a game marked `C`; the
-      program has no draw. Implement the draw on-chain or change the spec for vault events.
-- [ ] **End time.** The program stores `end_time` but never reads it after `create_event`.
-      Enforce it (for example as the earliest resolution time) or remove it.
-- [ ] **Unrevealed coupons.** Their stake stays in the pool but can never win. Decide the rule
-      (forfeit, refund, or count as no picks) and write it into the spec and the program.
-- [ ] **House share.** The 5% stays in each vault forever. Decide whether it stays locked or a
-      restricted, delayed withdrawal of only the settled house amount is added.
-- [ ] **Production upgrade delay.** The deployed devnet-testing build has a five-minute delay and a
-      unanimous override. Deploy the 24-hour build without the override before any public test.
-- [ ] **Capacity limits.** 30 coupons per event and 16 scheduled events per admin. Either raise
-      them (batched resolution) or enforce and show them in the backend and UI.
+- [x] **Cancelled single games.** For vault events a void result `C` counts every pick as correct
+      (spec section 10). Treasury events keep the weighted draw.
+- [x] **End time.** Results can be approved only from the end time; the reveal deadline equals it.
+- [x] **Unrevealed coupons.** Forfeited: the stake stays in the pool, the coupon cannot win, and
+      claiming it only returns the account rent. A refund would let players reveal only winners.
+- [x] **House share.** `withdraw_house` lets the event admin take exactly the settled house amount,
+      once, after resolution.
+- [x] **Production upgrade delay, source only.** `build-sbf.sh` builds the 24-hour variant without
+      the override unless `DEVNET_TESTING=1`. That binary stays unused until Phase 10. Devnet keeps
+      the five-minute delay and the unanimous override for the whole test period.
+- [x] **Capacity limits.** The 30-coupon cap is gone: approved results lock the event and a
+      permissionless, batched `tally` (12 coupons per transaction in the UI) counts every coupon. The
+      16 unresolved vaults per admin stays; it is in `/api/config` and checked before publishing.
+- [x] **Review fixes.** Rollover escrow is per admin (a global escrow let anyone create an event with
+      their own signers and take another admin's parked rollover). `per_winner` is indexed by
+      `correct - 1` (13-game events panicked). Event and schedule accounts are boxed (stack overflow).
+- [x] **Deploy the test build.** The previous program `35eSgM...QNca` cannot be upgraded: its
+      `execute_upgrade` never passes the program-data account to the loader. The fix is in the new
+      program `H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr`, built with `DEVNET_TESTING=1` (five-minute
+      delay and override). Council `D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt`. Hash in `build-hash.txt`.
+- [x] **Scripted devnet run.** Place, reveal, both approvals, tally and claim passed on
+      `H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr`. The player gained 2,392,800 lamports.
+      Claim `4ae2Nz...SPZM`.
+- [ ] **Devnet run from the UI.** A multi-wallet run through the app is still open. Phase 8 waits
+      for confirmation.
 
 **Done when:** every rule in the spec is enforced by the program or explicitly marked off-chain,
 and the program tests cover each decision above.
@@ -435,7 +455,10 @@ and the program tests cover each decision above.
 - [ ] **Atomic settlement.** Run MongoDB as a replica set and save results, settlement and rollover
       in one transaction.
 - [ ] **Sessions.** Revocable sessions and a token store that XSS cannot read.
-- [ ] **RPC.** A dedicated devnet RPC endpoint instead of the public, rate-limited one.
+- [ ] **RPC.** A dedicated devnet RPC endpoint instead of the public, rate-limited one. Coupon
+      recovery uses `getProgramAccounts`, which public endpoints throttle.
+- [ ] **Chain mirror.** The backend copies a vault's status only when a browser calls the sync
+      endpoint; add a periodic sync so listings do not lag the chain.
 - [ ] **Tests.** Frontend tests, HTTP tests for the payment and recovery handlers, and an automated
       multi-wallet run for both the treasury and the vault flow.
 - [ ] **Full devnet runs.** Settle `Test1` (starts 31 Oct 2026) with several wallets, and repeat the
@@ -467,6 +490,8 @@ Every change here adds trust assumptions. Re-check each one against the Phase 5 
 
 ## Phase 10: Audit and Mainnet
 
+- [ ] Switch the program to the 24-hour build with no override. This is the last program change
+      before mainnet, and the last upgrade that can skip the delay.
 - [ ] Internal review against the spec and invariants.
 - [ ] Fuzz tests on `place_coupon`, `claim` and `refund`.
 - [ ] External audit, using the Phase 2 spec and Phase 5 invariants as the brief.
@@ -491,6 +516,8 @@ Every change here adds trust assumptions. Re-check each one against the Phase 5 
 | 9 | Only costly at high volume, so it can wait |
 | 10 | Real users lose real money |
 
-**Next step:** Phase 6. Program `35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca` is live on devnet. Its upgrade authority is
-council `9ad7bFZNUVuvGkM2ZbepzK6wADV4LaWpW2weQPxXSWD2` (2 of 2, five-minute delay, unanimous override).
-The cost work (Phase 9) waits until Phases 6 to 8 are done.
+**Next step:** finish the Phase 6 devnet run, then stop for confirmation before Phase 8. The test
+program is `H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr`. Its upgrade authority is council
+`D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt` (2 of 2, five-minute delay, unanimous override). The
+old program `35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca` is stuck and unused. The 24-hour build
+with no override waits until Phase 10. The cost work (Phase 9) waits until Phases 6 to 8 are done.

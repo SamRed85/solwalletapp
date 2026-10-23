@@ -3,9 +3,8 @@ use anchor_lang::system_program;
 
 mod math;
 
-declare_id!("35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca");
+declare_id!("H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr");
 
-const MAX_COUPONS: u32 = 30;
 const EVENT_SEED: &[u8] = b"event";
 const VAULT_SEED: &[u8] = b"vault";
 const COUPON_SEED: &[u8] = b"coupon";
@@ -20,6 +19,11 @@ const UPGRADE_DELAY: i64 = 24 * 60 * 60;
 const UPGRADE_DELAY: i64 = 5 * 60;
 const MAX_SCHEDULE: usize = 16;
 const MAX_SIGNERS: usize = 5;
+pub const SEALED_LEN: usize = math::MAX_GAMES + 8;
+
+const PROPOSAL_NONE: u8 = 0;
+const PROPOSAL_RESOLVE: u8 = 1;
+const PROPOSAL_CANCEL: u8 = 2;
 
 #[program]
 pub mod predictions {
@@ -35,7 +39,7 @@ pub mod predictions {
         require!(args.deadline > now, PredError::BadEvent);
         require!(args.reveal_deadline > args.deadline, PredError::BadEvent);
         require!(args.end_time >= args.reveal_deadline, PredError::BadEvent);
-        require!(args.resolve_timeout > args.reveal_deadline, PredError::BadEvent);
+        require!(args.resolve_timeout > args.end_time, PredError::BadEvent);
         require!(args.threshold >= 2, PredError::BadSigners);
         require!(
             args.signers.len() >= args.threshold as usize && args.signers.len() <= MAX_SIGNERS,
@@ -101,12 +105,13 @@ pub mod predictions {
         Ok(())
     }
 
-    pub fn place_coupon(ctx: Context<PlaceCoupon>, commitment: [u8; 32], combinations: u32) -> Result<()> {
+    /// `sealed` is the owner's encrypted copy of the picks and reveal nonce. The program never
+    /// reads it; it lets the owner recover a coupon from the chain on a new device.
+    pub fn place_coupon(ctx: Context<PlaceCoupon>, commitment: [u8; 32], combinations: u32, sealed: [u8; SEALED_LEN]) -> Result<()> {
         require!(!ctx.accounts.gate.paused, PredError::Paused);
         let event = &mut ctx.accounts.event;
         require!(event.status == EventStatus::Open, PredError::BadStatus);
         require!(Clock::get()?.unix_timestamp < event.deadline, PredError::DeadlinePassed);
-        require!(event.coupon_count < MAX_COUPONS, PredError::TooManyCoupons);
         require!(combinations >= 1 && combinations <= math::MAX_COMBINATIONS, PredError::BadPicks);
         let cost = event.price.checked_mul(u64::from(combinations)).ok_or(error!(PredError::Overflow))?;
 
@@ -131,12 +136,15 @@ pub mod predictions {
         coupon.combinations = combinations;
         coupon.lamports_paid = cost;
         coupon.bump = ctx.bumps.coupon;
+        coupon.sealed = sealed;
 
-        event.coupon_count += 1;
+        event.coupon_count = event.coupon_count.checked_add(1).ok_or(error!(PredError::Overflow))?;
         event.sales = event.sales.checked_add(cost).ok_or(error!(PredError::Overflow))?;
         Ok(())
     }
 
+    /// Reveals are open from the entry deadline until the reveal deadline (normally the end
+    /// time). A coupon that is never revealed keeps its stake in the pool and cannot win.
     pub fn reveal_coupon(ctx: Context<RevealCoupon>, picks: [u8; math::MAX_GAMES], nonce: u64) -> Result<()> {
         let event = &ctx.accounts.event;
         require!(event.status == EventStatus::Open, PredError::BadStatus);
@@ -157,49 +165,81 @@ pub mod predictions {
         Ok(())
     }
 
-    pub fn resolve_event<'info>(ctx: Context<'_, '_, 'info, 'info, ResolveEvent<'info>>, results: Vec<u8>, signer_count: u8) -> Result<()> {
-        let game_count = ctx.accounts.event.game_count;
-        require!(results.len() == game_count as usize, PredError::BadResults);
-        require!(results.iter().all(|result| math::mask_for(*result).is_some()), PredError::BadResults);
+    /// Each result signer approves the same results in its own transaction. When the
+    /// threshold agrees, the results are locked and the event moves to tallying.
+    /// `C` marks a void game: every pick on it counts as correct.
+    pub fn approve_resolution(ctx: Context<Approve>, results: Vec<u8>) -> Result<()> {
+        let event = &ctx.accounts.event;
+        let game_count = event.game_count as usize;
+        require!(results.len() == game_count, PredError::BadResults);
+        require!(results.iter().all(|result| math::result_mask(*result).is_some()), PredError::BadResults);
         let now = Clock::get()?.unix_timestamp;
-        require!(now >= ctx.accounts.event.reveal_deadline, PredError::TooEarly);
-        require!(now < ctx.accounts.event.resolve_timeout, PredError::ResolutionExpired);
-        require!(ctx.accounts.event.status == EventStatus::Open, PredError::BadStatus);
-        let signer_count = signer_count as usize;
-        require!(ctx.remaining_accounts.len() >= signer_count, PredError::NotEnoughSigners);
-        verify_signers(
-            ctx.accounts.signers.threshold,
-            &ctx.accounts.signers.signers[..ctx.accounts.signers.count as usize],
-            &ctx.remaining_accounts[..signer_count],
-        )?;
-        let coupons = &ctx.remaining_accounts[signer_count..];
-        require!(coupons.len() == ctx.accounts.event.coupon_count as usize, PredError::MissingCoupon);
+        require!(now >= event.reveal_deadline && now >= event.end_time, PredError::TooEarly);
+        let mut proposal = [0u8; math::MAX_GAMES];
+        proposal[..game_count].copy_from_slice(&results);
+        if record_approval(&mut ctx.accounts.event, &ctx.accounts.signers, &ctx.accounts.signer.key(), PROPOSAL_RESOLVE, proposal)? {
+            let event = &mut ctx.accounts.event;
+            event.results = proposal;
+            event.status = EventStatus::Tallying;
+            event.tallied = 0;
+            event.winners = [0; math::MAX_GAMES + 1];
+        }
+        Ok(())
+    }
 
-        let mut winners = vec![0u32; game_count as usize + 1];
-        for (position, account) in coupons.iter().enumerate() {
+    /// Cancelling needs the same threshold as resolving, with one approval per transaction.
+    pub fn approve_cancel(ctx: Context<Approve>) -> Result<()> {
+        if record_approval(
+            &mut ctx.accounts.event,
+            &ctx.accounts.signers,
+            &ctx.accounts.signer.key(),
+            PROPOSAL_CANCEL,
+            [0; math::MAX_GAMES],
+        )? {
+            close_open_event(&mut ctx.accounts.event)?;
+            schedule_remove(&mut ctx.accounts.schedule, ctx.accounts.event.key())?;
+        }
+        Ok(())
+    }
+
+    /// Counts winning rows for the next coupons in index order. Anyone can call it, in as
+    /// many transactions as needed; the last batch settles the event. Locked results cannot
+    /// be replaced or expired, and every coupon account exists until settlement.
+    pub fn tally<'info>(ctx: Context<'_, '_, 'info, 'info, Tally<'info>>) -> Result<()> {
+        require!(ctx.accounts.event.status == EventStatus::Tallying, PredError::BadStatus);
+        let event_key = ctx.accounts.event.key();
+        let game_count = ctx.accounts.event.game_count as usize;
+        let results = ctx.accounts.event.results;
+        let mut tallied = ctx.accounts.event.tallied;
+        let mut winners = ctx.accounts.event.winners;
+        for account in ctx.remaining_accounts {
             let coupon = Account::<Coupon>::try_from(account)?;
-            require!(coupon.event == ctx.accounts.event.key(), PredError::WrongEvent);
-            require!(coupon.index == position as u32, PredError::CouponOrder);
-            if !coupon.revealed {
-                continue;
+            require!(coupon.event == event_key, PredError::WrongEvent);
+            require!(coupon.index == tallied, PredError::CouponOrder);
+            if coupon.revealed {
+                let counts = math::correct_counts(&coupon.picks[..game_count], &results[..game_count]).map_err(|_| error!(PredError::BadResults))?;
+                for (score, winner) in winners.iter_mut().enumerate() {
+                    *winner = winner.checked_add(u64::from(counts[score])).ok_or(error!(PredError::Overflow))?;
+                }
             }
-            let counts = math::correct_counts(&coupon.picks[..game_count as usize], &results).map_err(|_| error!(PredError::BadResults))?;
-            for (score, count) in counts.iter().enumerate() {
-                winners[score] = winners[score].checked_add(*count).ok_or(error!(PredError::Overflow))?;
-            }
+            tallied = tallied.checked_add(1).ok_or(error!(PredError::Overflow))?;
         }
 
         let event = &mut ctx.accounts.event;
+        event.tallied = tallied;
+        event.winners = winners;
+        if tallied < event.coupon_count {
+            return Ok(());
+        }
+
         let tiers: Vec<math::Tier> = event.tiers[..event.tier_count as usize]
             .iter()
             .map(|tier| math::Tier { correct: tier.correct, percent: tier.percent })
             .collect();
-        let settlement = math::settle(event.sales, event.rollover_in, game_count, &tiers, &winners).map_err(|_| error!(PredError::BadSettlement))?;
-        event.results = [0; math::MAX_GAMES];
-        event.results[..results.len()].copy_from_slice(&results);
+        let settlement = math::settle(event.sales, event.rollover_in, event.game_count, &tiers, &winners).map_err(|_| error!(PredError::BadSettlement))?;
         event.per_winner = [0; math::MAX_GAMES];
         for (tier, per_winner) in tiers.iter().zip(&settlement.per_winner) {
-            event.per_winner[tier.correct as usize] = *per_winner;
+            event.per_winner[tier.correct as usize - 1] = *per_winner;
         }
         event.house = settlement.house;
         event.paid = settlement.paid;
@@ -225,6 +265,8 @@ pub mod predictions {
         Ok(())
     }
 
+    /// Pays every winning row of the coupon and closes it. A coupon without winnings is
+    /// closed too, which returns its rent to the owner.
     pub fn claim(ctx: Context<Claim>) -> Result<()> {
         let event = &ctx.accounts.event;
         require!(event.status == EventStatus::Resolved, PredError::BadStatus);
@@ -241,21 +283,6 @@ pub mod predictions {
         Ok(())
     }
 
-    pub fn cancel_event<'info>(ctx: Context<'_, '_, 'info, 'info, CancelEvent<'info>>, signer_count: u8) -> Result<()> {
-        require!(ctx.accounts.event.status == EventStatus::Open, PredError::BadStatus);
-        require!(Clock::get()?.unix_timestamp < ctx.accounts.event.resolve_timeout, PredError::ResolutionExpired);
-        let signer_count = signer_count as usize;
-        require!(ctx.remaining_accounts.len() >= signer_count, PredError::NotEnoughSigners);
-        verify_signers(
-            ctx.accounts.signers.threshold,
-            &ctx.accounts.signers.signers[..ctx.accounts.signers.count as usize],
-            &ctx.remaining_accounts[..signer_count],
-        )?;
-        close_open_event(&mut ctx.accounts.event)?;
-        schedule_remove(&mut ctx.accounts.schedule, ctx.accounts.event.key())?;
-        Ok(())
-    }
-
     pub fn refund(ctx: Context<Refund>) -> Result<()> {
         require!(ctx.accounts.event.status == EventStatus::Cancelled, PredError::BadStatus);
         let amount = ctx.accounts.coupon.lamports_paid;
@@ -265,6 +292,23 @@ pub mod predictions {
             amount,
             ctx.accounts.event.rent_reserve,
         )?;
+        Ok(())
+    }
+
+    /// The event admin may take exactly the settled house share, once. Winnings, rollover and
+    /// refunds stay in the vault, so this cannot reach player money.
+    pub fn withdraw_house(ctx: Context<WithdrawHouse>) -> Result<()> {
+        let event = &ctx.accounts.event;
+        require!(event.status == EventStatus::Resolved, PredError::BadStatus);
+        require!(!event.house_withdrawn, PredError::AlreadyWithdrawn);
+        require!(event.house > 0, PredError::NothingToClaim);
+        transfer_from_vault(
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.admin.to_account_info(),
+            event.house,
+            event.rent_reserve,
+        )?;
+        ctx.accounts.event.house_withdrawn = true;
         Ok(())
     }
 
@@ -373,6 +417,11 @@ pub mod predictions {
         require!(ctx.accounts.buffer.key() == ctx.accounts.council.buffer, PredError::WrongEvent);
         require!(ctx.accounts.spill.key() == ctx.accounts.council.spill, PredError::WrongEvent);
         let bump = ctx.accounts.council.bump;
+        let (program_data, _) = Pubkey::find_program_address(
+            &[ctx.accounts.program_account.key().as_ref()],
+            &anchor_lang::solana_program::bpf_loader_upgradeable::id(),
+        );
+        require_keys_eq!(ctx.accounts.program_data.key(), program_data, PredError::WrongEvent);
         let instruction = anchor_lang::solana_program::bpf_loader_upgradeable::upgrade(
             &ctx.accounts.program_account.key(),
             &ctx.accounts.buffer.key(),
@@ -382,6 +431,7 @@ pub mod predictions {
         anchor_lang::solana_program::program::invoke_signed(
             &instruction,
             &[
+                ctx.accounts.program_data.to_account_info(),
                 ctx.accounts.program_account.to_account_info(),
                 ctx.accounts.buffer.to_account_info(),
                 ctx.accounts.spill.to_account_info(),
@@ -396,13 +446,31 @@ pub mod predictions {
     }
 }
 
+/// Records one signer's approval. A different proposal replaces the old one and restarts
+/// the count. Returns true once the threshold agrees on the current proposal.
+fn record_approval(event: &mut Event, signers: &ResultSigners, signer: &Pubkey, kind: u8, results: [u8; math::MAX_GAMES]) -> Result<bool> {
+    require!(event.status == EventStatus::Open, PredError::BadStatus);
+    require!(Clock::get()?.unix_timestamp < event.resolve_timeout, PredError::ResolutionExpired);
+    let position = signers.signers[..signers.count as usize]
+        .iter()
+        .position(|member| member == signer)
+        .ok_or(error!(PredError::NotEnoughSigners))?;
+    if event.proposal_kind != kind || event.proposal_results != results {
+        event.proposal_kind = kind;
+        event.proposal_results = results;
+        event.approvals = 0;
+    }
+    event.approvals |= 1 << position;
+    Ok(event.approvals.count_ones() >= u32::from(signers.threshold))
+}
+
 fn payout_for(coupon: &Coupon, event: &Event) -> Result<u64> {
     let game_count = event.game_count as usize;
     let counts = math::correct_counts(&coupon.picks[..game_count], &event.results[..game_count]).map_err(|_| error!(PredError::BadResults))?;
     let mut amount = 0u64;
     for tier in &event.tiers[..event.tier_count as usize] {
         let rows = u64::from(counts[tier.correct as usize]);
-        let per_winner = event.per_winner[tier.correct as usize];
+        let per_winner = event.per_winner[tier.correct as usize - 1];
         amount = amount.checked_add(per_winner.checked_mul(rows).ok_or(error!(PredError::Overflow))?).ok_or(error!(PredError::Overflow))?;
     }
     Ok(amount)
@@ -411,6 +479,7 @@ fn payout_for(coupon: &Coupon, event: &Event) -> Result<u64> {
 fn close_open_event(event: &mut Event) -> Result<()> {
     event.rollover_out = event.rollover_in;
     event.status = EventStatus::Cancelled;
+    event.proposal_kind = PROPOSAL_NONE;
     Ok(())
 }
 
@@ -498,8 +567,11 @@ pub enum EventStatus {
     Open,
     Resolved,
     Cancelled,
+    Tallying,
 }
 
+/// `per_winner[n - 1]` is the payout per row with `n` correct picks.
+/// `winners[n]` counts the rows with `n` correct picks while tallying.
 #[account]
 pub struct Event {
     pub admin: Pubkey,
@@ -525,10 +597,16 @@ pub struct Event {
     pub bump: u8,
     pub vault_bump: u8,
     pub rent_reserve: u64,
+    pub house_withdrawn: bool,
+    pub proposal_kind: u8,
+    pub proposal_results: [u8; math::MAX_GAMES],
+    pub approvals: u8,
+    pub tallied: u32,
+    pub winners: [u64; math::MAX_GAMES + 1],
 }
 
 impl Event {
-    pub const SIZE: usize = 320;
+    pub const SIZE: usize = 448;
 }
 
 #[account]
@@ -543,10 +621,11 @@ pub struct Coupon {
     pub combinations: u32,
     pub lamports_paid: u64,
     pub bump: u8,
+    pub sealed: [u8; SEALED_LEN],
 }
 
 impl Coupon {
-    pub const SIZE: usize = 32 + 32 + 4 + 1 + math::MAX_GAMES + 32 + 1 + 4 + 8 + 1;
+    pub const SIZE: usize = 32 + 32 + 4 + 1 + math::MAX_GAMES + 32 + 1 + 4 + 8 + 1 + SEALED_LEN;
 }
 
 #[account]
@@ -591,7 +670,7 @@ pub struct CreateEvent<'info> {
         seeds = [EVENT_SEED, admin.key().as_ref(), &args.nonce.to_le_bytes()],
         bump
     )]
-    pub event: Account<'info, Event>,
+    pub event: Box<Account<'info, Event>>,
     #[account(
         init,
         payer = admin,
@@ -604,7 +683,7 @@ pub struct CreateEvent<'info> {
         init_if_needed,
         payer = admin,
         space = 8 + Escrow::SIZE,
-        seeds = [ESCROW_SEED],
+        seeds = [ESCROW_SEED, admin.key().as_ref()],
         bump
     )]
     pub escrow: Account<'info, Escrow>,
@@ -615,7 +694,7 @@ pub struct CreateEvent<'info> {
         seeds = [SCHEDULE_SEED, admin.key().as_ref()],
         bump
     )]
-    pub schedule: Account<'info, Schedule>,
+    pub schedule: Box<Account<'info, Schedule>>,
     #[account(
         init,
         payer = admin,
@@ -640,7 +719,7 @@ pub struct PlaceCoupon<'info> {
     #[account(mut)]
     pub player: Signer<'info>,
     #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
-    pub event: Account<'info, Event>,
+    pub event: Box<Account<'info, Event>>,
     #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
     pub vault: Account<'info, Vault>,
     #[account(
@@ -657,15 +736,24 @@ pub struct PlaceCoupon<'info> {
 }
 
 #[derive(Accounts)]
-pub struct ResolveEvent<'info> {
+pub struct Approve<'info> {
+    pub signer: Signer<'info>,
     #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
-    pub event: Account<'info, Event>,
+    pub event: Box<Account<'info, Event>>,
     #[account(seeds = [SIGNERS_SEED, event.key().as_ref()], bump = signers.bump)]
     pub signers: Account<'info, ResultSigners>,
+    #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
+    pub schedule: Box<Account<'info, Schedule>>,
+}
+
+#[derive(Accounts)]
+pub struct Tally<'info> {
+    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
     #[account(seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
-    pub schedule: Account<'info, Schedule>,
+    pub schedule: Box<Account<'info, Schedule>>,
 }
 
 #[derive(Accounts)]
@@ -673,21 +761,11 @@ pub struct Claim<'info> {
     #[account(mut, close = owner)]
     pub coupon: Account<'info, Coupon>,
     #[account(mut, address = coupon.event)]
-    pub event: Account<'info, Event>,
+    pub event: Box<Account<'info, Event>>,
     #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut, address = coupon.owner)]
     pub owner: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct CancelEvent<'info> {
-    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
-    pub event: Account<'info, Event>,
-    #[account(seeds = [SIGNERS_SEED, event.key().as_ref()], bump = signers.bump)]
-    pub signers: Account<'info, ResultSigners>,
-    #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
-    pub schedule: Account<'info, Schedule>,
 }
 
 #[derive(Accounts)]
@@ -696,7 +774,7 @@ pub struct RevealCoupon<'info> {
     #[account(mut, seeds = [COUPON_SEED, event.key().as_ref(), &coupon.index.to_le_bytes()], bump = coupon.bump, constraint = coupon.owner == player.key() @ PredError::WrongEvent)]
     pub coupon: Account<'info, Coupon>,
     #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump, constraint = coupon.event == event.key() @ PredError::WrongEvent)]
-    pub event: Account<'info, Event>,
+    pub event: Box<Account<'info, Event>>,
 }
 
 #[derive(Accounts)]
@@ -710,9 +788,9 @@ pub struct SetPause<'info> {
 pub struct ExpireEvent<'info> {
     pub caller: Signer<'info>,
     #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
-    pub event: Account<'info, Event>,
+    pub event: Box<Account<'info, Event>>,
     #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
-    pub schedule: Account<'info, Schedule>,
+    pub schedule: Box<Account<'info, Schedule>>,
 }
 
 #[derive(Accounts)]
@@ -720,7 +798,7 @@ pub struct Refund<'info> {
     #[account(mut, close = owner)]
     pub coupon: Account<'info, Coupon>,
     #[account(mut, address = coupon.event)]
-    pub event: Account<'info, Event>,
+    pub event: Box<Account<'info, Event>>,
     #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut, address = coupon.owner)]
@@ -728,9 +806,19 @@ pub struct Refund<'info> {
 }
 
 #[derive(Accounts)]
+pub struct WithdrawHouse<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [EVENT_SEED, admin.key().as_ref(), &event.nonce.to_le_bytes()], bump = event.bump, has_one = admin)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+}
+
+#[derive(Accounts)]
 pub struct ForwardRollover<'info> {
     #[account(mut, seeds = [EVENT_SEED, source.admin.as_ref(), &source.nonce.to_le_bytes()], bump = source.bump)]
-    pub source: Account<'info, Event>,
+    pub source: Box<Account<'info, Event>>,
     #[account(mut, seeds = [VAULT_SEED, source.key().as_ref()], bump = source.vault_bump)]
     pub source_vault: Account<'info, Vault>,
     #[account(
@@ -739,23 +827,23 @@ pub struct ForwardRollover<'info> {
         bump = destination.bump,
         constraint = destination.admin == source.admin @ PredError::WrongEvent
     )]
-    pub destination: Account<'info, Event>,
+    pub destination: Box<Account<'info, Event>>,
     #[account(mut, seeds = [VAULT_SEED, destination.key().as_ref()], bump = destination.vault_bump)]
     pub destination_vault: Account<'info, Vault>,
     #[account(mut, seeds = [SCHEDULE_SEED, source.admin.as_ref()], bump)]
-    pub schedule: Account<'info, Schedule>,
+    pub schedule: Box<Account<'info, Schedule>>,
 }
 
 #[derive(Accounts)]
 pub struct ParkRollover<'info> {
     #[account(mut, seeds = [EVENT_SEED, source.admin.as_ref(), &source.nonce.to_le_bytes()], bump = source.bump)]
-    pub source: Account<'info, Event>,
+    pub source: Box<Account<'info, Event>>,
     #[account(mut, seeds = [VAULT_SEED, source.key().as_ref()], bump = source.vault_bump)]
     pub source_vault: Account<'info, Vault>,
-    #[account(mut, seeds = [ESCROW_SEED], bump)]
+    #[account(mut, seeds = [ESCROW_SEED, source.admin.as_ref()], bump)]
     pub escrow: Account<'info, Escrow>,
     #[account(mut, seeds = [SCHEDULE_SEED, source.admin.as_ref()], bump)]
-    pub schedule: Account<'info, Schedule>,
+    pub schedule: Box<Account<'info, Schedule>>,
 }
 
 #[error_code]
@@ -790,6 +878,7 @@ pub enum PredError {
     BadCommitment,
     Insolvent,
     UpgradeTimelock,
+    AlreadyWithdrawn,
 }
 
 #[account]
@@ -861,6 +950,10 @@ pub struct OverrideUpgradeDelay<'info> {
 pub struct ExecuteUpgrade<'info> {
     #[account(mut, seeds = [UPGRADE_SEED], bump = council.bump)]
     pub council: Account<'info, UpgradeCouncil>,
+    /// CHECK: the program-data account. The loader upgrade instruction requires it, and the
+    /// council can sign only the accounts this instruction passes through.
+    #[account(mut)]
+    pub program_data: UncheckedAccount<'info>,
     /// CHECK: the upgradeable loader identifies the deployed program.
     pub program_account: UncheckedAccount<'info>,
     /// CHECK: must match the buffer stored in the council proposal.

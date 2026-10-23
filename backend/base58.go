@@ -38,3 +38,20 @@ func base58Decode(s string) ([]byte, error) {
 	}
 	return append(make([]byte, zeros), n.Bytes()...), nil
 }
+
+func base58Encode(b []byte) string {
+	n := new(big.Int).SetBytes(b)
+	radix, mod := big.NewInt(58), new(big.Int)
+	var out []byte
+	for n.Sign() > 0 {
+		n.DivMod(n, radix, mod)
+		out = append([]byte{base58Alphabet[mod.Int64()]}, out...)
+	}
+	for _, c := range b {
+		if c != 0 {
+			break
+		}
+		out = append([]byte{'1'}, out...)
+	}
+	return string(out)
+}

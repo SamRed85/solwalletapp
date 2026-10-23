@@ -41,7 +41,7 @@ solana program deploy /app/target/deploy/predictions.so \
 # After this, only execute_upgrade can replace the program. The devnet build waits five
 # minutes, with a test-only override that requires every council member to sign.
 solana program set-upgrade-authority "${program}" \
-  --new-upgrade-authority 9ad7bFZNUVuvGkM2ZbepzK6wADV4LaWpW2weQPxXSWD2 \
+  --new-upgrade-authority D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt \
   --skip-new-upgrade-authority-signer-check \
   --keypair /app/keys/deployer-keypair.json \
   --url "${url}" \

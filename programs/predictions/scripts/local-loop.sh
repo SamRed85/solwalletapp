@@ -10,7 +10,7 @@ solana-keygen new --no-bip39-passphrase --force -o /root/.config/solana/id.json 
 ledger=/tmp/predictions-ledger
 rm -rf "${ledger}"
 solana-test-validator --reset --ledger "${ledger}" --rpc-port 8899 --faucet-port 9900 \
-  --bpf-program 35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca /app/target/deploy/predictions.so \
+  --bpf-program H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr /app/target/deploy/predictions.so \
   > /tmp/validator.log 2>&1 &
 validator_pid=$!
 cleanup() { kill "${validator_pid}" >/dev/null 2>&1 || true; }

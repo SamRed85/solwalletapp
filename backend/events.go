@@ -57,14 +57,21 @@ type Event struct {
 	Status              string        `json:"status" bson:"-"`
 	CouponsSold         int           `json:"couponsSold" bson:"-"`
 	Chain               *ChainVault   `json:"chain,omitempty" bson:"chain,omitempty"`
+
+	// hasVault stays true when prepare hides a vault from another program deployment:
+	// such an event still never takes treasury money.
+	hasVault bool
 }
 
 // ChainVault is the on-chain event created by the admin wallet. The program holds the funds.
+// Status mirrors the on-chain lifecycle (open, tallying, resolved, cancelled) for display.
 type ChainVault struct {
 	ProgramID string `json:"programId" bson:"programId"`
 	Admin     string `json:"admin" bson:"admin"`
 	Cosigner  string `json:"cosigner" bson:"cosigner"`
 	Nonce     uint64 `json:"nonce" bson:"nonce"`
+	Address   string `json:"address" bson:"address"`
+	Status    string `json:"status,omitempty" bson:"status,omitempty"`
 }
 
 func (e *Event) results() string {
@@ -91,6 +98,7 @@ func (a *App) prepare(e *Event, now time.Time) {
 			e.Games[i].Kickoff = e.StartTime
 		}
 	}
+	e.hasVault = e.Chain != nil
 	if e.Chain != nil && e.Chain.ProgramID != a.cfg.ProgramID {
 		e.Chain = nil
 	}
@@ -135,6 +143,8 @@ func (e *Event) statusAt(now time.Time) string {
 	switch {
 	case e.ResultsSetAt != nil:
 		return "completed"
+	case e.Chain != nil && e.Chain.Status == "cancelled":
+		return "cancelled"
 	case len(e.Games) == 0:
 		return "draft"
 	case now.Before(e.StartTime):
@@ -366,25 +376,83 @@ func validateChainVault(vault ChainVault, games int, start, now time.Time) strin
 	if !solanaPubkey(vault.Admin) || !solanaPubkey(vault.Cosigner) || vault.Admin == vault.Cosigner {
 		return "the event needs two different Solana result signers"
 	}
+	if !solanaPubkey(vault.Address) {
+		return "the on-chain event address is missing"
+	}
 	return ""
 }
 
+// handleSetChain attaches an on-chain vault to an event after reading it from the program.
+// From then on the event takes money only through the vault.
 func (a *App) handleSetChain(w http.ResponseWriter, r *http.Request) {
 	e, ok := a.loadEvent(w, r)
 	if !ok {
 		return
 	}
-	var vault ChainVault
-	if !decodeJSON(w, r, &vault) {
+	var req struct {
+		ChainVault
+		Signers string `json:"signers"`
+	}
+	if !decodeJSON(w, r, &req) {
 		return
 	}
-	vault.ProgramID = a.cfg.ProgramID
+	vault := ChainVault{
+		ProgramID: a.cfg.ProgramID,
+		Admin:     req.Admin,
+		Cosigner:  req.Cosigner,
+		Nonce:     req.Nonce,
+		Address:   req.Address,
+		Status:    "open",
+	}
 	if msg := validateChainVault(vault, len(e.Games), e.StartTime, time.Now()); msg != "" {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	// An admin-chosen cosigner could be a second wallet of the same person, which would turn
+	// the two-signer approval into one.
+	if vault.Cosigner != a.cfg.ResultCosigner {
+		writeError(w, http.StatusBadRequest, "the second result signer must be the configured cosigner "+a.cfg.ResultCosigner)
+		return
+	}
+	if vault.Admin != walletFrom(r) {
+		writeError(w, http.StatusForbidden, "publish the vault from the admin wallet you are signed in with")
+		return
+	}
+	if !solanaPubkey(req.Signers) {
+		writeError(w, http.StatusBadRequest, "the on-chain result signer address is missing")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
+	eventAccount, err := a.fetchAccount(ctx, vault.Address)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	signersAccount, err := a.fetchAccount(ctx, req.Signers)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	onChain, err := decodeChainEvent(eventAccount, a.cfg.ProgramID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	signers, err := decodeChainSigners(signersAccount, a.cfg.ProgramID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if msg := checkVaultMatches(e, vault, onChain, signers); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+
+	// Mark the event first so a treasury entry that starts now sees the vault, then make
+	// sure no treasury payment arrived before. Either order of the two requests ends with
+	// one money path.
 	res, err := a.events.UpdateOne(ctx,
 		bson.M{"_id": e.ID, "startTime": bson.M{"$gt": time.Now()}, "$or": bson.A{
 			bson.M{"chain": bson.M{"$exists": false}},
@@ -399,6 +467,31 @@ func (a *App) handleSetChain(w http.ResponseWriter, r *http.Request) {
 	if res.MatchedCount == 0 {
 		writeError(w, http.StatusConflict, "this event already has an on-chain vault or entries have closed")
 		return
+	}
+	payments, err := a.payments.CountDocuments(ctx, bson.M{"eventId": e.ID})
+	if err == nil && payments == 0 {
+		var entries int64
+		entries, err = a.entries.CountDocuments(ctx, bson.M{"eventId": e.ID})
+		payments += entries
+	}
+	if err != nil || payments > 0 {
+		_, _ = a.events.UpdateOne(ctx, bson.M{"_id": e.ID, "chain.address": vault.Address}, bson.M{"$unset": bson.M{"chain": ""}})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to check treasury payments")
+		} else {
+			writeError(w, http.StatusConflict, "this event already has treasury payments, so it must stay a treasury event")
+		}
+		return
+	}
+	// Treasury rollover cannot reach an on-chain vault; hand it to the next treasury event.
+	var before Event
+	if err := a.events.FindOneAndUpdate(ctx,
+		bson.M{"_id": e.ID, "rolloverInLamports": bson.M{"$gt": 0}},
+		bson.M{"$set": bson.M{"rolloverInLamports": 0}},
+	).Decode(&before); err == nil {
+		if err := a.applyRollover(ctx, nil, before.RolloverInLamports); err != nil {
+			log.Printf("event %s: failed to return %d lamports of treasury rollover: %v", e.ID.Hex(), before.RolloverInLamports, err)
+		}
 	}
 	a.handleGetEvent(w, r)
 }
@@ -415,6 +508,10 @@ func (a *App) handleSetResults(w http.ResponseWriter, r *http.Request) {
 		Results []string `json:"results"`
 	}
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if e.hasVault {
+		writeError(w, http.StatusConflict, "this event is settled by its on-chain vault; approve the results there")
 		return
 	}
 	if e.Status != "closed" {

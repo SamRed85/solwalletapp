@@ -19,19 +19,23 @@
         <template #[`item.actions`]="{ item }">
           <v-btn icon="mdi-eye" size="small" variant="text" title="Details" @click="openDetails(item)" />
           <v-btn
-            v-if="item.status === 'completed'" icon="mdi-cash-multiple" size="small" variant="text"
+            v-if="item.status === 'completed' && !item.chain" icon="mdi-cash-multiple" size="small" variant="text"
             color="success" title="Payouts" @click="openDetails(item)"
           />
           <v-btn
-            v-if="item.status === 'open' && !item.chain" icon="mdi-safe" size="small" variant="text"
-            color="primary" title="Open the on-chain vault" :loading="publishing === item.id" @click="publishVault(item)"
+            v-if="item.chain" icon="mdi-safe" size="small" variant="text"
+            color="primary" title="Vault: results, refunds, rollover" @click="openDetails(item)"
+          />
+          <v-btn
+            v-if="item.status === 'open' && !item.chain && !item.couponsSold" icon="mdi-safe-square-outline" size="small" variant="text"
+            color="primary" title="Move this event to an on-chain vault" :loading="publishing === item.id" @click="publishVault(item)"
           />
           <v-btn
             v-if="item.status === 'draft'" icon="mdi-format-list-numbered" size="small" variant="text"
             color="success" title="Set games" @click="openGames(item)"
           />
           <v-btn
-            v-if="item.status === 'closed'" icon="mdi-flag-checkered" size="small" variant="text"
+            v-if="item.status === 'closed' && !item.chain" icon="mdi-flag-checkered" size="small" variant="text"
             color="warning" title="Set results" @click="openResults(item)"
           />
         </template>
@@ -194,6 +198,7 @@
           <p><strong>Tiers:</strong> {{ details.tiers.map(t => `${t.correct} correct ${t.percent}%`).join(', ') }}</p>
           <p v-if="details.rolloverInLamports"><strong>Rollover received:</strong> {{ formatSol(details.rolloverInLamports) }}</p>
           <p class="mb-4"><strong>Created by:</strong> <code>{{ details.createdBy }}</code></p>
+          <VaultPanel v-if="details.chain" :event="details" class="mb-4" @changed="loadEvents" />
           <p v-if="details.games.length === 0" class="text-medium-emphasis">No games yet.</p>
           <v-table v-else density="compact">
             <thead><tr><th>#</th><th>Home</th><th>Away</th><th>Kickoff</th><th>Result</th></tr></thead>
@@ -204,8 +209,8 @@
                 <td>{{ game.awayTeam }}</td>
                 <td>{{ formatDate(game.kickoff) }}</td>
                 <td>
-                  {{ outcomeLabels[game.result] || '—' }}
-                  <v-chip v-if="game.cancelled" size="x-small" color="warning" class="ml-1">drawn</v-chip>
+                  {{ game.result === 'C' ? 'Void' : (outcomeLabels[game.result] || '—') }}
+                  <v-chip v-if="game.cancelled && game.result !== 'C'" size="x-small" color="warning" class="ml-1">drawn</v-chip>
                 </td>
               </tr>
             </tbody>
@@ -244,12 +249,15 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import VaultPanel from '@/components/VaultPanel.vue'
 import { eventApi, recoveryApi } from '@/services/api'
-import { PROGRAM_ID, RESULT_COSIGNER, createEventIx, sendProgramTransaction, vaultSchedule } from '@/services/program'
-import { sendPayment, waitForConfirmation } from '@/services/solana'
+import {
+  MAX_OPEN_VAULT_EVENTS, RESULT_COSIGNER, createEventIx, eventPda, fetchSchedule, sendProgramTransaction, signersPda, vaultSchedule
+} from '@/services/program'
+import { getAccount, sendPayment, waitForConfirmation } from '@/services/solana'
 import { auth, loadConfig } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
-import { formatDate, formatSol, outcomeLabels, outcomes, statusColors, toLocalInput } from '@/utils/format'
+import { formatDate, formatSol, outcomeLabels, outcomes, shortAddress, statusColors, toLocalInput } from '@/utils/format'
 
 const DRAW_DELAY_MS = 60 * 60 * 1000
 
@@ -318,24 +326,42 @@ async function loadEvents () {
   }
 }
 
+// The nonce of a vault created on chain is kept until the backend accepts it, so a failed
+// save can be retried without creating a second vault.
+const pendingVaultKey = (eventId, wallet) => `sol.pendingVault.${eventId}.${wallet}`
+
 async function publishVault (item) {
   publishing.value = item.id
   try {
+    await loadConfig()
+    const rpcUrl = config.value.solanaRpcUrl
     const schedule = vaultSchedule(item)
-    const nonce = Date.now()
-    const sent = await sendProgramTransaction(config.value.solanaRpcUrl, auth.wallet, [
-      createEventIx({
-        admin: auth.wallet,
-        other: RESULT_COSIGNER,
-        nonce,
-        ...schedule,
-        gameCount: item.gameCount,
-        price: item.couponPriceLamports,
-        tiers: item.tiers
-      })
-    ])
-    await waitForConfirmation(config.value.solanaRpcUrl, sent.signature, sent.lastValidBlockHeight)
-    await eventApi.setChain(item.id, { programId: PROGRAM_ID, admin: auth.wallet, cosigner: RESULT_COSIGNER, nonce })
+    const cosigner = config.value.resultCosigner || RESULT_COSIGNER
+    let nonce = Number(localStorage.getItem(pendingVaultKey(item.id, auth.wallet))) || 0
+    if (!nonce || !await getAccount(rpcUrl, eventPda(auth.wallet, nonce))) {
+      const open = (await fetchSchedule(rpcUrl, auth.wallet)).entries.length
+      if (open >= MAX_OPEN_VAULT_EVENTS) {
+        throw new Error(`This wallet already has ${open} unresolved vault events, the program limit. Resolve or cancel one first.`)
+      }
+      if (!confirm(`Create the vault with ${shortAddress(cosigner)} as the second result signer? Entries then pay only the program.`)) return
+      nonce = Date.now()
+      localStorage.setItem(pendingVaultKey(item.id, auth.wallet), String(nonce))
+      const sent = await sendProgramTransaction(rpcUrl, auth.wallet, [
+        createEventIx({
+          admin: auth.wallet,
+          other: cosigner,
+          nonce,
+          ...schedule,
+          gameCount: item.gameCount,
+          price: item.couponPriceLamports,
+          tiers: item.tiers
+        })
+      ])
+      await waitForConfirmation(rpcUrl, sent.signature, sent.lastValidBlockHeight)
+    }
+    const address = eventPda(auth.wallet, nonce)
+    await eventApi.setChain(item.id, { admin: auth.wallet, cosigner, nonce, address, signers: signersPda(address) })
+    localStorage.removeItem(pendingVaultKey(item.id, auth.wallet))
     notify('On-chain vault opened. Entries now pay the program, not the treasury.')
     await loadEvents()
   } catch (error) {

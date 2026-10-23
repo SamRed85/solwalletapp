@@ -255,7 +255,7 @@ func settleEntries(entries []Entry, results string, salesLamports, rolloverIn ui
 func (a *App) rolloverTarget(ctx context.Context, exclude bson.ObjectID, now time.Time) (*bson.ObjectID, error) {
 	var next Event
 	err := a.events.FindOne(ctx,
-		bson.M{"_id": bson.M{"$ne": exclude}, "startTime": bson.M{"$gt": now}, "resultsSetAt": bson.M{"$exists": false}},
+		bson.M{"_id": bson.M{"$ne": exclude}, "startTime": bson.M{"$gt": now}, "resultsSetAt": bson.M{"$exists": false}, "chain": bson.M{"$exists": false}},
 		options.FindOne().SetSort(bson.M{"startTime": 1}).SetProjection(bson.M{"_id": 1}),
 	).Decode(&next)
 	if errors.Is(err, mongo.ErrNoDocuments) {

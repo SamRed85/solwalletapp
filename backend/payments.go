@@ -101,8 +101,13 @@ func (a *App) handleCreatePaymentRecovery(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// A recovery only ever leads to a refund, so it stays open for vault events: a treasury
+	// transfer made for one is returned, never turned into an entry.
 	payment := newPaymentRecord(req.Signature, wallet, e.ID, system, combinations, lamports, memo, paymentRecoveryPending)
 	payment.Reason = "payment finalized but no entry was accepted"
+	if e.hasVault {
+		payment.Reason = "treasury transfer for an on-chain vault event; refund only"
+	}
 	if _, err := a.payments.InsertOne(ctx, payment); err != nil {
 		if !mongo.IsDuplicateKeyError(err) {
 			writeError(w, http.StatusInternalServerError, "failed to record payment recovery")

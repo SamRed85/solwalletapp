@@ -37,7 +37,9 @@ Test SOL: `solana airdrop 2 <wallet> --url devnet`, or https://faucet.solana.com
 | `ADMIN_WALLETS` | `4tyf8a...cHdy` | Comma-separated admin wallet addresses |
 | `TREASURY_WALLET` | `4tyf8a...cHdy` | Wallet that receives coupon payments |
 | `COUPON_PRICE_LAMPORTS` | `1000000` (0.001 SOL) | Default price per coupon (stored on each event when it is created) |
-| `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | RPC used to verify payments |
+| `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | RPC used to verify payments and read vault accounts |
+| `PROGRAM_ID` | `H4x1HK...G97tr` | Predictions program that owns vault events |
+| `RESULT_COSIGNER` | `4gGayW...FEHH` | Required second result signer of every vault; must not be an admin wallet |
 | `SESSION_SECRET` | random per start | HMAC key for session tokens; set it to keep sessions across restarts |
 | `ALLOWED_ORIGIN` | `http://localhost:3000` | CORS origin, only needed when not using the dev proxy |
 
@@ -81,6 +83,16 @@ first finalized devnet block at or after that time. The first 8 bytes (big endia
 number of picks select `1`, `X` or `2` in proportion to how many coupons picked each. The block and
 weights are stored with the game so anyone can recompute the draw.
 
+**Vault events.** An admin can move an open event without entries to an on-chain vault (at most 16
+unresolved vaults per admin wallet). From then on coupons are paid to the program, never the treasury,
+and the rules differ, see [`docs/rules-spec.md`](docs/rules-spec.md): picks stay hidden until entries
+close and must be revealed in My Coupons before the end time, or the coupon cannot win; a void game
+(`C`) counts every pick as correct; the admin and the configured cosigner each approve the same results
+in their own transaction, after which anyone runs the batched count and winners claim from the vault.
+Without approved results by 7 days after the end time, anyone can cancel the event and every coupon is
+refunded. Each coupon carries an encrypted backup of its picks, so My Coupons can rebuild it on another
+device after the wallet signs a fixed message.
+
 ## API
 
 | Method | Path | Access |
@@ -94,10 +106,12 @@ weights are stored with the game so anyone can recompute the draw.
 | GET | `/api/events`, `/api/events/{id}` | signed in |
 | POST | `/api/events/{id}/entries` | signed in |
 | POST | `/api/events/{id}/payment-recoveries` | signed in (own stranded payment) |
+| POST | `/api/events/{id}/chain/sync` | signed in (copies the vault outcome from chain) |
 | GET | `/api/entries` | signed in (own entries) |
 | POST | `/api/events` | admin |
 | PUT | `/api/events/{id}/games` | admin |
-| POST | `/api/events/{id}/results` | admin (settles the event) |
+| PUT | `/api/events/{id}/chain` | admin (attaches a vault after checking it on chain) |
+| POST | `/api/events/{id}/results` | admin (settles a treasury event) |
 | GET | `/api/events/{id}/payouts` | admin |
 | GET | `/api/payment-recoveries` | admin |
 | PUT | `/api/payment-recoveries/{signature}` | admin (records verified refund) |

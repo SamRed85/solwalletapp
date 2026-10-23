@@ -29,20 +29,41 @@
       </v-card-text>
     </v-card>
 
-    <v-card v-for="coupon in chainCoupons" :key="coupon.signature" class="mb-4" variant="outlined">
+    <div class="d-flex flex-wrap align-center ga-2 mb-4">
+      <span class="text-subtitle-1">Vault coupons</span>
+      <v-spacer />
+      <v-btn v-if="unrecovered" size="small" color="warning" variant="flat" :loading="recoveringChain" @click="recoverChain">
+        Recover {{ unrecovered }} coupon(s) from chain
+      </v-btn>
+      <v-btn size="small" variant="text" prepend-icon="mdi-download" @click="exportBackup">Export backup</v-btn>
+      <v-btn size="small" variant="text" prepend-icon="mdi-upload" @click="importInput?.click()">Import backup</v-btn>
+      <input ref="importInput" type="file" accept="application/json" hidden @change="importBackup">
+    </div>
+    <v-alert v-if="chainError" type="warning" variant="tonal" class="mb-4">{{ chainError }}</v-alert>
+
+    <v-card v-for="row in chainRows" :key="row.id" class="mb-4" variant="outlined">
       <v-card-title class="d-flex align-center flex-wrap ga-2">
-        {{ coupon.eventTitle || 'On-chain coupon' }}
+        <router-link v-if="row.eventId" :to="`/events/${row.eventId}`" class="text-decoration-none">{{ row.eventTitle }}</router-link>
+        <span v-else>{{ row.eventTitle }}</span>
         <v-spacer />
-        <v-chip size="small" variant="flat" color="primary">Vault</v-chip>
+        <v-chip size="small" variant="flat" :color="row.color">{{ row.label }}</v-chip>
       </v-card-title>
-      <v-card-subtitle>
-        {{ coupon.combinations.toLocaleString() }} combination(s) · paid {{ formatSol(coupon.lamports) }} ·
-        <a :href="explorerTx(coupon.signature)" target="_blank" rel="noopener">entry</a>
+      <v-card-subtitle class="text-wrap">
+        Coupon #{{ row.index + 1 }} · {{ row.combinations.toLocaleString() }} combination(s) · paid {{ formatSol(row.lamports) }}
+        <template v-if="row.address"> · <a :href="explorerAddress(row.address)" target="_blank" rel="noopener">account</a></template>
       </v-card-subtitle>
-      <v-card-text class="d-flex flex-wrap ga-2">
-        <v-btn v-if="!coupon.revealed" color="primary" variant="flat" :loading="acting === coupon.signature" @click="reveal(coupon)">Reveal picks</v-btn>
-        <v-btn v-if="coupon.revealed && !coupon.claimed" color="success" variant="flat" :loading="acting === coupon.signature" @click="claim(coupon)">Claim from vault</v-btn>
-        <span v-if="coupon.claimed" class="text-success">Claimed from the vault</span>
+      <v-card-text>
+        <div v-if="row.system" class="mb-2">
+          <span v-for="(picks, game) in row.system" :key="game" class="mr-2">{{ game + 1 }}:{{ picks }}</span>
+        </div>
+        <div class="text-body-2 mb-2">{{ row.detail }}</div>
+        <div class="d-flex flex-wrap ga-2">
+          <v-btn v-if="row.action === 'reveal'" color="primary" variant="flat" :loading="acting === row.id" @click="act(row, revealOnChain, 'Picks revealed')">Reveal picks</v-btn>
+          <v-btn v-if="row.action === 'claim'" color="success" variant="flat" :loading="acting === row.id" @click="act(row, claimOnChain, row.payout ? 'Winnings claimed' : 'Coupon closed and rent returned')">
+            {{ row.payout ? `Claim ${formatSol(row.payout)}` : 'Close coupon (returns rent)' }}
+          </v-btn>
+          <v-btn v-if="row.action === 'refund'" color="warning" variant="flat" :loading="acting === row.id" @click="act(row, refundOnChain, 'Entry refunded')">Refund {{ formatSol(row.lamports) }}</v-btn>
+        </div>
       </v-card-text>
     </v-card>
 
@@ -100,19 +121,159 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import CouponPicks from '@/components/CouponPicks.vue'
-import { entryApi } from '@/services/api'
-import { PAYMENT_MAX_AGE_MS, claimOnChain, loadChainCoupons, loadPending, removePending, revealOnChain, submitPending } from '@/services/entry'
+import { entryApi, eventApi } from '@/services/api'
+import {
+  PAYMENT_MAX_AGE_MS, backupMatches, claimOnChain, couponId, exportCouponBackup, importCouponBackup, loadChainCoupons,
+  loadPending, recoverFromChain, refundOnChain, removePending, revealOnChain, submitPending
+} from '@/services/entry'
+import { couponPayout, eventPda, fetchEvent, systemFromPicks, walletCoupons } from '@/services/program'
 import { auth, loadConfig } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
-import { explorerTx, formatDate, formatSol, statusColors } from '@/utils/format'
+import { explorerAddress, explorerTx, formatDate, formatSol, statusColors } from '@/utils/format'
 
 const entries = ref([])
 const pending = ref([])
 const loading = ref(false)
 const retrying = ref(null)
 const recovering = ref(null)
-const chainCoupons = ref([])
 const acting = ref(null)
+const chainRows = ref([])
+const chainError = ref('')
+const unrecovered = ref(0)
+const recoveringChain = ref(false)
+const importInput = ref(null)
+let chainContext = { onChain: [], events: new Map() }
+
+function describe (onChain, saved, state, now) {
+  const restorable = onChain && !onChain.revealed && backupMatches(auth.wallet, saved, onChain)
+  if (!onChain) {
+    if (saved.claimed) return { label: 'Claimed', color: 'success', detail: 'Paid from the vault; the coupon account is closed.' }
+    if (saved.refunded) return { label: 'Refunded', color: 'default', detail: 'The entry price was returned.' }
+    if (Date.now() - saved.placedAt < 120000) return { label: 'Confirming', color: 'default', detail: 'Waiting for the entry to appear on chain.' }
+    return { label: 'Closed', color: 'default', detail: 'This coupon is no longer on chain: it was claimed, refunded or never confirmed.' }
+  }
+  if (!state) return { label: 'Unknown event', color: 'default', detail: 'The on-chain event could not be read.' }
+  if (state.status === 'cancelled') return { label: 'Cancelled', color: 'warning', action: 'refund', detail: 'The event was cancelled. Refund the entry price to your wallet.' }
+  if (state.status === 'resolved') {
+    const payout = couponPayout(onChain, state)
+    return {
+      label: payout ? 'Won' : (onChain.revealed ? 'No win' : 'Not revealed'),
+      color: payout ? 'success' : 'default',
+      action: 'claim',
+      payout: Number(payout),
+      detail: onChain.revealed ? `Results: ${state.results}` : 'The picks were not revealed in time, so the stake stayed in the prize pool.'
+    }
+  }
+  if (state.status === 'tallying') return { label: 'Counting', color: 'primary', detail: 'Results are locked and coupons are being counted.' }
+  if (now < state.deadline) return { label: 'Entered', color: 'primary', detail: `Reveal your picks after entries close (${formatDate(state.deadline * 1000)}).` }
+  if (onChain.revealed) return { label: 'Revealed', color: 'primary', detail: 'Waiting for both result signers.' }
+  if (now >= state.revealDeadline) return { label: 'Not revealed', color: 'error', detail: 'The reveal window has closed; this coupon cannot win.' }
+  if (restorable) return { label: 'Reveal now', color: 'warning', action: 'reveal', detail: `Reveal before ${formatDate(state.revealDeadline * 1000)} or the coupon cannot win.` }
+  return { label: 'Picks missing', color: 'error', detail: 'This browser does not have the picks. Recover them from chain or import a backup.' }
+}
+
+async function loadChain () {
+  chainError.value = ''
+  await loadConfig()
+  const rpcUrl = auth.config.solanaRpcUrl
+  const saved = loadChainCoupons(auth.wallet)
+  let onChain = []
+  const events = new Map()
+  try {
+    const list = await eventApi.list()
+    for (const event of list) {
+      if (event.chain) events.set(event.chain.address || eventPda(event.chain.admin, event.chain.nonce), event)
+    }
+    onChain = await walletCoupons(rpcUrl, auth.wallet)
+  } catch (error) {
+    chainError.value = `Could not read your vault coupons from chain: ${error.message}`
+  }
+  const addresses = new Set([...onChain.map(coupon => coupon.event), ...saved.map(coupon => eventPda(coupon.admin, coupon.nonce))])
+  const states = new Map()
+  await Promise.all([...addresses].map(async address => {
+    try {
+      states.set(address, await fetchEvent(rpcUrl, address))
+    } catch {
+      // the event row explains that its state is unknown
+    }
+  }))
+  chainContext = { onChain, events }
+
+  const savedById = new Map(saved.map(coupon => [couponId(coupon), coupon]))
+  const localOnly = new Map(savedById)
+  const now = Math.floor(Date.now() / 1000)
+  const rows = []
+  for (const coupon of onChain) {
+    const local = savedById.get(coupon.address)
+    localOnly.delete(coupon.address)
+    const event = events.get(coupon.event)
+    const state = states.get(coupon.event)
+    const system = coupon.revealed ? systemFromPicks(coupon.picks, coupon.gameCount) : local?.system
+    rows.push({
+      id: coupon.address, address: coupon.address, index: coupon.index, combinations: coupon.combinations,
+      lamports: Number(coupon.lamportsPaid), eventId: event?.id, eventTitle: event?.title || local?.eventTitle || 'Vault event',
+      admin: event?.chain.admin ?? local?.admin, nonce: event?.chain.nonce ?? local?.nonce,
+      system, revealNonce: local?.revealNonce, ...describe(coupon, local, state, now)
+    })
+  }
+  for (const local of localOnly.values()) {
+    rows.push({ id: couponId(local), ...local, ...describe(null, local, null, now) })
+  }
+  unrecovered.value = onChain.filter(coupon => {
+    const state = states.get(coupon.event)
+    const canReveal = state?.status === 'open' && now < state.revealDeadline
+    return canReveal && !coupon.revealed && !backupMatches(auth.wallet, savedById.get(coupon.address), coupon)
+  }).length
+  chainRows.value = rows
+}
+
+async function act (row, action, message) {
+  acting.value = row.id
+  try {
+    await loadConfig()
+    await action({ config: auth.config, wallet: auth.wallet, coupon: row })
+    notify(message)
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    acting.value = null
+    await loadChain()
+  }
+}
+
+async function recoverChain () {
+  recoveringChain.value = true
+  try {
+    const restored = await recoverFromChain({ wallet: auth.wallet, ...chainContext })
+    notify(`Recovered ${restored} coupon(s) from chain`)
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    recoveringChain.value = false
+    await loadChain()
+  }
+}
+
+function exportBackup () {
+  const blob = new Blob([exportCouponBackup(auth.wallet)], { type: 'application/json' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = `sol-coupons-${auth.wallet.slice(0, 6)}.json`
+  link.click()
+  URL.revokeObjectURL(link.href)
+}
+
+async function importBackup (event) {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!file) return
+  try {
+    notify(`Imported ${importCouponBackup(auth.wallet, await file.text())} coupon(s)`)
+  } catch (error) {
+    notifyError(error)
+  }
+  await loadChain()
+}
 
 const totalWinnings = computed(() => entries.value.reduce((sum, e) => sum + e.winningsLamports, 0))
 const gameLabel = (entry, index) => {
@@ -123,7 +284,7 @@ const expired = p => Date.now() - p.paidAt > PAYMENT_MAX_AGE_MS
 
 async function load () {
   pending.value = loadPending(auth.wallet)
-  chainCoupons.value = loadChainCoupons(auth.wallet)
+  loadChain().catch(notifyError)
   loading.value = true
   try {
     entries.value = await entryApi.mine()
@@ -162,34 +323,6 @@ async function recover (p) {
   } finally {
     recovering.value = null
     pending.value = loadPending(auth.wallet)
-  }
-}
-
-async function reveal (coupon) {
-  acting.value = coupon.signature
-  try {
-    await loadConfig()
-    await revealOnChain({ config: auth.config, wallet: auth.wallet, coupon })
-    notify('Picks revealed')
-  } catch (error) {
-    notifyError(error)
-  } finally {
-    acting.value = null
-    chainCoupons.value = loadChainCoupons(auth.wallet)
-  }
-}
-
-async function claim (coupon) {
-  acting.value = coupon.signature
-  try {
-    await loadConfig()
-    await claimOnChain({ config: auth.config, wallet: auth.wallet, coupon })
-    notify('Claim sent from the vault')
-  } catch (error) {
-    notifyError(error)
-  } finally {
-    acting.value = null
-    chainCoupons.value = loadChainCoupons(auth.wallet)
   }
 }
 

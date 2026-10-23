@@ -20,8 +20,11 @@ export const statusColors = {
   draft: 'grey',
   open: 'success',
   closed: 'warning',
-  completed: 'primary'
+  completed: 'primary',
+  cancelled: 'error'
 }
+
+export const explorerAddress = address => `https://explorer.solana.com/address/${address}?cluster=devnet`
 
 export const outcomes = [
   { value: '1', label: 'Home win' },

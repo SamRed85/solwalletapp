@@ -27,6 +27,7 @@ type App struct {
 	verifyRecoveryPayment func(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string) error
 	verifyRefund          func(ctx context.Context, signature, treasury, recipient string, lamports uint64) error
 	findDrawBlock         func(ctx context.Context, t time.Time) (*blockRef, error)
+	fetchAccount          func(ctx context.Context, address string) (*chainAccount, error)
 }
 
 func main() {
@@ -58,6 +59,7 @@ func main() {
 		verifyRecoveryPayment: rpc.verifyRecoveryPayment,
 		verifyRefund:          rpc.verifyRefund,
 		findDrawBlock:         rpc.findDrawBlock,
+		fetchAccount:          rpc.getAccount,
 	}
 	if err := app.ensureIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
@@ -89,6 +91,7 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/events/{id}", a.requireAuth(a.handleGetEvent))
 	mux.HandleFunc("POST /api/events/{id}/entries", a.requireAuth(a.limitRequests("entry", 20, time.Minute, walletRateKey, a.handleCreateEntry)))
 	mux.HandleFunc("GET /api/entries", a.requireAuth(a.handleMyEntries))
+	mux.HandleFunc("POST /api/events/{id}/chain/sync", a.requireAuth(a.limitRequests("chain-sync", 20, time.Minute, walletRateKey, a.handleSyncChain)))
 	mux.HandleFunc("POST /api/events/{id}/payment-recoveries", a.requireAuth(a.limitRequests("payment-recovery", 5, time.Minute, walletRateKey, a.handleCreatePaymentRecovery)))
 
 	mux.HandleFunc("GET /api/users", a.requireAdmin(a.handleListUsers))
@@ -150,6 +153,9 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"maxGames":            maxGames,
 		"maxCouponsPerEntry":  maxCombinations,
 		"maxCombinations":     maxCombinations,
+		"programId":           a.cfg.ProgramID,
+		"resultCosigner":      a.cfg.ResultCosigner,
+		"maxOpenVaultEvents":  maxOpenVaultEvents,
 		"defaultGameCount":    defaultGameCount,
 		"defaultTiers":        defaultTiers(defaultGameCount),
 		"houseCutPercent":     houseCutPercent,

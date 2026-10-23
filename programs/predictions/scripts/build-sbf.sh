@@ -29,4 +29,11 @@ sed -i "s/declare_id!(\"[^\"]*\")/declare_id!(\"${pubkey}\")/" /app/src/lib.rs
 echo "program id ${pubkey}"
 
 cd /app
-cargo-build-sbf --features devnet-testing
+# The default build has the 24-hour upgrade delay and no override. DEVNET_TESTING=1 builds the
+# five-minute variant for local experiments only; never deploy it to a shared cluster.
+if [[ "${DEVNET_TESTING:-0}" == "1" ]]; then
+  echo "building the devnet-testing variant (five-minute upgrade delay with override)"
+  cargo-build-sbf --features devnet-testing
+else
+  cargo-build-sbf
+fi

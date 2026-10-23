@@ -62,8 +62,12 @@ export async function disconnectWallet () {
 }
 
 export async function signMessage (message) {
+  return btoa(String.fromCharCode(...await signMessageBytes(message)))
+}
+
+export async function signMessageBytes (message) {
   const { signature } = await requireProvider().signMessage(new TextEncoder().encode(message), 'utf8')
-  return btoa(String.fromCharCode(...signature))
+  return Uint8Array.from(signature)
 }
 
 async function rpc (rpcUrl, method, params) {
@@ -162,13 +166,22 @@ export async function latestBlockhash (rpcUrl) {
   return rpc(rpcUrl, 'getLatestBlockhash', [{ commitment: 'confirmed' }])
 }
 
-export async function getAccount (rpcUrl, address) {
-  const result = await rpc(rpcUrl, 'getAccountInfo', [address, { encoding: 'base64', commitment: 'confirmed' }])
-  if (!result?.value?.data?.[0]) return null
-  const binary = atob(result.value.data[0])
+function fromBase64 (encoded) {
+  const binary = atob(encoded)
   const out = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
   return out
+}
+
+export async function getAccount (rpcUrl, address) {
+  const result = await rpc(rpcUrl, 'getAccountInfo', [address, { encoding: 'base64', commitment: 'confirmed' }])
+  if (!result?.value?.data?.[0]) return null
+  return fromBase64(result.value.data[0])
+}
+
+export async function getProgramAccounts (rpcUrl, programId, filters) {
+  const result = await rpc(rpcUrl, 'getProgramAccounts', [programId, { encoding: 'base64', commitment: 'confirmed', filters }])
+  return (result ?? []).map(({ pubkey, account }) => ({ pubkey, data: fromBase64(account.data[0]) }))
 }
 
 export async function signAndSendMessage (message) {
