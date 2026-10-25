@@ -50,8 +50,8 @@ export async function login () {
     const wallet = await connectWallet()
     const { nonce, message } = await authApi.nonce(wallet)
     const signature = await signMessage(message)
-    const { token, expiresAt, user } = await authApi.login(wallet, nonce, signature)
-    const session = { token, expiresAt, wallet: user.walletAddress, displayName: user.displayName || '', isAdmin: user.isAdmin }
+    const { expiresAt, user } = await authApi.login(wallet, nonce, signature)
+    const session = { expiresAt, wallet: user.walletAddress, displayName: user.displayName || '', isAdmin: user.isAdmin }
     saveSession(session)
     apply(session)
     refreshBalance()
@@ -61,6 +61,11 @@ export async function login () {
 }
 
 export async function logout () {
+  try {
+    await authApi.logout()
+  } catch {
+    // The cookie is cleared locally even when the server is unreachable.
+  }
   clearSession()
   apply(null)
   await disconnectWallet()

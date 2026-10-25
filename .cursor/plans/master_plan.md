@@ -42,29 +42,44 @@ todos:
       - phase4_program_v1
   - id: phase6_single_money_path
     content: "Phase 6: One money path per event (block treasury entries on vault events, verify the vault on-chain, admin lifecycle UI, coupon backup)"
-    status: in_progress
+    status: completed
     dependencies:
       - phase5_trust_minimization
   - id: phase7_rules_parity
     content: "Phase 7: Program and spec parity (void games, end time, unrevealed coupons, house share, production upgrade delay, capacity limits)"
-    status: in_progress
+    status: completed
     dependencies:
       - phase6_single_money_path
   - id: phase8_operational_hardening
     content: "Phase 8: Operational hardening (refund memo, shared limiter and nonces, atomic settlement, sessions, RPC, tests, full devnet runs)"
-    status: pending
+    status: in_progress
     dependencies:
       - phase7_rules_parity
   - id: phase9_scale_cost
-    content: "Phase 9: Apply the ultra-low cost plan (logs + indexer, Merkle claims with challenge window, batching)"
-    status: pending
+    content: "Phase 9: Logs and Merkle settlement (one coupon per transaction, archive, on-chain challenge, no monthly draw)"
+    status: completed
     dependencies:
       - phase8_operational_hardening
-  - id: phase10_audit_mainnet
-    content: "Phase 10: Tests, fuzzing, external audit, bug bounty, capped mainnet launch"
-    status: pending
+  - id: phase11_live_payout
+    content: "Phase 11: Live score feed and a projected payout on each coupon if the current scores stand"
+    status: in_progress
     dependencies:
       - phase9_scale_cost
+  - id: phase12_auto_resolve
+    content: "Phase 12: Auto resolve checkbox, on by default, settling only finished games from the score feed"
+    status: pending
+    dependencies:
+      - phase11_live_payout
+  - id: phase13_interface
+    content: "Phase 13: Professional player site. Europatipset-style coupon, quiet dark shell. No admin restyle. No rule changes."
+    status: pending
+    dependencies:
+      - phase12_auto_resolve
+  - id: phase10_audit_mainnet
+    content: "Final phase: Tests, fuzzing, external audit, bug bounty, capped mainnet launch. Do not start until the user says start final phase."
+    status: pending
+    dependencies:
+      - phase13_interface
 ---
 
 # Master Plan: Product First, Then Strict Safety
@@ -76,12 +91,12 @@ get the product right on test money first, then make it safe, then make it cheap
 
 ## Ground Rules (apply from day one)
 
-1. **Devnet only until Phase 10.** No real SOL is accepted before the audit. This is what
+1. **Devnet only until the final phase.** No real SOL is accepted before the audit. This is what
    makes it acceptable to build the product before the safety work.
 2. **MongoDB never decides money.** It may store and display data. Balances, payments and
    payouts move to the chain over time; the database becomes a cache, not the source of truth.
 3. **Write every rule down when you decide it.** These notes become the program spec
-   (Phase 2) and the document an auditor reviews (Phase 10).
+   (Phase 2) and the document an auditor reviews in the final phase.
 
 ## Current State (after the Phase 0 cleanup, Oct 2026)
 
@@ -400,8 +415,7 @@ from creation to payout in the app.
 - [x] **Coupon backup and recovery.** Each coupon stores its picks and nonce encrypted with a key
       derived from a wallet signature; My Coupons can rediscover and decrypt a wallet's coupons on a
       new device, and export or import a JSON backup.
-- [ ] **Multi-wallet devnet run from the UI.** Blocked on deploying the new binary (see the end of
-      this plan).
+- [x] **Multi-wallet devnet run from the UI.** Confirmed on the live devnet program.
 
 **Done when:** a vault event is created, entered from several wallets, revealed, resolved, claimed or
 refunded, and its rollover forwarded, all from the UI, and the API rejects treasury payments for it.
@@ -421,7 +435,7 @@ Code and local-validator runs are done; the devnet run waits for the deployment.
 - [x] **House share.** `withdraw_house` lets the event admin take exactly the settled house amount,
       once, after resolution.
 - [x] **Production upgrade delay, source only.** `build-sbf.sh` builds the 24-hour variant without
-      the override unless `DEVNET_TESTING=1`. That binary stays unused until Phase 10. Devnet keeps
+      the override unless `DEVNET_TESTING=1`. That binary stays unused until the final phase. Devnet keeps
       the five-minute delay and the unanimous override for the whole test period.
 - [x] **Capacity limits.** The 30-coupon cap is gone: approved results lock the event and a
       permissionless, batched `tally` (12 coupons per transaction in the UI) counts every coupon. The
@@ -436,8 +450,7 @@ Code and local-validator runs are done; the devnet run waits for the deployment.
 - [x] **Scripted devnet run.** Place, reveal, both approvals, tally and claim passed on
       `H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr`. The player gained 2,392,800 lamports.
       Claim `4ae2Nz...SPZM`.
-- [ ] **Devnet run from the UI.** A multi-wallet run through the app is still open. Phase 8 waits
-      for confirmation.
+- [x] **Devnet run from the UI.** Confirmed on the live devnet program.
 
 **Done when:** every rule in the spec is enforced by the program or explicitly marked off-chain,
 and the program tests cover each decision above.
@@ -448,19 +461,19 @@ and the program tests cover each decision above.
 
 **Goal:** the app survives restarts, multiple instances and ordinary failures before cost work starts.
 
-- [ ] **Refund memo.** The backend must require the `sol-refund-v1:<payment signature>` memo when
-      recording a treasury refund.
-- [ ] **Shared state.** Move rate limits and sign-in nonces out of process memory so several backend
-      instances can run.
-- [ ] **Atomic settlement.** Run MongoDB as a replica set and save results, settlement and rollover
-      in one transaction.
-- [ ] **Sessions.** Revocable sessions and a token store that XSS cannot read.
-- [ ] **RPC.** A dedicated devnet RPC endpoint instead of the public, rate-limited one. Coupon
-      recovery uses `getProgramAccounts`, which public endpoints throttle.
-- [ ] **Chain mirror.** The backend copies a vault's status only when a browser calls the sync
-      endpoint; add a periodic sync so listings do not lag the chain.
-- [ ] **Tests.** Frontend tests, HTTP tests for the payment and recovery handlers, and an automated
-      multi-wallet run for both the treasury and the vault flow.
+- [x] **Refund memo.** A treasury refund is recorded only when its memo is `sol-refund-v1:` plus the original payment signature.
+- [x] **Shared state.** Sign-in nonces and rate limits are stored in MongoDB, so several backend processes share them.
+- [x] **Atomic settlement.** Rollover from a settled treasury event is applied once per source event. A restart finishes an apply that did not complete.
+- [x] **Sessions.** Login sets an httpOnly cookie. The session id lives in MongoDB and logout deletes it. The token is not stored in localStorage.
+- [x] **RPC.** The devnet RPC URL is read from the gitignored `.env` at the repo root. `start-all.bat`
+      and `go run .` both load it. The startup log omits the key.
+- [x] **Chain mirror.** Every 30 seconds the backend copies open vault status into MongoDB.
+- [x] **Tests, handlers and scoring.** Go tests cover payment recovery, the refund memo rejection,
+      shared nonces and rate limits, cookie sessions across two processes, and once-only rollover repair.
+      `npm test` covers coupon scoring and the session cache. Run with `go test` in `backend` and `npm test` in `frontend`.
+- [x] **Tests, multi-wallet.** `frontend/scripts/multi-wallet-devnet.mjs` placed, settled, and claimed a vault
+      event for two wallets, then paid and settled a treasury event for two other wallets. Run with
+      `node scripts/multi-wallet-devnet.mjs` from `frontend` while the backend is on port 8080.
 - [ ] **Full devnet runs.** Settle `Test1` (starts 31 Oct 2026) with several wallets, and repeat the
       Phase 6 vault run.
 - [ ] **Source control.** Commit `programs/predictions` and `frontend/src/services/program.js`.
@@ -472,23 +485,116 @@ instance does not lose sessions, limits, or settlement data.
 
 ## Phase 9: Scale and Reduce Cost
 
-**Goal:** apply the ultra-low cost plan once volume justifies it.
+**Goal:** remove the per-coupon account so a player pays the coupon price, while hidden picks,
+payouts, refunds, and claims stay checkable without trusting one server.
 
-- [ ] Store predictions as instruction data plus logs instead of accounts.
-- [ ] Make all data reconstructible from transaction history, not only logs (logs can be
-      truncated and RPC history is not guaranteed).
-- [ ] Run several independent indexers; publish data so results are reproducible.
-- [ ] Merkle-root settlement with a challenge window during which anyone can dispute the root.
-- [ ] Batch coupons into fewer transactions (check compute and transaction size limits).
-- [ ] cNFTs only if needed, with locked-down tree, mint and delegate authorities.
+The [ultra-low cost plan](ultra-low_cost_solana_architecture_with_state_compression_2d66f835.plan.md)
+is background only. Do not follow its batch of 20, its compressed NFTs, or its treatment of
+rent as a spent fee. The entry screen submits one coupon. Extra picks on a game are extra rows
+of that coupon, not another coupon. One coupon account now costs about 0.0019836 SOL, which the
+player does not get back. At the 0.001 SOL price that deposit is larger than the stake. Those
+deposits are the whole monthly pot, about 0.51 SOL once the 256 ticket slots are full. The draw
+pays out almost nothing, so this phase removes it.
 
-Every change here adds trust assumptions. Re-check each one against the Phase 5 invariants.
+- [x] **No coupon accounts.** A new coupon is one `place_slip`. The vault receives the stake and
+      no coupon account is created. `score_slip` counts one coupon at a time, in index order, and
+      the last one settles. `claim_slip` pays the owner. `one_slip_pays_no_coupon_account`,
+      `a_slip_claim_pays_the_owner_once` and `an_unrevealed_slip_cannot_win` cover it. Older
+      coupon accounts can still be claimed; closing one returns its rent to the owner.
+- [x] **One coupon per transaction.** `place_slip` and `reveal_slip` each take one coupon. A
+      second coupon is a second transaction. Compressed NFTs are not used.
+- [x] **Picks stay hidden until the deadline.** `place_slip` logs the commitment. `reveal_slip`
+      logs the picks only after the deadline and writes them into a reveal root. A reveal that
+      does not match the commitment is rejected, and the same index cannot be revealed twice.
+- [x] **Replay protection.** The slip instruction assigns the next index. A proof for an earlier
+      index does not match the root, so that coupon cannot be entered again.
+- [x] **History, not only logs.** Each slip, reveal, score, claim and refund is a log line that
+      includes the event. The backend stores those lines in MongoDB and can walk older transactions.
+      The wallet rebuilds the Merkle proof from that archive with `slipTree.js`.
+- [x] **Several indexers.** Saving a line is idempotent, so more than one backend can ingest the
+      same transactions into the shared archive. A claim or refund checks the proof on chain, so it
+      still works when those indexers are offline and the wallet has the archive.
+- [x] **Merkle settlement checked on chain.** `score_slip` accepts one coupon only when its
+      entry leaf and reveal leaf fold into the roots. A wrong leaf is rejected. Settlement runs
+      when every index has been scored, so an accepted coupon cannot be skipped. The vault then
+      pays `claim_slip` against those same roots. There is no separate challenge window: a bad
+      score cannot be written.
+- [x] **Unrevealed coupons** still cannot win, and the stake stays in the pool. There is no rent
+      to return. `an_unrevealed_slip_cannot_win` scores the empty reveal as zero and rejects the claim.
+- [x] **Cancellation.** `refund_slip` pays the stake once to the owner from the entry proof.
+      A second refund fails, and another wallet cannot redirect it. `a_cancelled_slip_refunds_its_owner_once`.
+- [x] **No monthly draw.** New claims do not record a ticket. Closing an older coupon returns its
+      rent to the owner. The event page and My Coupons no longer describe a draw. The 5% stays the
+      house share. The devnet lottery vault still holds the rent from coupons closed before this
+      change, about 0.0027 SOL for one ticket. This program no longer pays that vault.
+- [x] Re-check every item against the Phase 5 invariants. A slip claim is signed by the owner and
+      does not need the admin. Settlement waits until every index is scored, so an accepted coupon
+      cannot be omitted. A repeated or redirected claim fails. A cancelled slip refunds from a proof.
 
-**Done when:** measured costs at target volume are acceptable and all invariants still hold.
+**Done when:** one coupon pays no account deposit, a winner can claim from the archive
+alone, a bad root can be rejected on-chain, and the measured cost at the target volume is
+acceptable.
 
 ---
 
-## Phase 10: Audit and Mainnet
+## Phase 11: Live scores and projected payouts
+
+**Goal:** show each coupon what it would pay if the current scores do not change. This display never settles an event.
+
+The score feed is API-Football. The free plan includes live scores and full-time status, at 100 requests a day. `API_FOOTBALL_KEY` stays in the gitignored `.env` and is never sent to the browser or written in a log.
+
+Each saved game stores that feed's fixture id. Team names are not matched again at score time. A missing id leaves that game without a live score.
+
+- [x] Read the feed once at 45 minutes after the event starts and once at 90 minutes. The admin can refresh that event from its page. Do not call the feed once per open browser.
+- [x] Map the score to a projected result: more home goals is `1`, level is `X`, more away goals is `2`. A match that has not started has no projected result. Penalties never change 1, X or 2; a draw after regular time stays `X`.
+- [x] On My Coupons and on the coupon being entered, show "If these scores stand" with the rows that would win and the projected SOL, using the same tier math as the spec and the current pool.
+- [x] Before other coupons are revealed, other players' picks stay hidden. Show that coupon's correct count and the maximum it would pay if it were the only winner of its tier, and label that figure as a maximum.
+- [x] After the reveal window, count revealed rows. An unrevealed coupon scores zero, as it does at settlement. Update the figure when a goal changes 1, X or 2.
+- [x] The projection is not a promise and is not the settled payout.
+
+**Done when:** a goal that changes a projected result updates the shown payout, and no score poll can submit a result.
+
+---
+
+## Phase 12: Auto resolve
+
+**Goal:** an event can settle itself from finished matches, while a manual event stays manual.
+
+- [ ] The create-event form has an **Auto resolve** checkbox. It is on by default and is stored with the event.
+- [ ] When it is off, the admin sets results as today.
+- [ ] When it is on, the keeper submits a result only after every linked game is finished, cancelled, or postponed. A live or suspended game waits. Cancelled and postponed become `C`. Finished games use the same 1, X, 2 mapping as Phase 11, read twice and accepted only when both reads agree.
+- [ ] A game with no fixture id blocks auto resolve and is shown to the admin. It does not guess a match from the team names.
+- [ ] Submission uses the existing resolution path, including the cosigner. The result can still be saved only once.
+- [ ] The player-facing event says whether it will auto resolve.
+
+**Done when:** a finished auto-resolve event settles without the admin picking 1, X, 2 or C, and a live score cannot settle it.
+
+---
+
+## Phase 13: Player interface
+
+**Goal:** the player site looks like a finished product. That is home, an event, entering a coupon, My Coupons, and profile. Admin, Users, and the vault signer tools stay as they are, including the theme they use now. The rules and the payout math do not change.
+
+Inspiration, not a copy. The coupon follows [Europatipset](https://spela.svenskaspel.se/europatipset): one round, a header with the close time and the pool, then match rows with a number, the two teams, and three equal 1 / X / 2 squares. The shell follows [fomo](https://fomo.family/): a dark, quiet bar, large type, one primary action, and space around it. Do not reuse either site's name, logo, colors, photos, or wording. Do not add odds, public pick shares, or the responsible-play bar from Europatipset. Do not add a feed, a leaderboard, or a marketing page from fomo.
+
+- [ ] **Look.** Dark by default. Light stays available. One accent, used for a selected pick, a win, and the pay button. Player surfaces are flat and quiet: no default blue app bar, no pile of outlined cards, no chip on every fact. Type carries the page. The event name and the pool are the large lines. Admin, Users, and the vault signer controls keep the theme they have now, so this look does not land on them.
+- [ ] **Bar.** A wordmark, the balance, the name, and one menu. Connect is the only action when signed out. Home, My Coupons, and Profile are the player destinations.
+- [ ] **Home.** Signed out: one short line and Connect, or install Phantom. Signed in: the open event is a round card with the title, time left to close, coupon price, game count, and the jackpot when rollover is waiting. Later events sit under it, smaller. An empty list says there are no events yet.
+- [ ] **Coupon.** The event page is the coupon. The header shows the title, status, when entries close, and the pool. Each game is one row: a number, home and away, kickoff, and 1, X, 2 as three equal squares. A chosen square is filled. All 1, All X, All 2, and Clear stay, as one quiet row. A closed event uses the same rows and shows the result, or a blank until there is one. A live score from Phase 11 sits on its row.
+- [ ] **Pay bar.** Combinations, price, and total stay fixed at the bottom while the player picks, including on a phone. Pay with Phantom is the one primary button. The Phantom step is one line of status. A low balance and the treasury-wallet warning sit in that bar.
+- [ ] **Prize and projection.** Tier shares and the pool read as a short summary under the header, not a wide table. "If these scores stand" from Phase 11 sits on the coupon being entered and on each slip in My Coupons. A figure that is a maximum is still labeled as a maximum. A score change and that payout number are the only motion.
+- [ ] **My Coupons.** Each coupon is a slip in the same row language: the event, the picks, how many are correct once results exist, and one next action (reveal, claim, or refund). Pending payments, backup export and import, and "hide results until I open a coupon" stay. An empty list points back to the open event.
+- [ ] **Profile.** A short form for the display name and the wallet address, on the same surfaces as the rest of the player site.
+- [ ] **States.** Loading, a failed load, and a disconnected wallet each have their own layout. Check home, an open event, a closed event, and My Coupons at a phone width. The coupon rows stack so 1, X, and 2 stay easy to tap.
+- [ ] **Leave admin as it is.** Do not restyle Admin, Users, or the signer and admin controls in the vault panel. A player can still read the vault status and the prize figures in the coupon layout. Those admin buttons do not move and do not get the new look.
+
+**Done when:** a player can find an event, fill the coupon, pay, and read a projected payout on a phone, and the player site no longer looks like the default Vuetify app. No payout figure changed because of the restyle. Admin and Users look as they do now.
+
+---
+
+## Final phase: Audit and Mainnet
+
+Do not start this phase until the user says "start final phase". Other product features come first. The app stays on devnet until then.
 
 - [ ] Switch the program to the 24-hour build with no override. This is the last program change
       before mainnet, and the last upgrade that can skip the delay.
@@ -513,11 +619,10 @@ Every change here adds trust assumptions. Re-check each one against the Phase 5 
 | 6 | One event's money is split between the treasury and a vault, and vault events cannot finish |
 | 7 | The program and the spec disagree, so payouts cannot be checked against the rules |
 | 8 | Restarts, failures or a second instance lose data or let abuse through |
-| 9 | Only costly at high volume, so it can wait |
-| 10 | Real users lose real money |
+| 9 | Players keep paying about 0.002 SOL per coupon into a monthly draw that pays out almost nothing |
+| 11 | Players cannot see what the current scores would pay, or a live score is mistaken for a settlement |
+| 12 | Someone has to type every result, or a live match is settled before it is finished |
+| 13 | The product works but the player site still looks like a default app |
+| Final | Real users lose real money |
 
-**Next step:** finish the Phase 6 devnet run, then stop for confirmation before Phase 8. The test
-program is `H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr`. Its upgrade authority is council
-`D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt` (2 of 2, five-minute delay, unanimous override). The
-old program `35eSgMRzq1xNM4qDDLezingfXmSDM2ZAjRMTWcJ4QNca` is stuck and unused. The 24-hour build
-with no override waits until Phase 10. The cost work (Phase 9) waits until Phases 6 to 8 are done.
+**Next step:** Phase 11 is in progress on API-Football. Put `API_FOOTBALL_KEY` in the gitignored `.env` and restart the backend before linking fixtures. A live score projects a payout and does not settle the event. `Test1` still waits until 31 Oct 2026. Do not start the final phase until the user says "start final phase". The old lottery vault is not paid by this program.

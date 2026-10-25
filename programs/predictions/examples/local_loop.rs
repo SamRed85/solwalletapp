@@ -16,7 +16,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-const PROGRAM: &str = "H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr";
+const PROGRAM: &str = "AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX";
 const CLOCK: &str = "SysvarC1ock11111111111111111111111111111111";
 const REVEAL_NONCE: u64 = 7;
 

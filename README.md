@@ -86,9 +86,15 @@ weights are stored with the game so anyone can recompute the draw.
 **Vault events.** An admin can move an open event without entries to an on-chain vault (at most 16
 unresolved vaults per admin wallet). From then on coupons are paid to the program, never the treasury,
 and the rules differ, see [`docs/rules-spec.md`](docs/rules-spec.md): picks stay hidden until entries
-close and must be revealed in My Coupons before the end time, or the coupon cannot win; a void game
+close and must be revealed before the end time, or the coupon cannot win. The player signs only the
+entry. The picks are time-lock encrypted until entries close, and the backend publishes them from the
+gitignored `keys/reveal-keeper.json`, so the player does not need to be online or sign the reveal.
+My Coupons can arm that publish later, or reveal immediately once the window is open. A void game
 (`C`) counts every pick as correct; the admin and the configured cosigner each approve the same results
-in their own transaction, after which anyone runs the batched count and winners claim from the vault.
+(or a cancellation) in their own transaction, after which anyone runs the batched count and winners
+claim from the vault. A cancellation takes effect only after both have approved; players then refund
+from My Coupons or the event page. When the cosigner is the council key on disk, it approves with
+`node scripts/cosign-event.mjs <event> cancel` or `... resolve <results>`.
 Without approved results by 7 days after the end time, anyone can cancel the event and every coupon is
 refunded. Each coupon carries an encrypted backup of its picks, so My Coupons can rebuild it on another
 device after the wallet signs a fixed message.
@@ -107,8 +113,10 @@ device after the wallet signs a fixed message.
 | POST | `/api/events/{id}/entries` | signed in |
 | POST | `/api/events/{id}/payment-recoveries` | signed in (own stranded payment) |
 | POST | `/api/events/{id}/chain/sync` | signed in (copies the vault outcome from chain) |
+| POST | `/api/reveals` | signed in (stores the owner's time-locked reveal; the server cannot read it early) |
 | GET | `/api/entries` | signed in (own entries) |
 | POST | `/api/events` | admin |
+| DELETE | `/api/events/{id}` | admin (only before a vault, coupons, or results) |
 | PUT | `/api/events/{id}/games` | admin |
 | PUT | `/api/events/{id}/chain` | admin (attaches a vault after checking it on chain) |
 | POST | `/api/events/{id}/results` | admin (settles a treasury event) |

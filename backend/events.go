@@ -32,6 +32,7 @@ type Game struct {
 	HomeTeam  string    `json:"homeTeam" bson:"homeTeam"`
 	AwayTeam  string    `json:"awayTeam" bson:"awayTeam"`
 	Kickoff   time.Time `json:"kickoff" bson:"kickoff"`
+	FixtureID int       `json:"fixtureId,omitempty" bson:"fixtureId,omitempty"`
 	Result    string    `json:"result" bson:"result"`
 	Cancelled bool      `json:"cancelled,omitempty" bson:"cancelled,omitempty"`
 	Draw      *Draw     `json:"draw,omitempty" bson:"draw,omitempty"`
@@ -301,6 +302,84 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, e)
 }
 
+// handleDeleteEvent removes an event that has not been published on chain.
+// Coupons and results make the event a record of money already taken, so those stay.
+// Rollover that was waiting on the event is handed to the next treasury event.
+func (a *App) handleDeleteEvent(w http.ResponseWriter, r *http.Request) {
+	e, ok := a.loadEvent(w, r)
+	if !ok {
+		return
+	}
+	if e.hasVault {
+		writeError(w, http.StatusConflict, "this event is on chain and cannot be deleted")
+		return
+	}
+	if e.ResultsSetAt != nil {
+		writeError(w, http.StatusConflict, "results are already set, so this event cannot be deleted")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	activity, err := a.eventActivity(ctx, e.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check coupons")
+		return
+	}
+	if activity > 0 {
+		writeError(w, http.StatusConflict, "this event already has coupons or payments, so it cannot be deleted")
+		return
+	}
+
+	res, err := a.events.DeleteOne(ctx, bson.M{
+		"_id":          e.ID,
+		"chain":        bson.M{"$exists": false},
+		"resultsSetAt": bson.M{"$exists": false},
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete event")
+		return
+	}
+	if res.DeletedCount == 0 {
+		writeError(w, http.StatusConflict, "this event changed and can no longer be deleted")
+		return
+	}
+
+	activity, err = a.eventActivity(ctx, e.ID)
+	if err != nil || activity > 0 {
+		if _, insErr := a.events.InsertOne(ctx, e); insErr != nil {
+			log.Printf("event %s was deleted during a coupon race and could not be restored: %v", e.ID.Hex(), insErr)
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to check coupons")
+		} else {
+			writeError(w, http.StatusConflict, "this event already has coupons or payments, so it cannot be deleted")
+		}
+		return
+	}
+
+	if e.RolloverInLamports > 0 {
+		target, targetErr := a.rolloverTarget(ctx, e.ID, time.Now())
+		if targetErr != nil || a.applyRolloverFrom(ctx, e.ID, target, e.RolloverInLamports) != nil {
+			if _, insErr := a.events.InsertOne(ctx, e); insErr != nil {
+				log.Printf("event %s was deleted but %d lamports of rollover could not be returned or restored: %v", e.ID.Hex(), e.RolloverInLamports, insErr)
+			}
+			writeError(w, http.StatusInternalServerError, "failed to return rollover from this event")
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *App) eventActivity(ctx context.Context, eventID bson.ObjectID) (int64, error) {
+	payments, err := a.payments.CountDocuments(ctx, bson.M{"eventId": eventID})
+	if err != nil {
+		return 0, err
+	}
+	entries, err := a.entries.CountDocuments(ctx, bson.M{"eventId": eventID})
+	return payments + entries, err
+}
+
 // Games can be set once, before entries open. Changing games after people have
 // placed coupons would change what their picks mean.
 func (a *App) handleSetGames(w http.ResponseWriter, r *http.Request) {
@@ -310,9 +389,10 @@ func (a *App) handleSetGames(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Games []struct {
-			HomeTeam string    `json:"homeTeam"`
-			AwayTeam string    `json:"awayTeam"`
-			Kickoff  time.Time `json:"kickoff"`
+			HomeTeam  string    `json:"homeTeam"`
+			AwayTeam  string    `json:"awayTeam"`
+			Kickoff   time.Time `json:"kickoff"`
+			FixtureID int       `json:"fixtureId"`
 		} `json:"games"`
 	}
 	if !decodeJSON(w, r, &req) {
@@ -341,7 +421,22 @@ func (a *App) handleSetGames(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "every kickoff must be between the event start (entry deadline) and end time")
 			return
 		}
-		games[i] = Game{HomeTeam: home, AwayTeam: away, Kickoff: kickoff}
+		if g.FixtureID < 0 {
+			writeError(w, http.StatusBadRequest, "a fixture id must be a positive number")
+			return
+		}
+		games[i] = Game{HomeTeam: home, AwayTeam: away, Kickoff: kickoff, FixtureID: g.FixtureID}
+	}
+	seenFixture := map[int]bool{}
+	for _, g := range games {
+		if g.FixtureID == 0 {
+			continue
+		}
+		if seenFixture[g.FixtureID] {
+			writeError(w, http.StatusBadRequest, "two games cannot use the same fixture")
+			return
+		}
+		seenFixture[g.FixtureID] = true
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -574,6 +669,7 @@ func (a *App) handleSetResults(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		settlement.RolloverToEventID = target
+		settlement.RolloverApplied = false
 	}
 
 	res, err := a.events.UpdateOne(ctx,
@@ -588,8 +684,10 @@ func (a *App) handleSetResults(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "results have already been set")
 		return
 	}
-	if err := a.applyRollover(ctx, settlement.RolloverToEventID, settlement.RolloverOutLamports); err != nil {
-		log.Printf("event %s: failed to apply rollover of %d lamports: %v", e.ID.Hex(), settlement.RolloverOutLamports, err)
+	if settlement.RolloverOutLamports > 0 {
+		if err := a.commitRollover(ctx, e.ID, settlement); err != nil {
+			log.Printf("event %s: failed to apply rollover of %d lamports: %v", e.ID.Hex(), settlement.RolloverOutLamports, err)
+		}
 	}
 	a.handleGetEvent(w, r)
 }

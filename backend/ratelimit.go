@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 type rateWindow struct {
@@ -15,9 +19,13 @@ type rateWindow struct {
 type rateLimiter struct {
 	mu      sync.Mutex
 	windows map[string]rateWindow
+	coll    *mongo.Collection
 }
 
 func (l *rateLimiter) allow(key string, limit int, window time.Duration, now time.Time) bool {
+	if l.coll != nil {
+		return l.allowShared(key, limit, window, now)
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.windows == nil {
@@ -41,6 +49,36 @@ func (l *rateLimiter) allow(key string, limit int, window time.Duration, now tim
 		}
 	}
 	return true
+}
+
+// allowShared counts in MongoDB so every backend process shares one window.
+func (l *rateLimiter) allowShared(key string, limit int, window time.Duration, now time.Time) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	open := now.Add(-window)
+	res, err := l.coll.UpdateOne(ctx, bson.M{"_id": key, "start": bson.M{"$gt": open}, "count": bson.M{"$lt": limit}}, bson.M{"$inc": bson.M{"count": 1}})
+	if err != nil {
+		return false
+	}
+	if res.MatchedCount == 1 {
+		return true
+	}
+	res, err = l.coll.UpdateOne(ctx, bson.M{"_id": key, "start": bson.M{"$lte": open}}, bson.M{"$set": bson.M{"start": now, "count": 1}})
+	if err != nil {
+		return false
+	}
+	if res.MatchedCount == 1 {
+		return true
+	}
+	_, err = l.coll.InsertOne(ctx, bson.M{"_id": key, "start": now, "count": 1})
+	if err == nil {
+		return true
+	}
+	if !mongo.IsDuplicateKeyError(err) {
+		return false
+	}
+	res, err = l.coll.UpdateOne(ctx, bson.M{"_id": key, "start": bson.M{"$gt": open}, "count": bson.M{"$lt": limit}}, bson.M{"$inc": bson.M{"count": 1}})
+	return err == nil && res.MatchedCount == 1
 }
 
 func remoteIP(r *http.Request) string {

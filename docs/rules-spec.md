@@ -181,10 +181,15 @@ An event attached to the on-chain program follows sections 1 to 9 with these dif
 program is authoritative; MongoDB only mirrors its status.
 
 - **Hidden picks.** `place_coupon` stores `SHA-256(owner || picks || nonce)` and the paid row
-  count. Picks are revealed with the nonce from the entry deadline until the reveal deadline,
-  which equals the event end time. A coupon that is not revealed in time cannot win; its
-  payment stays in the pool and claiming it only closes the account (its rent goes back to the
-  owner). A refund for unrevealed coupons would let a player reveal only winning coupons.
+  count. The player signs only that entry. The picks are time-lock encrypted until the entry
+  deadline and stored by the backend. After entries close, anyone who knows the picks can
+  publish them: the owner does not sign the reveal, and a wrong set of picks fails the
+  commitment check. The keeper opens the time lock and sends that transaction, so the player
+  does not have to be online. Reveals are only accepted from the entry deadline until the
+  reveal deadline, which equals the event end time. A coupon that is not revealed in time
+  cannot win; its payment stays in the pool and claiming it only closes the account (its rent
+  goes back to the owner). A refund for unrevealed coupons would let a player reveal only
+  winning coupons.
 - **Picks backup.** Each coupon stores 21 encrypted bytes: the 13 pick masks and the nonce,
   XORed with `SHA-256(key || commitment)[0..21]`, where `key = SHA-256(wallet signature of a
   fixed message)`. The program never reads it. It lets the owner rebuild a coupon on another

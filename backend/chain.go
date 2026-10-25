@@ -7,12 +7,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // The vault schedule every published event must use. The program checks the order of these
@@ -38,6 +40,8 @@ const (
 	eventStatusOffset       = 116
 	eventResultsOffset      = 117
 	eventCouponCountOffset  = 130
+	eventSalesOffset        = 134
+	eventRolloverOffset     = 142
 	eventAccountMinimumSize = 421
 
 	signersEventOffset     = 8
@@ -55,8 +59,9 @@ func anchorDiscriminator(account string) []byte {
 }
 
 type chainAccount struct {
-	Owner string
-	Data  []byte
+	Lamports uint64
+	Owner    string
+	Data     []byte
 }
 
 type chainEvent struct {
@@ -72,6 +77,8 @@ type chainEvent struct {
 	Status         string
 	Results        string
 	CouponCount    uint32
+	Sales          uint64
+	RolloverIn     uint64
 }
 
 func decodeChainEvent(account *chainAccount, programID string) (*chainEvent, error) {
@@ -95,6 +102,8 @@ func decodeChainEvent(account *chainAccount, programID string) (*chainEvent, err
 		EndTime:        int64(binary.LittleEndian.Uint64(d[eventEndOffset:])),
 		ResolveTimeout: int64(binary.LittleEndian.Uint64(d[eventTimeoutOffset:])),
 		CouponCount:    binary.LittleEndian.Uint32(d[eventCouponCountOffset:]),
+		Sales:          binary.LittleEndian.Uint64(d[eventSalesOffset:]),
+		RolloverIn:     binary.LittleEndian.Uint64(d[eventRolloverOffset:]),
 	}
 	status := int(d[eventStatusOffset])
 	if status >= len(chainStatuses) {
@@ -196,8 +205,9 @@ func checkVaultMatches(e *Event, vault ChainVault, ev *chainEvent, signers *chai
 func (s *solanaRPC) getAccount(ctx context.Context, address string) (*chainAccount, error) {
 	var out struct {
 		Value *struct {
-			Owner string    `json:"owner"`
-			Data  [2]string `json:"data"`
+			Lamports uint64    `json:"lamports"`
+			Owner    string    `json:"owner"`
+			Data     [2]string `json:"data"`
 		} `json:"value"`
 	}
 	if err := s.call(ctx, "getAccountInfo", []any{address, map[string]any{"encoding": "base64", "commitment": "confirmed"}}, &out); err != nil {
@@ -210,7 +220,7 @@ func (s *solanaRPC) getAccount(ctx context.Context, address string) (*chainAccou
 	if err != nil {
 		return nil, fmt.Errorf("invalid account data: %w", err)
 	}
-	return &chainAccount{Owner: out.Value.Owner, Data: data}, nil
+	return &chainAccount{Lamports: out.Value.Lamports, Owner: out.Value.Owner, Data: data}, nil
 }
 
 // handleSyncChain copies the on-chain outcome of a vault event into MongoDB for display.
@@ -255,4 +265,71 @@ func (a *App) handleSyncChain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.handleGetEvent(w, r)
+}
+
+func (a *App) mirrorLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	a.mirrorVaults()
+	for range ticker.C {
+		a.mirrorVaults()
+	}
+}
+
+// mirrorVaults copies open vault accounts into MongoDB so the event list does not wait
+// for someone to open the event.
+func (a *App) mirrorVaults() {
+	if a.fetchAccount == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	cursor, err := a.events.Find(ctx, bson.M{
+		"chain.address": bson.M{"$exists": true, "$ne": ""},
+		"chain.status":  bson.M{"$nin": []string{"resolved", "cancelled"}},
+	}, options.Find().SetLimit(20))
+	if err != nil {
+		log.Printf("vault mirror: %v", err)
+		return
+	}
+	defer cursor.Close(ctx)
+	for cursor.Next(ctx) {
+		var event Event
+		if err := cursor.Decode(&event); err != nil || event.Chain == nil {
+			continue
+		}
+		if err := a.mirrorOne(ctx, &event); err != nil {
+			log.Printf("vault mirror %s: %v", event.ID.Hex(), err)
+		}
+	}
+}
+
+func (a *App) mirrorOne(ctx context.Context, e *Event) error {
+	account, err := a.fetchAccount(ctx, e.Chain.Address)
+	if err != nil {
+		return err
+	}
+	if account == nil || account.Owner != a.cfg.ProgramID {
+		return nil
+	}
+	ev, err := decodeChainEvent(account, a.cfg.ProgramID)
+	if err != nil {
+		return err
+	}
+	set := bson.M{"chain.status": ev.Status}
+	filter := bson.M{"_id": e.ID, "chain.address": e.Chain.Address}
+	if ev.Status == "resolved" && e.ResultsSetAt == nil {
+		games := append([]Game(nil), e.Games...)
+		for i := range games {
+			if i < len(ev.Results) {
+				games[i].Result = string(ev.Results[i])
+				games[i].Cancelled = ev.Results[i] == 'C'
+			}
+		}
+		set["games"] = games
+		set["resultsSetAt"] = time.Now()
+		filter["resultsSetAt"] = bson.M{"$exists": false}
+	}
+	_, err = a.events.UpdateOne(ctx, filter, bson.M{"$set": set})
+	return err
 }

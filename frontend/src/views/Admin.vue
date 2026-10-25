@@ -9,6 +9,7 @@
       </v-card-title>
       <v-card-subtitle>
         Games can be set once while the event is a draft. Results can be set once, after the start time.
+        An event can be deleted while it is not on chain, has no coupons, and has no results.
       </v-card-subtitle>
 
       <v-data-table :headers="headers" :items="events" :loading="loading" item-value="id">
@@ -37,6 +38,10 @@
           <v-btn
             v-if="item.status === 'closed' && !item.chain" icon="mdi-flag-checkered" size="small" variant="text"
             color="warning" title="Set results" @click="openResults(item)"
+          />
+          <v-btn
+            v-if="canDelete(item)" icon="mdi-delete" size="small" variant="text"
+            color="error" title="Delete this event" @click="confirmDelete(item)"
           />
         </template>
       </v-data-table>
@@ -80,8 +85,8 @@
             <v-text-field v-model="newEvent.title" label="Title" :rules="[required, v => v.length <= 120 || 'Max 120 characters']" />
             <v-textarea v-model="newEvent.description" label="Description" rows="3" :rules="[v => v.length <= 1000 || 'Max 1000 characters']" />
             <v-text-field
-              v-model.number="newEvent.gameCount" label="Number of games" type="number" min="7" max="13"
-              :rules="[v => (v >= 7 && v <= 13) || 'Between 7 and 13 games']"
+              v-model.number="newEvent.gameCount" label="Number of games" type="number" min="7" max="13" step="1"
+              :rules="[v => (v >= 7 && v <= 13) || 'Between 7 and 13 games', integerRule]"
               :hint="isSpecial ? 'Special event: set the price and prize tiers below' : 'Standard event'" persistent-hint
               @update:model-value="resetTiers"
             />
@@ -99,10 +104,16 @@
               </div>
               <v-row v-for="(tier, index) in newEvent.tiers" :key="index" dense align="center">
                 <v-col cols="5">
-                  <v-text-field v-model.number="tier.correct" label="Correct picks" type="number" density="compact" hide-details :disabled="index === 0" />
+                  <v-text-field
+                    v-model.number="tier.correct" label="Correct picks" type="number" step="1" density="compact"
+                    hide-details="auto" :disabled="index === 0" :rules="[integerRule]"
+                  />
                 </v-col>
                 <v-col cols="5">
-                  <v-text-field v-model.number="tier.percent" label="Percent" type="number" suffix="%" density="compact" hide-details />
+                  <v-text-field
+                    v-model.number="tier.percent" label="Percent" type="number" step="1" suffix="%" density="compact"
+                    hide-details="auto" :rules="[integerRule]"
+                  />
                 </v-col>
                 <v-col cols="2">
                   <v-btn v-if="index > 0" icon="mdi-delete" size="small" variant="text" @click="newEvent.tiers.splice(index, 1)" />
@@ -141,11 +152,30 @@
             <p class="text-caption text-medium-emphasis mb-2">
               Kickoffs must be between the event start ({{ formatDate(selected?.startTime) }}) and end. Entries close at the event start.
             </p>
+            <p class="text-caption text-medium-emphasis mb-2">
+              Find fixture lists that day's matches whose names include the home team. A game without a fixture has no live score.
+            </p>
             <v-row v-for="(game, index) in newGames" :key="index" dense align="center">
               <v-col cols="1" class="text-medium-emphasis">{{ index + 1 }}.</v-col>
               <v-col cols="4"><v-text-field v-model="game.homeTeam" label="Home team" density="compact" :rules="[required]" /></v-col>
               <v-col cols="4"><v-text-field v-model="game.awayTeam" label="Away team" density="compact" :rules="[required]" /></v-col>
               <v-col cols="3"><v-text-field v-model="game.kickoff" label="Kickoff" type="datetime-local" density="compact" :rules="[required]" /></v-col>
+              <v-col cols="12" class="pt-0">
+                <div class="d-flex flex-wrap align-center ga-2">
+                  <v-btn type="button" size="small" variant="tonal" :loading="game.searching" @click="findFixture(index)">Find fixture</v-btn>
+                  <span v-if="game.fixtureId" class="text-caption">Fixture {{ game.fixtureId }}</span>
+                  <v-btn v-if="game.fixtureId" size="x-small" variant="text" @click="game.fixtureId = 0">Unlink</v-btn>
+                </div>
+                <p v-if="game.message" class="text-caption mt-2 mb-1" :class="game.hits.length ? 'text-medium-emphasis' : 'text-warning'">
+                  {{ game.message }}
+                </p>
+                <v-btn
+                  v-for="hit in game.hits" :key="hit.id" block size="small" variant="outlined" class="mt-1 justify-start"
+                  @click="useFixture(index, hit)"
+                >
+                  {{ hit.home }} vs {{ hit.away }} · {{ hit.league }} · {{ formatDate(hit.kickoff) }}
+                </v-btn>
+              </v-col>
             </v-row>
           </v-form>
         </v-card-text>
@@ -244,6 +274,22 @@
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <v-dialog v-model="deleteDialog" max-width="480">
+      <v-card title="Delete event">
+        <v-card-text>
+          Delete {{ selected?.title }}? This cannot be undone.
+          <span v-if="selected?.rolloverInLamports">
+            Rollover of {{ formatSol(selected.rolloverInLamports) }} goes back to the next treasury event.
+          </span>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn @click="deleteDialog = false">Cancel</v-btn>
+          <v-btn color="error" variant="flat" :loading="saving" @click="deleteEvent">Delete</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-container>
 </template>
 
@@ -269,6 +315,7 @@ const headers = [
   { title: '', key: 'actions', sortable: false, align: 'end' }
 ]
 const required = v => !!v?.trim?.() || 'Required'
+const integerRule = v => Number.isInteger(v) || 'Must be a whole number'
 
 const events = ref([])
 const loading = ref(false)
@@ -292,6 +339,7 @@ const tierError = computed(() => {
   const tiers = newEvent.value.tiers ?? []
   const counts = tiers.map(t => t.correct)
   if (tiers.some(t => !(t.correct >= 1 && t.correct <= newEvent.value.gameCount))) return 'Correct picks must be between 1 and the number of games'
+  if (tiers.some(t => !Number.isInteger(t.correct) || !Number.isInteger(t.percent))) return 'Correct picks and percentages must be whole numbers'
   if (new Set(counts).size !== counts.length) return 'Each number of correct picks can only appear once'
   if (tiers.some(t => !(t.percent >= 1))) return 'Every tier needs a positive percentage'
   const target = config.value?.tierPercentTotal ?? 95
@@ -311,6 +359,20 @@ const gamesValid = ref(false)
 const newGames = ref([])
 
 const resultsDialog = ref(false)
+const deleteDialog = ref(false)
+
+function canDelete (event) {
+  return !event.chain && !event.couponsSold && event.status !== 'completed'
+}
+
+function confirmDelete (event) {
+  selected.value = event
+  deleteDialog.value = true
+}
+
+function deleteEvent () {
+  return save(() => eventApi.remove(selected.value.id), 'Event deleted', () => { deleteDialog.value = false })
+}
 const results = ref([])
 const resultsComplete = computed(() =>
   selected.value && results.value.filter(Boolean).length === selected.value.games.length)
@@ -435,13 +497,15 @@ function createEvent () {
   const body = {
     title,
     description,
-    gameCount,
+    gameCount: Math.round(Number(gameCount)),
     startTime: new Date(startTime).toISOString(),
     endTime: new Date(endTime).toISOString()
   }
   if (isSpecial.value || customRules) {
     body.couponPriceLamports = Math.round(priceSol * 1e9)
-    body.tiers = tiers.map(t => ({ correct: Number(t.correct), percent: Number(t.percent) }))
+    // Tiers are int fields on the backend: round defensively in case a tier was left
+    // with a fractional percent/correct value (e.g. while rebalancing payouts).
+    body.tiers = tiers.map(t => ({ correct: Math.round(Number(t.correct)), percent: Math.round(Number(t.percent)) }))
   }
   return save(() => eventApi.create(body), 'Event created', () => { createDialog.value = false })
 }
@@ -449,12 +513,48 @@ function createEvent () {
 function openGames (event) {
   selected.value = event
   const kickoff = toLocalInput(event.startTime)
-  newGames.value = Array.from({ length: event.gameCount }, () => ({ homeTeam: '', awayTeam: '', kickoff }))
+  newGames.value = Array.from({ length: event.gameCount }, () => ({ homeTeam: '', awayTeam: '', kickoff, fixtureId: 0, hits: [], searching: false, message: '' }))
   gamesDialog.value = true
 }
 
+async function findFixture (index) {
+  const game = newGames.value[index]
+  const team = game.homeTeam.trim()
+  const date = String(game.kickoff || '').slice(0, 10)
+  if (team.length < 3 || date.length !== 10) {
+    notify('Enter the home team and a kickoff date first', 'warning')
+    return
+  }
+  game.searching = true
+  game.message = ''
+  game.hits = []
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    const found = await eventApi.searchFixtures(team, date, game.awayTeam.trim(), zone)
+    game.hits = found.fixtures ?? []
+    game.message = found.message || (game.hits.length ? '' : 'No fixture on that date')
+  } catch (error) {
+    game.message = error?.message || 'The score feed could not be read'
+    notifyError(error)
+  } finally {
+    game.searching = false
+  }
+}
+
+function useFixture (index, hit) {
+  const game = newGames.value[index]
+  game.homeTeam = hit.home
+  game.awayTeam = hit.away
+  game.kickoff = toLocalInput(hit.kickoff)
+  game.fixtureId = hit.id
+  game.hits = []
+  game.message = `${hit.home} vs ${hit.away} linked`
+}
+
 const saveGames = () => save(
-  () => eventApi.setGames(selected.value.id, newGames.value.map(g => ({ ...g, kickoff: new Date(g.kickoff).toISOString() }))),
+  () => eventApi.setGames(selected.value.id, newGames.value.map(g => ({
+    homeTeam: g.homeTeam, awayTeam: g.awayTeam, kickoff: new Date(g.kickoff).toISOString(), fixtureId: g.fixtureId || 0
+  }))),
   'Games saved, the event is now open for entries',
   () => { gamesDialog.value = false }
 )

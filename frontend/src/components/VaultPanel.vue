@@ -4,6 +4,9 @@
       <v-icon class="mr-1">mdi-safe</v-icon>
       On-chain vault
       <v-chip v-if="chain" size="small" variant="flat" :color="statusColor">{{ chain.status }}</v-chip>
+      <v-chip v-if="chain?.status === 'open' && chain.proposalKind !== 'none'" size="small" variant="tonal" color="warning">
+        {{ chain.proposalKind }} pending · {{ approvedBy.length }} of {{ signers?.threshold }}
+      </v-chip>
       <v-chip v-if="paused" size="small" variant="flat" color="warning">entries paused</v-chip>
       <v-spacer />
       <v-btn icon="mdi-refresh" size="small" variant="text" :loading="loading" title="Reload from chain" @click="load" />
@@ -42,8 +45,11 @@
         House {{ sol(chain.house) }}{{ chain.houseWithdrawn ? ' (withdrawn)' : '' }} · to winners {{ sol(chain.paid) }} ·
         rollover out {{ sol(chain.rolloverOut) }}{{ chain.rolloverForwarded ? ' (passed on)' : '' }}
       </p>
+      <p v-if="settled" class="text-body-2 mt-2 mb-0">
+        <router-link to="/coupons">My Coupons</router-link> shows each coupon you played, the games it hit, and what it won.
+      </p>
       <p v-if="chain.status === 'cancelled'">
-        Every coupon can be refunded at its entry price. Rollover to pass on: {{ sol(chain.rolloverOut) }}{{ chain.rolloverForwarded ? ' (passed on)' : '' }}
+        Refund each coupon from <router-link to="/coupons">My Coupons</router-link>. Rollover to pass on: {{ sol(chain.rolloverOut) }}{{ chain.rolloverForwarded ? ' (passed on)' : '' }}
       </p>
       <p v-if="chain.status === 'tallying'">
         Results {{ chain.results }} are locked. {{ chain.tallied }} of {{ chain.couponCount }} coupons counted.
@@ -52,7 +58,12 @@
       <template v-if="chain.status === 'open' && chain.proposalKind !== 'none'">
         <div class="text-subtitle-2 mt-2">Pending {{ chain.proposalKind === 'cancel' ? 'cancellation' : `results ${chain.proposalResults}` }}</div>
         <div class="text-caption">
-          Approved by {{ approvedBy.map(shortAddress).join(', ') || 'nobody' }} · {{ signers?.threshold }} of {{ signers?.members.length }} needed
+          Approved by {{ approvedBy.map(shortAddress).join(', ') || 'nobody' }} · {{ signers?.threshold }} of {{ signers?.members.length }} needed.
+          Nothing changes until every needed signer has approved.
+        </div>
+        <div v-if="isSigner && cosignerMissing" class="text-caption text-medium-emphasis mt-1">
+          The other signer is the result cosigner {{ shortAddress(RESULT_COSIGNER) }}, which signs outside the browser:
+          <code>node scripts/cosign-event.mjs {{ address }} {{ chain.proposalKind === 'cancel' ? 'cancel' : `resolve ${chain.proposalResults}` }}</code>
         </div>
       </template>
     </v-card-text>
@@ -101,12 +112,13 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { eventApi } from '@/services/api'
+import { scoreNextSlip } from '@/services/entry'
 import {
-  TALLY_BATCH, approveCancelIx, approveResolutionIx, computeBudgetIx, eventCoupons, eventPda, expireEventIx, fetchEvent,
-  fetchGatePaused, fetchSchedule, fetchSigners, forwardRolloverIx, parkRolloverIx, sendProgramTransaction, setPauseIx,
-  tallyIx, withdrawHouseIx
+  RESULT_COSIGNER, TALLY_BATCH, approveCancelIx, approveResolutionIx, computeBudgetIx, eventCoupons, eventPda,
+  expireEventIx, fetchEvent, fetchGatePaused, fetchSchedule, fetchSigners, forwardRolloverIx, parkRolloverIx,
+  sendProgramTransaction, setPauseIx, slipsPda, tallyIx, withdrawHouseIx
 } from '@/services/program'
-import { waitForConfirmation } from '@/services/solana'
+import { getAccount, waitForConfirmation } from '@/services/solana'
 import { auth, loadConfig } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { explorerAddress, formatDate, formatSol, shortAddress } from '@/utils/format'
@@ -140,6 +152,7 @@ const resultsOpen = computed(() => now.value >= resultsFrom.value && now.value <
 const draftComplete = computed(() => draft.value.length === chain.value?.gameCount && draft.value.every(Boolean))
 const canExpire = computed(() => chain.value.status === 'open' && now.value >= chain.value.resolveTimeout)
 const canPassRollover = computed(() => ['resolved', 'cancelled'].includes(chain.value.status) && chain.value.rolloverOut > 0n && !chain.value.rolloverForwarded)
+const cosignerMissing = computed(() => signers.value?.members.includes(RESULT_COSIGNER) && !approvedBy.value.includes(RESULT_COSIGNER))
 const canWithdrawHouse = computed(() => settled.value && chain.value.house > 0n && !chain.value.houseWithdrawn)
 
 const tierRows = computed(() => chain.value.tiers.map(tier => {
@@ -225,8 +238,19 @@ const approveCancel = () => run('cancel', async () => {
 
 // Tallying is permissionless and resumable: each batch continues from the on-chain counter.
 const tally = () => run('tally', async () => {
-  const coupons = await eventCoupons(rpcUrl(), address.value)
+  const book = await getAccount(rpcUrl(), slipsPda(address.value))
   let state = await fetchEvent(rpcUrl(), address.value)
+  if (book) {
+    do {
+      progress.value = `Counting coupon ${state.tallied + 1} of ${state.couponCount}...`
+      await scoreNextSlip({ config: auth.config, wallet: auth.wallet, admin: admin.value, event: address.value })
+      const before = state.tallied
+      state = await fetchEvent(rpcUrl(), address.value)
+      if (state.status === 'tallying' && state.tallied <= before) throw new Error('The count did not advance; reload and try again')
+    } while (state.status === 'tallying')
+    return
+  }
+  const coupons = await eventCoupons(rpcUrl(), address.value)
   if (coupons.length < state.couponCount) throw new Error(`The RPC returned ${coupons.length} of ${state.couponCount} coupons; try again`)
   do {
     const batch = coupons.slice(state.tallied, state.tallied + TALLY_BATCH).map(coupon => coupon.address)
@@ -250,7 +274,7 @@ const withdrawHouse = () => run('house', () => send([withdrawHouseIx({ admin: au
 
 const togglePause = () => run('pause', () => send([setPauseIx({ admin: auth.wallet, paused: !paused.value })]), paused.value ? 'Entries resumed' : 'Entries paused')
 
-watch(() => props.event.id, load)
+watch(() => [props.event.id, auth.wallet], load)
 onMounted(load)
 </script>
 

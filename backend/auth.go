@@ -40,19 +40,25 @@ type pendingNonce struct {
 type nonceStore struct {
 	mu      sync.Mutex
 	pending map[string]pendingNonce
+	coll    *mongo.Collection
 }
 
-func newNonceStore() *nonceStore {
-	return &nonceStore{pending: map[string]pendingNonce{}}
+func newNonceStore(coll *mongo.Collection) *nonceStore {
+	return &nonceStore{pending: map[string]pendingNonce{}, coll: coll}
 }
 
-func (s *nonceStore) issue(wallet string, now time.Time) (nonce, message string, err error) {
+func (s *nonceStore) issue(ctx context.Context, wallet string, now time.Time) (nonce, message string, err error) {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
 		return "", "", err
 	}
 	nonce = hex.EncodeToString(buf)
 	message = loginMessage(wallet, nonce, now)
+	expires := now.Add(nonceTTL)
+	if s.coll != nil {
+		_, err = s.coll.InsertOne(ctx, bson.M{"_id": nonce, "wallet": wallet, "message": message, "expiresAt": expires})
+		return nonce, message, err
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -64,12 +70,24 @@ func (s *nonceStore) issue(wallet string, now time.Time) (nonce, message string,
 	if len(s.pending) >= maxNonces {
 		return "", "", fmt.Errorf("too many pending sign-in requests")
 	}
-	s.pending[nonce] = pendingNonce{wallet: wallet, message: message, expires: now.Add(nonceTTL)}
+	s.pending[nonce] = pendingNonce{wallet: wallet, message: message, expires: expires}
 	return nonce, message, nil
 }
 
 // consume removes the nonce whether or not it is valid, so each one can be tried once.
-func (s *nonceStore) consume(nonce, wallet string, now time.Time) (string, bool) {
+func (s *nonceStore) consume(ctx context.Context, nonce, wallet string, now time.Time) (string, bool) {
+	if s.coll != nil {
+		var doc struct {
+			Message string `bson:"message"`
+		}
+		err := s.coll.FindOneAndDelete(ctx, bson.M{
+			"_id": nonce, "wallet": wallet, "expiresAt": bson.M{"$gt": now},
+		}).Decode(&doc)
+		if err != nil {
+			return "", false
+		}
+		return doc.Message, true
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p, ok := s.pending[nonce]
@@ -133,20 +151,80 @@ func (a *App) parseToken(token string, now time.Time) (string, bool) {
 	return wallet, true
 }
 
+const sessionCookie = "sol_session"
+
 func (a *App) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		header := r.Header.Get("Authorization")
-		if !strings.HasPrefix(header, bearerPrefix) {
-			writeError(w, http.StatusUnauthorized, "authentication required")
-			return
-		}
-		wallet, ok := a.parseToken(strings.TrimPrefix(header, bearerPrefix), time.Now())
+		wallet, ok := a.authenticatedWallet(r)
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "session expired or invalid")
 			return
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), walletContext, wallet)))
 	}
+}
+
+func (a *App) authenticatedWallet(r *http.Request) (string, bool) {
+	now := time.Now()
+	if a.sessions != nil {
+		if cookie, err := r.Cookie(sessionCookie); err == nil && cookie.Value != "" {
+			if wallet, ok := a.loadSession(r.Context(), cookie.Value, now); ok {
+				return wallet, true
+			}
+		}
+		header := r.Header.Get("Authorization")
+		if strings.HasPrefix(header, bearerPrefix) {
+			return a.loadSession(r.Context(), strings.TrimPrefix(header, bearerPrefix), now)
+		}
+		return "", false
+	}
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, bearerPrefix) {
+		return "", false
+	}
+	return a.parseToken(strings.TrimPrefix(header, bearerPrefix), now)
+}
+
+func (a *App) loadSession(ctx context.Context, id string, now time.Time) (string, bool) {
+	var doc struct {
+		Wallet    string    `bson:"wallet"`
+		ExpiresAt time.Time `bson:"expiresAt"`
+	}
+	err := a.sessions.FindOne(ctx, bson.M{"_id": id}).Decode(&doc)
+	if err != nil || !now.Before(doc.ExpiresAt) {
+		if err == nil {
+			_, _ = a.sessions.DeleteOne(ctx, bson.M{"_id": id})
+		}
+		return "", false
+	}
+	return doc.Wallet, true
+}
+
+func (a *App) issueSession(w http.ResponseWriter, ctx context.Context, wallet string, now time.Time) (time.Time, string, error) {
+	expires := now.Add(sessionTTL)
+	if a.sessions == nil {
+		return expires, a.signToken(wallet, expires), nil
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return time.Time{}, "", err
+	}
+	id := hex.EncodeToString(buf)
+	if _, err := a.sessions.InsertOne(ctx, bson.M{"_id": id, "wallet": wallet, "expiresAt": expires}); err != nil {
+		return time.Time{}, "", err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: id, Path: "/", HttpOnly: true,
+		SameSite: http.SameSiteLaxMode, Expires: expires,
+	})
+	return expires, "", nil
+}
+
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: "", Path: "/", HttpOnly: true,
+		SameSite: http.SameSiteLaxMode, MaxAge: -1,
+	})
 }
 
 func (a *App) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
@@ -175,7 +253,7 @@ func (a *App) handleNonce(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid wallet address")
 		return
 	}
-	nonce, message, err := a.nonces.issue(req.PublicKey, time.Now())
+	nonce, message, err := a.nonces.issue(r.Context(), req.PublicKey, time.Now())
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -198,7 +276,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	message, ok := a.nonces.consume(req.Nonce, req.PublicKey, now)
+	message, ok := a.nonces.consume(r.Context(), req.Nonce, req.PublicKey, now)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "sign-in request expired, please try again")
 		return
@@ -228,12 +306,28 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to save user")
 		return
 	}
-	expires := now.Add(sessionTTL)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"token":     a.signToken(req.PublicKey, expires),
-		"expiresAt": expires,
-		"user":      a.publicUser(user),
-	})
+	expires, token, err := a.issueSession(w, ctx, req.PublicKey, now)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start the session")
+		return
+	}
+	body := map[string]any{"expiresAt": expires, "user": a.publicUser(user)}
+	if token != "" {
+		body["token"] = token
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if a.sessions != nil {
+		if cookie, err := r.Cookie(sessionCookie); err == nil && cookie.Value != "" {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			_, _ = a.sessions.DeleteOne(ctx, bson.M{"_id": cookie.Value})
+			cancel()
+		}
+	}
+	clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *App) handleMe(w http.ResponseWriter, r *http.Request) {

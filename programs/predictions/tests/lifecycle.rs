@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
-use predictions::{CreateEventArgs, Escrow, Event, EventStatus, TierArg, UpgradeCouncil};
+use predictions::{CreateEventArgs, Escrow, Event, EventStatus, RevealArg, SlipArg, SlipBook, TierArg, UpgradeCouncil};
 use solana_program_error::ProgramResult;
 use solana_program_test::{processor, ProgramTest, ProgramTestContext};
 use solana_sdk::{
@@ -163,10 +163,19 @@ fn reveal_picks_ix(player: Pubkey, admin: Pubkey, nonce: u64, index: u32, picks:
     }
 }
 
-fn claim_ix(coupon: Pubkey, event: Pubkey, owner: Pubkey) -> Instruction {
+fn claim_accounts(coupon: Pubkey, event: Pubkey, owner: Pubkey) -> predictions::accounts::Claim {
+    predictions::accounts::Claim {
+        coupon,
+        event,
+        vault: pda(&[b"vault", event.as_ref()]),
+        owner,
+    }
+}
+
+fn claim_ix(coupon: Pubkey, event: Pubkey, owner: Pubkey, _admin: Pubkey) -> Instruction {
     Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::Claim { coupon, event, vault: pda(&[b"vault", event.as_ref()]), owner }.to_account_metas(None),
+        accounts: claim_accounts(coupon, event, owner).to_account_metas(None),
         data: predictions::instruction::Claim {}.data(),
     }
 }
@@ -306,14 +315,14 @@ async fn winner_is_paid_once_from_the_vault() {
     fund(&mut context, &stranger.pubkey(), 1_000_000).await;
     let redirected = Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::Claim { coupon, event, vault, owner: stranger.pubkey() }.to_account_metas(None),
+        accounts: claim_accounts(coupon, event, stranger.pubkey()).to_account_metas(None),
         data: predictions::instruction::Claim {}.data(),
     };
     assert!(send(&mut context, &stranger, redirected).await.is_err(), "a claim cannot be redirected");
     let before = context.banks_client.get_balance(player.pubkey()).await.unwrap();
     let claim = Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::Claim { coupon, event, vault, owner: player.pubkey() }.to_account_metas(None),
+        accounts: claim_accounts(coupon, event, player.pubkey()).to_account_metas(None),
         data: predictions::instruction::Claim {}.data(),
     };
     send(&mut context, &player, claim.clone()).await.unwrap();
@@ -484,7 +493,7 @@ async fn forwarding_rollover_leaves_unclaimed_winnings() {
     let before = context.banks_client.get_balance(player.pubkey()).await.unwrap();
     let claim = Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::Claim { coupon, event, vault, owner: player.pubkey() }.to_account_metas(None),
+        accounts: claim_accounts(coupon, event, player.pubkey()).to_account_metas(None),
         data: predictions::instruction::Claim {}.data(),
     };
     send(&mut context, &player, claim).await.unwrap();
@@ -541,7 +550,7 @@ async fn one_signer_cannot_resolve_and_pause_spares_claims() {
     send(&mut context, &admin, pause).await.unwrap();
     let claim = Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::Claim { coupon, event, vault, owner: player.pubkey() }.to_account_metas(None),
+        accounts: claim_accounts(coupon, event, player.pubkey()).to_account_metas(None),
         data: predictions::instruction::Claim {}.data(),
     };
     send(&mut context, &player, claim).await.unwrap();
@@ -696,9 +705,9 @@ async fn batched_tally_settles_a_full_thirteen_game_event() {
     assert!(send(&mut context, &stranger, expire).await.is_err(), "a resolved event cannot expire");
 
     let before = context.banks_client.get_balance(player.pubkey()).await.unwrap();
-    send(&mut context, &player, claim_ix(coupons[0], event, player.pubkey())).await.unwrap();
+    send(&mut context, &player, claim_ix(coupons[0], event, player.pubkey(), admin.pubkey())).await.unwrap();
     assert!(context.banks_client.get_balance(player.pubkey()).await.unwrap() > before + sales / 2 - 10_000_000);
-    send(&mut context, &player, claim_ix(coupons[1], event, player.pubkey())).await.unwrap();
+    send(&mut context, &player, claim_ix(coupons[1], event, player.pubkey(), admin.pubkey())).await.unwrap();
     assert!(context.banks_client.get_account(coupons[1]).await.unwrap().is_none(), "an unrevealed coupon closes with no payout");
 
     assert!(send(&mut context, &stranger, withdraw_house_ix(stranger.pubkey(), event)).await.is_err(), "only the event admin takes the house share");
@@ -821,4 +830,364 @@ async fn upgrade_is_public_and_delayed() {
         let late = format!("{:?}", send(&mut context, &admin, execute).await.unwrap_err());
         assert!(!late.contains("6029"), "after one day the timelock opens and the loader is reached: {late}");
     }
+}
+
+#[tokio::test]
+async fn anyone_can_publish_a_reveal_after_entries_close() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    let keeper = Keypair::new();
+    fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    fund(&mut context, &keeper.pubkey(), 2_000_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let (create, _event, _vault) = create_ix(admin.pubkey(), other.pubkey(), 78, now + 10);
+    send(&mut context, &admin, create).await.unwrap();
+    let (place, coupon) = place_ix(player.pubkey(), admin.pubkey(), 78, 0);
+    send(&mut context, &player, place).await.unwrap();
+
+    let reveal = reveal_ix(player.pubkey(), admin.pubkey(), 78, 0);
+    assert!(
+        send(&mut context, &keeper, reveal.clone()).await.is_err(),
+        "a reveal before the deadline must fail"
+    );
+
+    set_clock(&mut context, now + 10);
+    let mut wrong = all_home();
+    wrong[0] = 0b010;
+    assert!(
+        send(&mut context, &keeper, reveal_picks_ix(player.pubkey(), admin.pubkey(), 78, 0, wrong)).await.is_err(),
+        "picks that miss the commitment must fail"
+    );
+    send(&mut context, &keeper, reveal).await.unwrap();
+    let account = context.banks_client.get_account(coupon).await.unwrap().unwrap();
+    let stored = predictions::Coupon::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert!(stored.revealed, "a keeper who knows the committed picks can reveal them");
+}
+
+fn slips_of(event: &Pubkey) -> Pubkey {
+    pda(&[b"slips", event.as_ref()])
+}
+
+fn empty_proof() -> Vec<[u8; 32]> {
+    (0..20).map(predictions::slip_zero).collect()
+}
+
+fn place_slip_ix(player: Pubkey, admin: Pubkey, nonce: u64, slip: SlipArg, proof: Vec<[u8; 32]>) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::PlaceSlip {
+            player,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            slips: slips_of(&event),
+            gate: gate_of(&admin),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::PlaceSlip { slip, proof }.data(),
+    }
+}
+
+fn reveal_slip_ix(caller: Pubkey, admin: Pubkey, nonce: u64, reveal: RevealArg, proof: Vec<[u8; 32]>) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::RevealSlip {
+            caller,
+            event,
+            slips: slips_of(&event),
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::RevealSlip { reveal, proof }.data(),
+    }
+}
+
+fn score_slip_ix(
+    caller: Pubkey,
+    admin: Pubkey,
+    nonce: u64,
+    reveal: RevealArg,
+    revealed: bool,
+    entry_proof: Vec<[u8; 32]>,
+    reveal_proof: Vec<[u8; 32]>,
+    scored_proof: Vec<[u8; 32]>,
+) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::ScoreSlip {
+            caller,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            slips: slips_of(&event),
+            schedule: schedule_of(&admin),
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::ScoreSlip { reveal, revealed, entry_proof, reveal_proof, scored_proof }.data(),
+    }
+}
+
+fn claim_slip_ix(
+    owner: Pubkey,
+    admin: Pubkey,
+    nonce: u64,
+    reveal: RevealArg,
+    entry_proof: Vec<[u8; 32]>,
+    reveal_proof: Vec<[u8; 32]>,
+    claimed_proof: Vec<[u8; 32]>,
+) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::ClaimSlip {
+            owner,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            slips: slips_of(&event),
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::ClaimSlip { reveal, entry_proof, reveal_proof, claimed_proof }.data(),
+    }
+}
+
+fn refund_slip_ix(
+    owner: Pubkey,
+    admin: Pubkey,
+    nonce: u64,
+    index: u32,
+    combinations: u32,
+    commitment: [u8; 32],
+    entry_proof: Vec<[u8; 32]>,
+    refund_proof: Vec<[u8; 32]>,
+) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::RefundSlip {
+            owner,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            slips: slips_of(&event),
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::RefundSlip { index, combinations, commitment, entry_proof, refund_proof }.data(),
+    }
+}
+
+#[tokio::test]
+async fn one_slip_pays_no_coupon_account() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    let keeper = Keypair::new();
+    fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    fund(&mut context, &keeper.pubkey(), 10_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), 90, now + 30);
+    send(&mut context, &admin, create).await.unwrap();
+
+    let picks = all_home();
+    let commitment = predictions::coupon_commitment(&player.pubkey(), &picks, REVEAL_NONCE);
+    let slip = SlipArg { commitment, combinations: 1 };
+    let leaf = predictions::slip_leaf(0, &player.pubkey(), 1, &commitment);
+    send(&mut context, &player, place_slip_ix(player.pubkey(), admin.pubkey(), 90, slip.clone(), empty_proof())).await.unwrap();
+    let stored = load_event(&mut context, event).await;
+    assert_eq!(stored.coupon_count, 1);
+    assert_eq!(stored.sales, 1_000_000);
+    let vault_account = context.banks_client.get_account(vault).await.unwrap().unwrap();
+    assert_eq!(vault_account.lamports, stored.rent_reserve + 1_000_000);
+    assert!(context.banks_client.get_account(pda(&[b"coupon", event.as_ref(), &0u32.to_le_bytes()])).await.unwrap().is_none());
+
+    let book_account = context.banks_client.get_account(slips_of(&event)).await.unwrap().unwrap();
+    let book = SlipBook::try_deserialize(&mut book_account.data.as_slice()).unwrap();
+    assert_eq!(book.count, 1);
+    assert_eq!(book.entry_hash, predictions::slip_fold(0, &leaf, &empty_proof()));
+
+    let mut second_proof = empty_proof();
+    second_proof[0] = leaf;
+    send(&mut context, &player, place_slip_ix(player.pubkey(), admin.pubkey(), 90, slip, second_proof.clone())).await.unwrap();
+    let again = load_event(&mut context, event).await;
+    assert_eq!(again.coupon_count, 2, "a second coupon is its own transaction and the next index");
+    let replay = empty_proof();
+    assert!(
+        send(&mut context, &player, place_slip_ix(player.pubkey(), admin.pubkey(), 90, SlipArg { commitment, combinations: 1 }, replay)).await.is_err(),
+        "an earlier index cannot be placed again"
+    );
+
+    let early = reveal_slip_ix(keeper.pubkey(), admin.pubkey(), 90, RevealArg {
+        index: 0,
+        owner: player.pubkey(),
+        combinations: 1,
+        picks,
+        nonce: REVEAL_NONCE,
+        commitment,
+    }, empty_proof());
+    assert!(send(&mut context, &keeper, early.clone()).await.is_err(), "a reveal before the deadline must fail");
+
+    set_clock(&mut context, now + 30);
+    assert!(
+        send(&mut context, &player, place_slip_ix(player.pubkey(), admin.pubkey(), 90, SlipArg { commitment, combinations: 1 }, second_proof)).await.is_err(),
+        "a slip after the deadline must fail"
+    );
+    let mut wrong = picks;
+    wrong[0] = 0b010;
+    assert!(send(&mut context, &keeper, reveal_slip_ix(keeper.pubkey(), admin.pubkey(), 90, RevealArg {
+        index: 0,
+        owner: player.pubkey(),
+        combinations: 1,
+        picks: wrong,
+        nonce: REVEAL_NONCE,
+        commitment,
+    }, empty_proof())).await.is_err());
+    send(&mut context, &keeper, early).await.unwrap();
+    let revealed = context.banks_client.get_account(slips_of(&event)).await.unwrap().unwrap();
+    let revealed = SlipBook::try_deserialize(&mut revealed.data.as_slice()).unwrap();
+    assert_eq!(revealed.reveal_count, 1);
+    assert_ne!(revealed.reveal_hash, [0u8; 32]);
+}
+
+#[tokio::test]
+async fn a_slip_claim_pays_the_owner_once() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    let stranger = Keypair::new();
+    fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    fund(&mut context, &stranger.pubkey(), 10_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), 91, now + 30);
+    send(&mut context, &admin, create).await.unwrap();
+
+    let picks = all_home();
+    let commitment = predictions::coupon_commitment(&player.pubkey(), &picks, REVEAL_NONCE);
+    let reveal = RevealArg { index: 0, owner: player.pubkey(), combinations: 1, picks, nonce: REVEAL_NONCE, commitment };
+    let slip = SlipArg { commitment, combinations: 1 };
+    let proof = empty_proof();
+    send(&mut context, &player, place_slip_ix(player.pubkey(), admin.pubkey(), 91, slip, proof.clone())).await.unwrap();
+    set_clock(&mut context, now + 31);
+    send(&mut context, &stranger, reveal_slip_ix(stranger.pubkey(), admin.pubkey(), 91, reveal.clone(), proof.clone())).await.unwrap();
+    assert!(
+        send(&mut context, &stranger, reveal_slip_ix(stranger.pubkey(), admin.pubkey(), 91, reveal.clone(), proof.clone())).await.is_err(),
+        "a reveal cannot be repeated"
+    );
+
+    set_clock(&mut context, now + 50);
+    send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    fund(&mut context, &other.pubkey(), 10_000_000).await;
+    send(&mut context, &other, approve_ix(other.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    send(&mut context, &stranger, score_slip_ix(stranger.pubkey(), admin.pubkey(), 91, reveal.clone(), true, proof.clone(), proof.clone(), proof.clone())).await.unwrap();
+    let settled = load_event(&mut context, event).await;
+    assert_eq!(settled.status, EventStatus::Resolved);
+    assert_eq!(settled.per_winner[6], 950_000);
+    assert_eq!(settled.house, 50_000);
+
+    let redirected = claim_slip_ix(stranger.pubkey(), admin.pubkey(), 91, reveal.clone(), proof.clone(), proof.clone(), proof.clone());
+    assert!(send(&mut context, &stranger, redirected).await.is_err(), "a claim cannot be redirected");
+    let before = context.banks_client.get_balance(player.pubkey()).await.unwrap();
+    send(&mut context, &player, claim_slip_ix(player.pubkey(), admin.pubkey(), 91, reveal.clone(), proof.clone(), proof.clone(), proof.clone())).await.unwrap();
+    let after = context.banks_client.get_balance(player.pubkey()).await.unwrap();
+    assert!(after > before, "the vault must pay the slip winner");
+    let vault_account = context.banks_client.get_account(vault).await.unwrap().unwrap();
+    assert_eq!(vault_account.lamports, settled.rent_reserve + settled.house);
+    assert!(
+        send(&mut context, &player, claim_slip_ix(player.pubkey(), admin.pubkey(), 91, reveal, proof.clone(), proof.clone(), proof)).await.is_err(),
+        "a slip claim cannot be repeated"
+    );
+}
+
+#[tokio::test]
+async fn an_unrevealed_slip_cannot_win() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), 92, now + 30);
+    send(&mut context, &admin, create).await.unwrap();
+
+    let picks = all_home();
+    let hidden_picks = [0b100u8; 13];
+    let commitment = predictions::coupon_commitment(&player.pubkey(), &picks, REVEAL_NONCE);
+    let hidden_commitment = predictions::coupon_commitment(&player.pubkey(), &hidden_picks, REVEAL_NONCE);
+    let proof = empty_proof();
+    send(&mut context, &player, place_slip_ix(player.pubkey(), admin.pubkey(), 92, SlipArg { commitment, combinations: 1 }, proof.clone())).await.unwrap();
+    let leaf = predictions::slip_leaf(0, &player.pubkey(), 1, &commitment);
+    let mut second = proof.clone();
+    second[0] = leaf;
+    send(&mut context, &player, place_slip_ix(player.pubkey(), admin.pubkey(), 92, SlipArg { commitment: hidden_commitment, combinations: 1 }, second)).await.unwrap();
+
+    set_clock(&mut context, now + 31);
+    let reveal = RevealArg { index: 0, owner: player.pubkey(), combinations: 1, picks, nonce: REVEAL_NONCE, commitment };
+    send(&mut context, &player, reveal_slip_ix(player.pubkey(), admin.pubkey(), 92, reveal.clone(), proof.clone())).await.unwrap();
+
+    set_clock(&mut context, now + 50);
+    send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    fund(&mut context, &other.pubkey(), 10_000_000).await;
+    send(&mut context, &other, approve_ix(other.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    let leaf1 = predictions::slip_leaf(1, &player.pubkey(), 1, &hidden_commitment);
+    let mut first_entry = proof.clone();
+    first_entry[0] = leaf1;
+    send(&mut context, &player, score_slip_ix(player.pubkey(), admin.pubkey(), 92, reveal.clone(), true, first_entry.clone(), proof.clone(), proof.clone())).await.unwrap();
+
+    let mut entry_proof = proof.clone();
+    entry_proof[0] = leaf;
+    let mut reveal_proof = proof.clone();
+    reveal_proof[0] = predictions::slip_reveal_leaf(0, &player.pubkey(), 1, &commitment, &picks);
+    let mut scored_proof = proof.clone();
+    scored_proof[0] = predictions::slip_mark();
+    let hidden = RevealArg { index: 1, owner: player.pubkey(), combinations: 1, picks: hidden_picks, nonce: REVEAL_NONCE, commitment: hidden_commitment };
+    send(&mut context, &player, score_slip_ix(player.pubkey(), admin.pubkey(), 92, hidden.clone(), false, entry_proof, reveal_proof, scored_proof)).await.unwrap();
+
+    let settled = load_event(&mut context, event).await;
+    assert_eq!(settled.status, EventStatus::Resolved);
+    assert_eq!(settled.per_winner[6], 1_900_000, "the hidden stake stays in the pool");
+    assert_eq!(settled.house, 100_000);
+    assert!(
+        send(&mut context, &player, claim_slip_ix(player.pubkey(), admin.pubkey(), 92, hidden, proof.clone(), proof.clone(), proof.clone())).await.is_err(),
+        "an unrevealed slip cannot be claimed"
+    );
+    send(&mut context, &player, claim_slip_ix(player.pubkey(), admin.pubkey(), 92, reveal, first_entry, proof.clone(), proof)).await.unwrap();
+    let vault_account = context.banks_client.get_account(vault).await.unwrap().unwrap();
+    assert_eq!(vault_account.lamports, settled.rent_reserve + settled.house);
+}
+
+#[tokio::test]
+async fn a_cancelled_slip_refunds_its_owner_once() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    let stranger = Keypair::new();
+    fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    fund(&mut context, &stranger.pubkey(), 10_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), 93, now + 3_600);
+    send(&mut context, &admin, create).await.unwrap();
+    let reserve = load_event(&mut context, event).await.rent_reserve;
+    let picks = all_home();
+    let commitment = predictions::coupon_commitment(&player.pubkey(), &picks, REVEAL_NONCE);
+    let proof = empty_proof();
+    send(&mut context, &player, place_slip_ix(player.pubkey(), admin.pubkey(), 93, SlipArg { commitment, combinations: 1 }, proof.clone())).await.unwrap();
+
+    let early = refund_slip_ix(player.pubkey(), admin.pubkey(), 93, 0, 1, commitment, proof.clone(), proof.clone());
+    assert!(send(&mut context, &player, early).await.is_err(), "an open event does not refund");
+    cancel(&mut context, &admin, &other, event).await;
+
+    let redirected = refund_slip_ix(stranger.pubkey(), admin.pubkey(), 93, 0, 1, commitment, proof.clone(), proof.clone());
+    assert!(send(&mut context, &stranger, redirected).await.is_err(), "a refund cannot be redirected");
+    let before = context.banks_client.get_balance(player.pubkey()).await.unwrap();
+    send(&mut context, &player, refund_slip_ix(player.pubkey(), admin.pubkey(), 93, 0, 1, commitment, proof.clone(), proof.clone())).await.unwrap();
+    let after = context.banks_client.get_balance(player.pubkey()).await.unwrap();
+    assert!(after > before, "the vault must return the stake");
+    assert_eq!(context.banks_client.get_balance(vault).await.unwrap(), reserve);
+    assert!(
+        send(&mut context, &player, refund_slip_ix(player.pubkey(), admin.pubkey(), 93, 0, 1, commitment, proof.clone(), proof)).await.is_err(),
+        "a slip refund cannot be repeated"
+    );
 }

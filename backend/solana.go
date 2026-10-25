@@ -76,7 +76,7 @@ func (s *solanaRPC) callOnce(ctx context.Context, method string, params []any, r
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("solana RPC unreachable: %w", err)
+		return fmt.Errorf("solana RPC unreachable: %s", strings.ReplaceAll(err.Error(), s.url, redactRPC(s.url)))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -228,8 +228,12 @@ func (s *solanaRPC) verifyRecoveryPayment(ctx context.Context, signature, payer,
 	return s.verifyPaymentWithAge(ctx, signature, payer, treasury, lamports, memo, 0)
 }
 
-func (s *solanaRPC) verifyRefund(ctx context.Context, signature, treasury, recipient string, lamports uint64) error {
-	return s.verifyPaymentWithAge(ctx, signature, treasury, recipient, lamports, "", 0)
+func refundMemo(paymentSignature string) string {
+	return "sol-refund-v1:" + paymentSignature
+}
+
+func (s *solanaRPC) verifyRefund(ctx context.Context, refundSignature, paymentSignature, treasury, recipient string, lamports uint64) error {
+	return s.verifyPaymentWithAge(ctx, refundSignature, treasury, recipient, lamports, refundMemo(paymentSignature), 0)
 }
 
 func (s *solanaRPC) verifyPaymentWithAge(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string, maxAge time.Duration) error {

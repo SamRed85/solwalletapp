@@ -184,12 +184,16 @@ export async function getProgramAccounts (rpcUrl, programId, filters) {
   return (result ?? []).map(({ pubkey, account }) => ({ pubkey, data: fromBase64(account.data[0]) }))
 }
 
-export async function signAndSendMessage (message) {
+export async function signAndSendTransaction (serialized) {
   const { signature } = await requireProvider().request({
     method: 'signAndSendTransaction',
-    params: { message: base58Encode(phantomTransaction(message)) }
+    params: { message: base58Encode(serialized) }
   })
   return signature
+}
+
+export async function signAndSendMessage (message) {
+  return signAndSendTransaction(phantomTransaction(message))
 }
 
 // Phantom submits the transaction to the network it is set to. The blockhash comes from devnet,

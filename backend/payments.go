@@ -182,7 +182,7 @@ func (a *App) handleRefundPaymentRecovery(w http.ResponseWriter, r *http.Request
 		}
 		return
 	}
-	if err := a.verifyRefund(ctx, req.RefundSignature, a.cfg.TreasuryWallet, payment.WalletAddress, payment.Lamports); err != nil {
+	if err := a.verifyRefund(ctx, req.RefundSignature, payment.Signature, a.cfg.TreasuryWallet, payment.WalletAddress, payment.Lamports); err != nil {
 		writeError(w, http.StatusPaymentRequired, err.Error())
 		return
 	}

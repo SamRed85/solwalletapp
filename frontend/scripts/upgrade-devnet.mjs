@@ -1,7 +1,6 @@
-// Upgrade the devnet program through the council.
-// The live program still has the five-minute delay and the unanimous override.
+// Deploy or upgrade the devnet program. The deployer key is the loader authority.
+// The program must not upgrade itself: Solana rejects that with PrivilegeEscalation.
 //
-//   node scripts/upgrade-devnet.mjs --probe
 //   node scripts/upgrade-devnet.mjs --upgrade
 
 import { createHash } from 'node:crypto'
@@ -12,7 +11,7 @@ import { ed25519 } from '@noble/curves/ed25519'
 import { base58Decode, base58Encode } from '../src/services/solana.js'
 import { compileMessage, PROGRAM_ID } from '../src/services/program.js'
 
-const RPC = 'https://api.devnet.solana.com'
+const ENDPOINTS = [process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com']
 const LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111'
 const SYSTEM = '11111111111111111111111111111111'
 const RENT = 'SysvarRent111111111111111111111111111111111'
@@ -80,19 +79,27 @@ function programDataAddress (program) {
   throw new Error('No program data address')
 }
 
+let endpoint = 0
+
 async function rpc (method, params) {
-  const response = await fetch(RPC, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
-  })
-  const body = await response.json()
-  if (body.error) {
-    const error = new Error(`${method} failed: ${JSON.stringify(body.error)}`)
-    error.rpc = body.error
-    throw error
+  let last
+  for (let attempt = 0; attempt < ENDPOINTS.length; attempt++) {
+    const url = ENDPOINTS[(endpoint + attempt) % ENDPOINTS.length]
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
+    })
+    const body = await response.json()
+    if (!body.error) return body.result
+    last = body.error
+    const limited = /429|Too many requests|rate limit/i.test(JSON.stringify(body.error))
+    if (!limited) break
+    endpoint = (endpoint + 1) % ENDPOINTS.length
   }
-  return body.result
+  const error = new Error(`${method} failed: ${JSON.stringify(last)}`)
+  error.rpc = last
+  throw error
 }
 
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
@@ -108,23 +115,36 @@ function signedTransaction (signers, ixList, blockhash) {
   return concat([Uint8Array.of(signatures.length), ...signatures, compiled.message])
 }
 
+let cachedHash = null
+
+async function recentBlockhash () {
+  if (cachedHash && Date.now() < cachedHash.until) return cachedHash.blockhash
+  const value = (await rpc('getLatestBlockhash', [{ commitment: 'confirmed' }])).value
+  cachedHash = { blockhash: value.blockhash, until: Date.now() + 20000 }
+  return value.blockhash
+}
+
 async function send (signers, ixList) {
-  for (let attempt = 0; attempt < 6; attempt++) {
+  for (let attempt = 0; attempt < 8; attempt++) {
     try {
-      const { blockhash, lastValidBlockHeight } = (await rpc('getLatestBlockhash', [{ commitment: 'confirmed' }])).value
+      const blockhash = await recentBlockhash()
       const transaction = signedTransaction(signers, ixList, blockhash)
-      const signature = await rpc('sendTransaction', [Buffer.from(transaction).toString('base64'), { encoding: 'base64', preflightCommitment: 'confirmed' }])
-      for (let check = 0; check < 40; check++) {
-        const status = (await rpc('getSignatureStatuses', [[signature], { searchTransactionHistory: true }])).value[0]
+      const signature = await rpc('sendTransaction', [
+        Buffer.from(transaction).toString('base64'),
+        { encoding: 'base64', skipPreflight: true, preflightCommitment: 'processed' }
+      ])
+      for (let check = 0; check < 20; check++) {
+        const status = (await rpc('getSignatureStatuses', [[signature]])).value[0]
         if (status?.err) throw new Error(`transaction ${signature} failed: ${JSON.stringify(status.err)}`)
-        if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') return signature
-        await sleep(1000)
+        if (status?.confirmationStatus) return signature
+        await sleep(400)
       }
-      throw new Error(`transaction was not confirmed before block ${lastValidBlockHeight}`)
+      cachedHash = null
+      throw new Error(`transaction ${signature} was not confirmed`)
     } catch (error) {
-      if (!limited(error) || attempt === 5) throw error
-      console.log('RPC rate limit, waiting')
-      await sleep(5000 * (attempt + 1))
+      if (/blockhash/i.test(String(error))) cachedHash = null
+      if ((!limited(error) && !/not confirmed/.test(String(error))) || attempt === 7) throw error
+      await sleep(800 * (attempt + 1))
     }
   }
 }
@@ -150,13 +170,24 @@ function overrideIx () {
   return councilIx('override_upgrade_delay', [writable(COUNCIL)], 2, councilSigners)
 }
 
-function executeIx (buffer) {
+function loaderUpgradeIx (buffer) {
   return {
-    programId: PROGRAM_ID,
+    programId: LOADER,
     accounts: [
-      writable(COUNCIL), writable(programData), readonly(PROGRAM_ID), writable(buffer), writable(DEPLOYER), readonly(RENT), readonly(CLOCK)
+      writable(programData), writable(PROGRAM_ID), writable(buffer), writable(DEPLOYER),
+      readonly(RENT), readonly(CLOCK), signer(DEPLOYER, false)
     ],
-    data: disc('execute_upgrade')
+    data: u32(3)
+  }
+}
+
+function extendProgramIx (additional) {
+  return {
+    programId: LOADER,
+    accounts: [
+      writable(programData), writable(PROGRAM_ID), readonly(SYSTEM), signer(DEPLOYER, true)
+    ],
+    data: concat([u32(6), u32(additional)])
   }
 }
 
@@ -269,27 +300,36 @@ if (!programInfo.value) {
   ]))
 }
 
-const councilInfo = await rpc('getAccountInfo', [COUNCIL, { encoding: 'base64', commitment: 'confirmed' }])
-if (!councilInfo.value) {
-  console.log(`creating council ${COUNCIL}`)
-  console.log(await send([deployer], [{
-    programId: PROGRAM_ID,
-    accounts: [signer(DEPLOYER, true), writable(COUNCIL), readonly(SYSTEM)],
-    data: concat([disc('initialize_upgrade'), Uint8Array.of(2), u32(2), base58Decode(DEPLOYER, 32), base58Decode(member.address, 32)])
-  }]))
-}
-const dumped = await rpc('getAccountInfo', [programData, { encoding: 'base64', commitment: 'confirmed' }])
-const raw = Buffer.from(dumped.value.data[0], 'base64')
+let dumped = await rpc('getAccountInfo', [programData, { encoding: 'base64', commitment: 'confirmed' }])
+if (!dumped.value) throw new Error('program data account is missing after deploy')
+let raw = Buffer.from(dumped.value.data[0], 'base64')
 const authority = raw[12] === 1 ? base58Encode(raw.subarray(13, 45)) : ''
-if (authority !== COUNCIL) {
-  console.log(`handoff ${await send([deployer], [{
-    programId: LOADER,
-    accounts: [writable(programData), signer(DEPLOYER, false), readonly(COUNCIL)],
-    data: u32(4)
-  }])}`)
+if (authority !== DEPLOYER) throw new Error(`upgrade authority is ${authority}`)
+const needed = PROGRAM_DATA_HEADER + elf.length
+if (raw.length < needed) {
+  const additional = needed - raw.length
+  const slot = await rpc('getSlot', [{ commitment: 'confirmed' }])
+  console.log(`extending program data by ${additional} bytes`)
+  console.log(await send([deployer], [extendProgramIx(additional)]))
+  for (let wait = 0; wait < 40; wait++) {
+    const now = await rpc('getSlot', [{ commitment: 'confirmed' }])
+    if (now > slot) break
+    await sleep(500)
+  }
+  dumped = await rpc('getAccountInfo', [programData, { encoding: 'base64', commitment: 'confirmed' }])
+  raw = Buffer.from(dumped.value.data[0], 'base64')
+  if (raw.length < needed) throw new Error(`program data is ${raw.length} bytes after extend, need ${needed}`)
 }
-const deployed = Buffer.from(dumped.value.data[0], 'base64').subarray(PROGRAM_DATA_HEADER, PROGRAM_DATA_HEADER + elf.length)
-const deployedHash = createHash('sha256').update(deployed).digest('hex')
+const deployedHashOf = account => {
+  const body = Buffer.from(account.value.data[0], 'base64').subarray(PROGRAM_DATA_HEADER, PROGRAM_DATA_HEADER + elf.length)
+  return createHash('sha256').update(body).digest('hex')
+}
+let deployedHash = deployedHashOf(dumped)
+if (deployedHash !== local) {
+  console.log(`loader upgrade ${await send([deployer], [loaderUpgradeIx(buffer.address)])}`)
+  dumped = await rpc('getAccountInfo', [programData, { encoding: 'base64', commitment: 'confirmed' }])
+  deployedHash = deployedHashOf(dumped)
+}
 if (deployedHash !== local) throw new Error(`deployed program hash ${deployedHash} does not match ${local}`)
 writeFileSync(resolve(root, 'build-hash.txt'), `${local}\n`)
 console.log(`devnet program matches ${local}`)

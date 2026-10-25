@@ -3,7 +3,7 @@ use anchor_lang::system_program;
 
 mod math;
 
-declare_id!("H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr");
+declare_id!("AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX");
 
 const EVENT_SEED: &[u8] = b"event";
 const VAULT_SEED: &[u8] = b"vault";
@@ -13,6 +13,8 @@ const SCHEDULE_SEED: &[u8] = b"schedule";
 const SIGNERS_SEED: &[u8] = b"signers";
 const GATE_SEED: &[u8] = b"gate";
 const UPGRADE_SEED: &[u8] = b"upgrade-council";
+const SLIP_SEED: &[u8] = b"slips";
+const SLIP_DEPTH: usize = 20;
 #[cfg(not(feature = "devnet-testing"))]
 const UPGRADE_DELAY: i64 = 24 * 60 * 60;
 #[cfg(feature = "devnet-testing")]
@@ -144,7 +146,10 @@ pub mod predictions {
     }
 
     /// Reveals are open from the entry deadline until the reveal deadline (normally the end
-    /// time). A coupon that is never revealed keeps its stake in the pool and cannot win.
+    /// time). Anyone can publish the picks then. The commitment stored at entry rejects any
+    /// other picks, and the app keeps the picks time-lock encrypted until the deadline, so
+    /// the publisher cannot read them early. A coupon that is never revealed keeps its stake
+    /// in the pool and cannot win.
     pub fn reveal_coupon(ctx: Context<RevealCoupon>, picks: [u8; math::MAX_GAMES], nonce: u64) -> Result<()> {
         let event = &ctx.accounts.event;
         require!(event.status == EventStatus::Open, PredError::BadStatus);
@@ -162,6 +167,181 @@ pub mod predictions {
         );
         coupon.picks = picks;
         coupon.revealed = true;
+        Ok(())
+    }
+
+    /// Places one coupon without creating a coupon account. The UI submits one coupon,
+    /// and this instruction refuses a batch. The stake is one transfer. The coupon is one
+    /// log line and one leaf in the slip Merkle root. Picks are not in that line. The index
+    /// is the next free one, so an earlier index cannot be submitted again.
+    pub fn place_slip(ctx: Context<PlaceSlip>, slip: SlipArg, proof: Vec<[u8; 32]>) -> Result<()> {
+        require!(!ctx.accounts.gate.paused, PredError::Paused);
+        require!(proof.len() == SLIP_DEPTH, PredError::BadPicks);
+        let event = &mut ctx.accounts.event;
+        require!(event.status == EventStatus::Open, PredError::BadStatus);
+        require!(Clock::get()?.unix_timestamp < event.deadline, PredError::DeadlinePassed);
+        let book = &mut ctx.accounts.slips;
+        if book.event == Pubkey::default() {
+            book.event = event.key();
+            book.bump = ctx.bumps.slips;
+            book.entry_hash = slip_empty_root();
+            book.reveal_hash = slip_empty_root();
+            book.scored_root = slip_empty_root();
+            book.claimed_root = slip_empty_root();
+        }
+        require!(book.event == event.key(), PredError::WrongEvent);
+        require!(book.count == event.coupon_count, PredError::BadStatus);
+        require!(slip.combinations >= 1 && slip.combinations <= math::MAX_COMBINATIONS, PredError::BadPicks);
+        let index = book.count;
+        require!(index < (1u32 << SLIP_DEPTH), PredError::TooManyCoupons);
+
+        let owner = ctx.accounts.player.key();
+        let leaf = slip_leaf(index, &owner, slip.combinations, &slip.commitment);
+        let empty_root = slip_fold(index, &slip_zero(0), &proof);
+        require!(empty_root == book.entry_hash, PredError::BadCommitment);
+        book.entry_hash = slip_fold(index, &leaf, &proof);
+        msg!("slip-v1:{}:{}:{}:{}:{}", event.key(), index, owner, slip.combinations, hex_encode(&slip.commitment));
+        book.count = book.count.checked_add(1).ok_or(error!(PredError::Overflow))?;
+        let cost = event.price.checked_mul(u64::from(slip.combinations)).ok_or(error!(PredError::Overflow))?;
+
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.player.to_account_info(),
+                    to: ctx.accounts.vault.to_account_info(),
+                },
+            ),
+            cost,
+        )?;
+        event.coupon_count = book.count;
+        event.sales = event.sales.checked_add(cost).ok_or(error!(PredError::Overflow))?;
+        Ok(())
+    }
+
+    /// Publishes the picks for one slip. The commitment is checked against those picks.
+    /// The reveal leaf starts empty, so the same index cannot be published twice.
+    pub fn reveal_slip(ctx: Context<RevealSlip>, reveal: RevealArg, proof: Vec<[u8; 32]>) -> Result<()> {
+        let event = &ctx.accounts.event;
+        require!(event.status == EventStatus::Open, PredError::BadStatus);
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= event.deadline && now < event.reveal_deadline, PredError::RevealClosed);
+        let book = &mut ctx.accounts.slips;
+        require!(book.event == event.key(), PredError::WrongEvent);
+        check_reveal(&reveal, event.game_count)?;
+        require!(reveal.index < book.count, PredError::MissingCoupon);
+        let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks);
+        write_leaf(&mut book.reveal_hash, reveal.index, &proof, &leaf)?;
+        msg!(
+            "reveal-v1:{}:{}:{}:{}:{}:{}",
+            event.key(),
+            reveal.index,
+            reveal.owner,
+            reveal.combinations,
+            hex_encode(&reveal.commitment),
+            hex_encode(&reveal.picks)
+        );
+        book.reveal_count = book.reveal_count.checked_add(1).ok_or(error!(PredError::Overflow))?;
+        Ok(())
+    }
+
+    /// Scores one slip from its entry and reveal proofs. An empty reveal leaf scores nothing.
+    /// The last scored slip settles the event. A leaf that is not in the root is rejected.
+    pub fn score_slip(
+        ctx: Context<ScoreSlip>,
+        reveal: RevealArg,
+        revealed: bool,
+        entry_proof: Vec<[u8; 32]>,
+        reveal_proof: Vec<[u8; 32]>,
+        scored_proof: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        require!(ctx.accounts.event.status == EventStatus::Tallying, PredError::BadStatus);
+        require!(reveal.index == ctx.accounts.event.tallied, PredError::CouponOrder);
+        let book = &mut ctx.accounts.slips;
+        require!(book.event == ctx.accounts.event.key(), PredError::WrongEvent);
+        require!(reveal.index < book.count, PredError::MissingCoupon);
+        require_leaf(&book.entry_hash, reveal.index, &slip_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment), &entry_proof)?;
+        let event_key_games = ctx.accounts.event.game_count;
+        let results = ctx.accounts.event.results;
+        if revealed {
+            let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks);
+            require_leaf(&book.reveal_hash, reveal.index, &leaf, &reveal_proof)?;
+            let counts = math::correct_counts(&reveal.picks[..event_key_games as usize], &results[..event_key_games as usize]).map_err(|_| error!(PredError::BadResults))?;
+            for (score, winner) in ctx.accounts.event.winners.iter_mut().enumerate() {
+                *winner = winner.checked_add(u64::from(counts[score])).ok_or(error!(PredError::Overflow))?;
+            }
+        } else {
+            prove_empty(&book.reveal_hash, reveal.index, &reveal_proof)?;
+        }
+        write_leaf(&mut book.scored_root, reveal.index, &scored_proof, &slip_mark())?;
+        msg!("score-v1:{}:{}", ctx.accounts.event.key(), reveal.index);
+        let event = &mut ctx.accounts.event;
+        event.tallied = event.tallied.checked_add(1).ok_or(error!(PredError::Overflow))?;
+        if event.tallied < event.coupon_count {
+            return Ok(());
+        }
+        apply_settlement(event, ctx.accounts.vault.to_account_info().lamports())?;
+        schedule_remove(&mut ctx.accounts.schedule, event.key())?;
+        Ok(())
+    }
+
+    /// Pays one scored slip from the vault. The owner signs, the proofs must match the roots,
+    /// and a second claim sees a leaf that is no longer empty. There is no account deposit and no draw ticket.
+    pub fn claim_slip(
+        ctx: Context<ClaimSlip>,
+        reveal: RevealArg,
+        entry_proof: Vec<[u8; 32]>,
+        reveal_proof: Vec<[u8; 32]>,
+        claimed_proof: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let event = &ctx.accounts.event;
+        require!(event.status == EventStatus::Resolved, PredError::BadStatus);
+        require!(ctx.accounts.owner.key() == reveal.owner, PredError::WrongWinner);
+        let book = &mut ctx.accounts.slips;
+        require!(book.event == event.key(), PredError::WrongEvent);
+        require!(reveal.index < book.count, PredError::MissingCoupon);
+        check_reveal(&reveal, event.game_count)?;
+        require_leaf(&book.entry_hash, reveal.index, &slip_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment), &entry_proof)?;
+        let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks);
+        require_leaf(&book.reveal_hash, reveal.index, &leaf, &reveal_proof)?;
+        let game_count = event.game_count as usize;
+        let counts = math::correct_counts(&reveal.picks[..game_count], &event.results[..game_count]).map_err(|_| error!(PredError::BadResults))?;
+        let mut amount = 0u64;
+        for tier in &event.tiers[..event.tier_count as usize] {
+            let rows = u64::from(counts[tier.correct as usize]);
+            let per_winner = event.per_winner[tier.correct as usize - 1];
+            amount = amount.checked_add(per_winner.checked_mul(rows).ok_or(error!(PredError::Overflow))?).ok_or(error!(PredError::Overflow))?;
+        }
+        require!(amount > 0, PredError::NothingToClaim);
+        write_leaf(&mut book.claimed_root, reveal.index, &claimed_proof, &slip_mark())?;
+        msg!("claim-v1:{}:{}", event.key(), reveal.index);
+        transfer_from_vault(&ctx.accounts.vault.to_account_info(), &ctx.accounts.owner.to_account_info(), amount, event.rent_reserve)?;
+        Ok(())
+    }
+
+    /// Returns one cancelled slip's stake to its owner. The entry proof identifies the coupon.
+    /// The refund proof is empty the first time and fails once that leaf has been marked.
+    pub fn refund_slip(
+        ctx: Context<RefundSlip>,
+        index: u32,
+        combinations: u32,
+        commitment: [u8; 32],
+        entry_proof: Vec<[u8; 32]>,
+        refund_proof: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let event = &ctx.accounts.event;
+        require!(event.status == EventStatus::Cancelled, PredError::BadStatus);
+        let owner = ctx.accounts.owner.key();
+        let book = &mut ctx.accounts.slips;
+        require!(book.event == event.key(), PredError::WrongEvent);
+        require!(index < book.count, PredError::MissingCoupon);
+        require!(combinations >= 1, PredError::BadPicks);
+        let leaf = slip_leaf(index, &owner, combinations, &commitment);
+        require_leaf(&book.entry_hash, index, &leaf, &entry_proof)?;
+        let amount = event.price.checked_mul(u64::from(combinations)).ok_or(error!(PredError::Overflow))?;
+        write_leaf(&mut book.claimed_root, index, &refund_proof, &slip_mark())?;
+        msg!("refund-v1:{}:{}", event.key(), index);
+        transfer_from_vault(&ctx.accounts.vault.to_account_info(), &ctx.accounts.owner.to_account_info(), amount, event.rent_reserve)?;
         Ok(())
     }
 
@@ -231,23 +411,7 @@ pub mod predictions {
         if tallied < event.coupon_count {
             return Ok(());
         }
-
-        let tiers: Vec<math::Tier> = event.tiers[..event.tier_count as usize]
-            .iter()
-            .map(|tier| math::Tier { correct: tier.correct, percent: tier.percent })
-            .collect();
-        let settlement = math::settle(event.sales, event.rollover_in, event.game_count, &tiers, &winners).map_err(|_| error!(PredError::BadSettlement))?;
-        event.per_winner = [0; math::MAX_GAMES];
-        for (tier, per_winner) in tiers.iter().zip(&settlement.per_winner) {
-            event.per_winner[tier.correct as usize - 1] = *per_winner;
-        }
-        event.house = settlement.house;
-        event.paid = settlement.paid;
-        event.rollover_out = settlement.rollover_out;
-        event.status = EventStatus::Resolved;
-        let liquid = ctx.accounts.vault.to_account_info().lamports().checked_sub(event.rent_reserve).ok_or(error!(PredError::Insolvent))?;
-        let liability = settlement.paid.checked_add(settlement.house).ok_or(error!(PredError::Overflow))?.checked_add(settlement.rollover_out).ok_or(error!(PredError::Overflow))?;
-        require!(liquid >= liability, PredError::Insolvent);
+        apply_settlement(event, ctx.accounts.vault.to_account_info().lamports())?;
         schedule_remove(&mut ctx.accounts.schedule, event.key())?;
         Ok(())
     }
@@ -265,21 +429,28 @@ pub mod predictions {
         Ok(())
     }
 
-    /// Pays every winning row of the coupon and closes it. A coupon without winnings is
-    /// closed too, which returns its rent to the owner.
+    /// Pays a winning coupon from the event vault and returns its account rent to the owner.
+    /// A coupon with no prize returns only that rent. The stake stays in the pool. There is no draw.
     pub fn claim(ctx: Context<Claim>) -> Result<()> {
         let event = &ctx.accounts.event;
         require!(event.status == EventStatus::Resolved, PredError::BadStatus);
         let amount = payout_for(&ctx.accounts.coupon, event)?;
-        if amount == 0 {
-            return Ok(());
+        if amount > 0 {
+            transfer_from_vault(
+                &ctx.accounts.vault.to_account_info(),
+                &ctx.accounts.owner.to_account_info(),
+                amount,
+                event.rent_reserve,
+            )?;
         }
-        transfer_from_vault(
-            &ctx.accounts.vault.to_account_info(),
-            &ctx.accounts.owner.to_account_info(),
-            amount,
-            event.rent_reserve,
-        )?;
+        Ok(())
+    }
+
+    /// Closes a resolved coupon that won nothing. The keeper calls this so a loser does not
+    /// have to sign. The account rent goes back to the owner, and the stake stays in the pool.
+    pub fn close_lost(ctx: Context<CloseLost>) -> Result<()> {
+        require!(ctx.accounts.event.status == EventStatus::Resolved, PredError::BadStatus);
+        require!(payout_for(&ctx.accounts.coupon, &ctx.accounts.event)? == 0, PredError::BadStatus);
         Ok(())
     }
 
@@ -464,6 +635,53 @@ fn record_approval(event: &mut Event, signers: &ResultSigners, signer: &Pubkey, 
     Ok(event.approvals.count_ones() >= u32::from(signers.threshold))
 }
 
+fn apply_settlement(event: &mut Event, vault_lamports: u64) -> Result<()> {
+    let tiers: Vec<math::Tier> = event.tiers[..event.tier_count as usize]
+        .iter()
+        .map(|tier| math::Tier { correct: tier.correct, percent: tier.percent })
+        .collect();
+    let settlement = math::settle(event.sales, event.rollover_in, event.game_count, &tiers, &event.winners).map_err(|_| error!(PredError::BadSettlement))?;
+    event.per_winner = [0; math::MAX_GAMES];
+    for (tier, per_winner) in tiers.iter().zip(&settlement.per_winner) {
+        event.per_winner[tier.correct as usize - 1] = *per_winner;
+    }
+    event.house = settlement.house;
+    event.paid = settlement.paid;
+    event.rollover_out = settlement.rollover_out;
+    event.status = EventStatus::Resolved;
+    let liquid = vault_lamports.checked_sub(event.rent_reserve).ok_or(error!(PredError::Insolvent))?;
+    let liability = settlement.paid.checked_add(settlement.house).ok_or(error!(PredError::Overflow))?.checked_add(settlement.rollover_out).ok_or(error!(PredError::Overflow))?;
+    require!(liquid >= liability, PredError::Insolvent);
+    Ok(())
+}
+
+fn check_reveal(reveal: &RevealArg, game_count: u8) -> Result<()> {
+    let games = game_count as usize;
+    require!(reveal.picks[games..].iter().all(|mask| *mask == 0), PredError::BadPicks);
+    let combinations = math::combination_count(&reveal.picks[..games]).map_err(|_| error!(PredError::BadPicks))?;
+    require!(combinations == reveal.combinations, PredError::BadPicks);
+    require!(coupon_commitment(&reveal.owner, &reveal.picks, reveal.nonce) == reveal.commitment, PredError::BadCommitment);
+    Ok(())
+}
+
+fn prove_empty(root: &[u8; 32], index: u32, proof: &[[u8; 32]]) -> Result<()> {
+    require!(proof.len() == SLIP_DEPTH, PredError::BadPicks);
+    require!(slip_fold(index, &slip_zero(0), proof) == *root, PredError::BadCommitment);
+    Ok(())
+}
+
+fn require_leaf(root: &[u8; 32], index: u32, leaf: &[u8; 32], proof: &[[u8; 32]]) -> Result<()> {
+    require!(proof.len() == SLIP_DEPTH, PredError::BadPicks);
+    require!(slip_fold(index, leaf, proof) == *root, PredError::BadCommitment);
+    Ok(())
+}
+
+fn write_leaf(root: &mut [u8; 32], index: u32, proof: &[[u8; 32]], leaf: &[u8; 32]) -> Result<()> {
+    prove_empty(root, index, proof)?;
+    *root = slip_fold(index, leaf, proof);
+    Ok(())
+}
+
 fn payout_for(coupon: &Coupon, event: &Event) -> Result<u64> {
     let game_count = event.game_count as usize;
     let counts = math::correct_counts(&coupon.picks[..game_count], &event.results[..game_count]).map_err(|_| error!(PredError::BadResults))?;
@@ -498,6 +716,82 @@ fn verify_signers(threshold: u8, members: &[Pubkey], provided: &[AccountInfo]) -
 
 pub fn coupon_commitment(player: &Pubkey, picks: &[u8; math::MAX_GAMES], nonce: u64) -> [u8; 32] {
     anchor_lang::solana_program::hash::hashv(&[player.as_ref(), picks, &nonce.to_le_bytes()]).to_bytes()
+}
+
+pub fn slip_leaf(index: u32, owner: &Pubkey, combinations: u32, commitment: &[u8; 32]) -> [u8; 32] {
+    anchor_lang::solana_program::hash::hashv(&[
+        b"slip-leaf",
+        &index.to_le_bytes(),
+        owner.as_ref(),
+        &combinations.to_le_bytes(),
+        commitment,
+    ])
+    .to_bytes()
+}
+
+pub fn slip_zero(level: usize) -> [u8; 32] {
+    let mut node = anchor_lang::solana_program::hash::hash(b"slip-empty").to_bytes();
+    for _ in 0..level {
+        node = anchor_lang::solana_program::hash::hashv(&[&node, &node]).to_bytes();
+    }
+    node
+}
+
+pub fn slip_empty_root() -> [u8; 32] {
+    slip_zero(SLIP_DEPTH)
+}
+
+pub fn slip_mark() -> [u8; 32] {
+    anchor_lang::solana_program::hash::hash(b"slip-marked").to_bytes()
+}
+
+pub fn slip_reveal_leaf(index: u32, owner: &Pubkey, combinations: u32, commitment: &[u8; 32], picks: &[u8; math::MAX_GAMES]) -> [u8; 32] {
+    anchor_lang::solana_program::hash::hashv(&[
+        b"slip-reveal",
+        &index.to_le_bytes(),
+        owner.as_ref(),
+        &combinations.to_le_bytes(),
+        commitment,
+        picks,
+    ])
+    .to_bytes()
+}
+
+/// Folds a leaf up `SLIP_DEPTH` sibling hashes. `proof[0]` is the leaf's sibling.
+pub fn slip_fold(index: u32, leaf: &[u8; 32], proof: &[[u8; 32]]) -> [u8; 32] {
+    let mut node = *leaf;
+    let mut cursor = index;
+    for sibling in proof {
+        node = if cursor & 1 == 0 {
+            anchor_lang::solana_program::hash::hashv(&[&node, sibling]).to_bytes()
+        } else {
+            anchor_lang::solana_program::hash::hashv(&[sibling, &node]).to_bytes()
+        };
+        cursor >>= 1;
+    }
+    node
+}
+
+pub fn slip_reveal_hash(previous: &[u8; 32], index: u32, owner: &Pubkey, combinations: u32, commitment: &[u8; 32]) -> [u8; 32] {
+    anchor_lang::solana_program::hash::hashv(&[
+        b"reveal-v1",
+        previous,
+        &index.to_le_bytes(),
+        owner.as_ref(),
+        &combinations.to_le_bytes(),
+        commitment,
+    ])
+    .to_bytes()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn schedule_insert(schedule: &mut Schedule, event: Pubkey, deadline: i64) -> Result<()> {
@@ -626,6 +920,108 @@ pub struct Coupon {
 
 impl Coupon {
     pub const SIZE: usize = 32 + 32 + 4 + 1 + math::MAX_GAMES + 32 + 1 + 4 + 8 + 1 + SEALED_LEN;
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct SlipArg {
+    pub commitment: [u8; 32],
+    pub combinations: u32,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct RevealArg {
+    pub index: u32,
+    pub owner: Pubkey,
+    pub combinations: u32,
+    pub picks: [u8; math::MAX_GAMES],
+    pub nonce: u64,
+    pub commitment: [u8; 32],
+}
+
+/// One book per event. `entry_hash` is the Merkle root of the coupons entered so far.
+/// One place transaction adds one coupon. This is not a coupon account.
+#[account]
+pub struct SlipBook {
+    pub event: Pubkey,
+    pub count: u32,
+    pub entry_hash: [u8; 32],
+    pub reveal_count: u32,
+    /// Merkle root of reveal leaves. An empty leaf means that index was not revealed.
+    pub reveal_hash: [u8; 32],
+    pub scored_root: [u8; 32],
+    pub claimed_root: [u8; 32],
+    pub bump: u8,
+}
+
+impl SlipBook {
+    pub const SIZE: usize = 32 + 4 + 32 + 4 + 32 + 32 + 32 + 1;
+}
+
+#[derive(Accounts)]
+pub struct PlaceSlip<'info> {
+    #[account(mut)]
+    pub player: Signer<'info>,
+    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = 8 + SlipBook::SIZE,
+        seeds = [SLIP_SEED, event.key().as_ref()],
+        bump
+    )]
+    pub slips: Account<'info, SlipBook>,
+    #[account(seeds = [GATE_SEED, event.admin.as_ref()], bump = gate.bump)]
+    pub gate: Account<'info, Gate>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RevealSlip<'info> {
+    pub caller: Signer<'info>,
+    #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [SLIP_SEED, event.key().as_ref()], bump = slips.bump)]
+    pub slips: Account<'info, SlipBook>,
+}
+
+#[derive(Accounts)]
+pub struct ScoreSlip<'info> {
+    pub caller: Signer<'info>,
+    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [SLIP_SEED, event.key().as_ref()], bump = slips.bump)]
+    pub slips: Account<'info, SlipBook>,
+    #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
+    pub schedule: Box<Account<'info, Schedule>>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimSlip<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [SLIP_SEED, event.key().as_ref()], bump = slips.bump)]
+    pub slips: Account<'info, SlipBook>,
+}
+
+#[derive(Accounts)]
+pub struct RefundSlip<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [SLIP_SEED, event.key().as_ref()], bump = slips.bump)]
+    pub slips: Account<'info, SlipBook>,
 }
 
 #[account]
@@ -769,8 +1165,21 @@ pub struct Claim<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CloseLost<'info> {
+    #[account(mut, close = owner)]
+    pub coupon: Account<'info, Coupon>,
+    #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump, constraint = coupon.event == event.key() @ PredError::WrongEvent)]
+    pub event: Box<Account<'info, Event>>,
+    /// CHECK: the rent goes back to the coupon owner. The keeper signs instead.
+    #[account(mut, address = coupon.owner)]
+    pub owner: UncheckedAccount<'info>,
+    pub caller: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct RevealCoupon<'info> {
-    pub player: Signer<'info>,
+    /// CHECK: must equal the coupon owner. It does not sign; the commitment binds the picks.
+    pub player: UncheckedAccount<'info>,
     #[account(mut, seeds = [COUPON_SEED, event.key().as_ref(), &coupon.index.to_le_bytes()], bump = coupon.bump, constraint = coupon.owner == player.key() @ PredError::WrongEvent)]
     pub coupon: Account<'info, Coupon>,
     #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump, constraint = coupon.event == event.key() @ PredError::WrongEvent)]
@@ -879,6 +1288,11 @@ pub enum PredError {
     Insolvent,
     UpgradeTimelock,
     AlreadyWithdrawn,
+    DrawInProgress,
+    DrawRequired,
+    LotteryFull,
+    DrawNotReady,
+    WrongWinner,
 }
 
 #[account]

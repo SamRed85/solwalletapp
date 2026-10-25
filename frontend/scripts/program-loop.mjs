@@ -1,7 +1,7 @@
 import { ed25519 } from '@noble/curves/ed25519'
 import { base58Encode } from '../src/services/solana.js'
 import {
-  approveResolutionIx, claimIx, compileMessage, couponCommitment, couponPda, createEventIx, decodeEvent, escrowPda, eventPda,
+  approveResolutionIx, claimIx, compileMessage, couponCommitment, couponPda, createEventIx, decodeEvent, escrowPda, eventPda, initLotteryIx,
   findPda, picksFromSystem, placeCouponIx, PROGRAM_ID, revealCouponIx, tallyIx, vaultPda
 } from '../src/services/program.js'
 
@@ -161,15 +161,17 @@ if (settled.status !== 'resolved' || perWinner !== 950_000n || house !== 50_000n
   throw new Error(`unexpected settlement perWinner=${perWinner} house=${house}`)
 }
 
-const redirected = await send(stranger, [stranger], [claimIx({ owner: stranger.address, event, coupon })])
+const opened = await send(admin, [admin], [initLotteryIx(admin.address)])
+if (opened instanceof Error) throw opened
+const redirected = await send(stranger, [stranger], [claimIx({ owner: stranger.address, event, coupon, admin: admin.address })])
 if (!(redirected instanceof Error)) throw new Error('a claim cannot be redirected')
 const before = await balance(player.address)
-const claimed = await send(player, [player], [claimIx({ owner: player.address, event, coupon })])
+const claimed = await send(player, [player], [claimIx({ owner: player.address, event, coupon, admin: admin.address })])
 if (claimed instanceof Error) throw claimed
 const after = await balance(player.address)
 if (after <= before) throw new Error('the vault must pay the winner')
 if (await account(coupon)) throw new Error('a paid coupon account must close')
-const repeated = await send(player, [player], [claimIx({ owner: player.address, event, coupon })])
+const repeated = await send(player, [player], [claimIx({ owner: player.address, event, coupon, admin: admin.address })])
 if (!(repeated instanceof Error)) throw new Error('a claim cannot be repeated')
 const reserve = settled.rentReserve
 if (BigInt(await balance(vault)) !== reserve + house) throw new Error('the vault did not keep the house share')

@@ -57,6 +57,7 @@ type Settlement struct {
 	PaidLamports        uint64         `json:"paidLamports" bson:"paidLamports"`
 	RolloverOutLamports uint64         `json:"rolloverOutLamports" bson:"rolloverOutLamports"`
 	RolloverToEventID   *bson.ObjectID `json:"rolloverToEventId,omitempty" bson:"rolloverToEventId,omitempty"`
+	RolloverApplied     bool           `json:"rolloverApplied,omitempty" bson:"rolloverApplied"`
 	Tiers               []TierPayout   `json:"tiers" bson:"tiers"`
 }
 
@@ -268,6 +269,88 @@ func (a *App) rolloverTarget(ctx context.Context, exclude bson.ObjectID, now tim
 }
 
 const pendingRolloverID = "pending"
+
+// applyRolloverFrom adds lamports once for this source event. A retry sees the source id
+// already recorded and does not add them again, so a crash between the two writes can be repaired.
+func (a *App) applyRolloverFrom(ctx context.Context, source bson.ObjectID, target *bson.ObjectID, lamports uint64) error {
+	if lamports == 0 {
+		return nil
+	}
+	sourceID := source.Hex()
+	if target != nil {
+		res, err := a.events.UpdateOne(ctx,
+			bson.M{"_id": *target, "rolloverSources": bson.M{"$ne": sourceID}},
+			bson.M{"$inc": bson.M{"rolloverInLamports": int64(lamports)}, "$addToSet": bson.M{"rolloverSources": sourceID}},
+		)
+		if err != nil {
+			return err
+		}
+		if res.MatchedCount == 0 {
+			n, err := a.events.CountDocuments(ctx, bson.M{"_id": *target, "rolloverSources": sourceID})
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return fmt.Errorf("rollover target is missing")
+			}
+		}
+		return nil
+	}
+	_, err := a.rollover.UpdateOne(ctx,
+		bson.M{"_id": pendingRolloverID, "sources": bson.M{"$ne": sourceID}},
+		bson.M{"$inc": bson.M{"lamports": int64(lamports)}, "$addToSet": bson.M{"sources": sourceID}},
+		options.UpdateOne().SetUpsert(true),
+	)
+	if mongo.IsDuplicateKeyError(err) {
+		return nil
+	}
+	return err
+}
+
+func (a *App) markRolloverApplied(ctx context.Context, source bson.ObjectID) error {
+	_, err := a.events.UpdateByID(ctx, source, bson.M{"$set": bson.M{"settlement.rolloverApplied": true}})
+	return err
+}
+
+func (a *App) commitRollover(ctx context.Context, source bson.ObjectID, settlement Settlement) error {
+	if err := a.applyRolloverFrom(ctx, source, settlement.RolloverToEventID, settlement.RolloverOutLamports); err != nil {
+		return err
+	}
+	return a.markRolloverApplied(ctx, source)
+}
+
+func (a *App) repairRollover(ctx context.Context) {
+	cursor, err := a.events.Find(ctx, bson.M{
+		"resultsSetAt":                   bson.M{"$exists": true},
+		"settlement.rolloverOutLamports": bson.M{"$gt": 0},
+		"settlement.rolloverApplied":     false,
+	})
+	if err != nil {
+		log.Printf("rollover repair: %v", err)
+		return
+	}
+	defer cursor.Close(ctx)
+	for cursor.Next(ctx) {
+		var event Event
+		if err := cursor.Decode(&event); err != nil || event.Settlement == nil {
+			continue
+		}
+		if err := a.commitRollover(ctx, event.ID, *event.Settlement); err != nil {
+			log.Printf("rollover repair %s: %v", event.ID.Hex(), err)
+		}
+	}
+}
+
+func (a *App) rolloverRepairLoop() {
+	a.repairRollover(context.Background())
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		a.repairRollover(ctx)
+		cancel()
+	}
+}
 
 func (a *App) applyRollover(ctx context.Context, target *bson.ObjectID, lamports uint64) error {
 	if lamports == 0 {

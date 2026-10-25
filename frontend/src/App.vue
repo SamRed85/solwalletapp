@@ -71,6 +71,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTheme } from 'vuetify'
 import { authApi, healthApi } from '@/services/api'
+import { startAutoReveal } from '@/services/autoReveal'
 import { auth, login, logout, setProfile } from '@/stores/auth'
 import { notify, notifyError, snackbar } from '@/stores/notify'
 import { shortAddress } from '@/utils/format'
@@ -158,8 +159,11 @@ async function checkHealth () {
 
 let healthTimer
 onMounted(() => {
+  startAutoReveal()
   checkHealth()
   healthTimer = setInterval(checkHealth, 30000)
 })
-onBeforeUnmount(() => clearInterval(healthTimer))
+onBeforeUnmount(() => {
+  clearInterval(healthTimer)
+})
 </script>

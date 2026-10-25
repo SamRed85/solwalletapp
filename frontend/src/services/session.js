@@ -3,7 +3,7 @@ const KEY = 'session'
 export function loadSession () {
   try {
     const session = JSON.parse(localStorage.getItem(KEY))
-    if (session?.token && new Date(session.expiresAt) > new Date()) return session
+    if (session?.wallet && new Date(session.expiresAt) > new Date()) return session
   } catch {
     // corrupt value, fall through and clear it
   }

@@ -16,6 +16,14 @@
           {{ event.gameCount }} games · {{ formatSol(event.couponPriceLamports) }} per coupon ·
           entries close {{ formatDate(event.startTime) }}
         </v-card-subtitle>
+        <v-card-text v-if="auth.isAdmin && event.status !== 'completed'" class="pt-2 pb-0">
+          <v-btn size="small" variant="tonal" prepend-icon="mdi-refresh" :loading="refreshingScores" @click="refreshScores">
+            Refresh scores
+          </v-btn>
+          <div class="text-caption text-medium-emphasis mt-1">
+            Scores refresh on their own 45 and 90 minutes after entries close. This button reads them now.
+          </div>
+        </v-card-text>
         <v-card-text>
           <p v-if="event.description" class="mb-4">{{ event.description }}</p>
           <p v-if="event.chain" class="text-body-2">
@@ -58,6 +66,9 @@
       <VaultPanel v-if="event.chain" :event="event" class="mb-4" @changed="refreshEvent" />
 
       <v-card v-if="event.status !== 'open'" class="mb-4" title="Games">
+        <v-card-subtitle v-if="event.status !== 'completed'" class="text-wrap">
+          A live score is what the match shows now. It is not the settled result.
+        </v-card-subtitle>
         <v-table density="compact">
           <thead><tr><th>#</th><th>Game</th><th>Kickoff</th><th>Result</th></tr></thead>
           <tbody>
@@ -75,7 +86,7 @@
                     <a :href="explorerBlock(game.draw.slot)" target="_blank" rel="noopener">block {{ game.draw.slot }}</a>
                   </div>
                 </template>
-                <span v-else class="text-medium-emphasis">—</span>
+                <MatchScore v-else :game="projection?.games?.[index]" :kickoff="game.kickoff" />
               </td>
             </tr>
           </tbody>
@@ -108,7 +119,7 @@
           <div v-for="(game, g) in event.games" :key="g" class="d-flex align-center flex-wrap ga-3 py-2 game-row">
             <div class="game-cell">
               <div class="font-weight-medium">{{ g + 1 }}. {{ game.homeTeam }} vs {{ game.awayTeam }}</div>
-              <div class="text-caption text-medium-emphasis">{{ formatDate(game.kickoff) }}</div>
+              <MatchScore :game="projection?.games?.[g]" :kickoff="game.kickoff" />
             </div>
             <v-btn
               v-for="o in outcomes" :key="o.value" :title="o.label" min-width="44" :disabled="paying"
@@ -136,6 +147,10 @@
             <div class="text-caption text-medium-emphasis">
               {{ statusText }}
             </div>
+            <div class="text-caption text-medium-emphasis mt-1">
+              You pay the coupon price only. A losing coupon keeps its stake in the pool. There is no account deposit and no monthly draw.
+            </div>
+            <ProjectedPayout :system="systemRows(picks)" :projection="projection" />
             <div v-if="lowBalance" class="text-caption text-error">Your devnet balance looks too low for this payment.</div>
           </div>
           <v-spacer />
@@ -153,9 +168,11 @@
 </template>
 
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import CouponPicks from '@/components/CouponPicks.vue'
+import MatchScore from '@/components/MatchScore.vue'
+import ProjectedPayout from '@/components/ProjectedPayout.vue'
 import VaultPanel from '@/components/VaultPanel.vue'
 import { eventApi } from '@/services/api'
 import { payAndEnter, placeOnChain } from '@/services/entry'
@@ -167,14 +184,17 @@ import { explorerBlock, formatDate, formatSol, outcomes, statusColors } from '@/
 const route = useRoute()
 const router = useRouter()
 const event = ref(null)
+const projection = ref(null)
 const loading = ref(false)
+const refreshingScores = ref(false)
 const picks = ref([])
 const paying = ref(false)
 const step = ref('sign')
 
 const stepLabels = computed(() => event.value?.chain ? {
-  sign: 'Approve the entry in Phantom. The program vault holds this payment.',
-  confirm: 'Waiting for the entry to be finalized on devnet...'
+  sign: 'Approve the entry in Phantom.',
+  confirm: 'Waiting for the entry to be finalized on devnet...',
+  schedule: 'Saving the time-locked picks. They are published when entries close.'
 } : {
   sign: 'Approve the payment in Phantom (make sure Phantom is set to Devnet)...',
   confirm: 'Waiting for the payment to be finalized on devnet. This can take about a minute...',
@@ -207,6 +227,30 @@ const tierRows = computed(() => {
     potLamports: Math.floor(sales * t.percent / 100) + (t.correct === e.gameCount ? e.rolloverInLamports : 0)
   }))
 })
+
+async function refreshScores () {
+  refreshingScores.value = true
+  try {
+    projection.value = await eventApi.refreshScores(event.value.id)
+    notify('Scores refreshed')
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    refreshingScores.value = false
+  }
+}
+
+async function loadProjection () {
+  if (!event.value || event.value.status === 'completed') {
+    projection.value = null
+    return
+  }
+  try {
+    projection.value = await eventApi.projection(event.value.id)
+  } catch {
+    projection.value = null
+  }
+}
 
 function resetPicks () {
   picks.value = event.value.games.map(() => [])
@@ -268,8 +312,10 @@ async function pay () {
       onStep: s => { step.value = s }
     }
     if (event.value.chain) {
-      await placeOnChain(entry)
-      notify('Coupon entered in the program vault.')
+      const placed = await placeOnChain(entry)
+      notify(placed.armError
+        ? `Coupon entered. The automatic reveal was not saved (${placed.armError}). Arm it from My Coupons.`
+        : 'Coupon entered. Your picks are published automatically when entries close.')
     } else {
       await payAndEnter(entry)
       notify('Coupons placed. Good luck!')
@@ -287,8 +333,11 @@ async function pay () {
 watch(() => route.params.id, id => {
   if (!id) return
   picks.value = []
-  load()
+  load().then(loadProjection)
 }, { immediate: true })
+
+const projectionTimer = setInterval(loadProjection, 60000)
+onBeforeUnmount(() => clearInterval(projectionTimer))
 </script>
 
 <style scoped>

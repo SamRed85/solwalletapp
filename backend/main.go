@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"log"
 	"net/http"
 	"time"
@@ -22,10 +23,18 @@ type App struct {
 	entries  *mongo.Collection
 	payments *mongo.Collection
 	rollover *mongo.Collection
+	reveals  *mongo.Collection
+	sessions *mongo.Collection
+	slips    *mongo.Collection
+	feed     *footballFeed
+
+	rpc           *solanaRPC
+	keeper        ed25519.PrivateKey
+	keeperAddress string
 
 	verifyPayment         func(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string) error
 	verifyRecoveryPayment func(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string) error
-	verifyRefund          func(ctx context.Context, signature, treasury, recipient string, lamports uint64) error
+	verifyRefund          func(ctx context.Context, refundSignature, paymentSignature, treasury, recipient string, lamports uint64) error
 	findDrawBlock         func(ctx context.Context, t time.Time) (*blockRef, error)
 	fetchAccount          func(ctx context.Context, address string) (*chainAccount, error)
 }
@@ -49,12 +58,18 @@ func main() {
 	app := &App{
 		cfg:                   cfg,
 		db:                    db,
-		nonces:                newNonceStore(),
+		nonces:                newNonceStore(db.Collection("nonces")),
+		limiter:               rateLimiter{coll: db.Collection("limits")},
 		users:                 db.Collection("users"),
 		events:                db.Collection("events"),
 		entries:               db.Collection("entries"),
 		payments:              db.Collection("payments"),
 		rollover:              db.Collection("rollover"),
+		reveals:               db.Collection("reveals"),
+		sessions:              db.Collection("sessions"),
+		slips:                 db.Collection("slipArchive"),
+		rpc:                   rpc,
+		feed:                  newFootballFeed(cfg.APIFootballKey),
 		verifyPayment:         rpc.verifyPayment,
 		verifyRecoveryPayment: rpc.verifyRecoveryPayment,
 		verifyRefund:          rpc.verifyRefund,
@@ -64,6 +79,13 @@ func main() {
 	if err := app.ensureIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
 	}
+	app.loadKeeper()
+	go app.revealLoop()
+	go app.lotteryLoop()
+	go app.mirrorLoop()
+	go app.rolloverRepairLoop()
+	go app.archiveLoop()
+	go app.footballLoop()
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -73,7 +95,7 @@ func main() {
 		WriteTimeout:      150 * time.Second,
 	}
 	log.Printf("Sol backend listening on :%s (db %q, RPC %s, treasury %s)",
-		cfg.Port, cfg.MongoDB, cfg.SolanaRPCURL, cfg.TreasuryWallet)
+		cfg.Port, cfg.MongoDB, redactRPC(cfg.SolanaRPCURL), cfg.TreasuryWallet)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -84,6 +106,7 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/config", a.handleConfig)
 	mux.HandleFunc("POST /api/auth/nonce", a.limitRequests("auth-nonce", 10, time.Minute, ipRateKey, a.handleNonce))
 	mux.HandleFunc("POST /api/auth/login", a.limitRequests("auth-login", 10, time.Minute, ipRateKey, a.handleLogin))
+	mux.HandleFunc("POST /api/auth/logout", a.handleLogout)
 
 	mux.HandleFunc("GET /api/me", a.requireAuth(a.handleMe))
 	mux.HandleFunc("PUT /api/me", a.requireAuth(a.handleUpdateMe))
@@ -91,17 +114,25 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/events/{id}", a.requireAuth(a.handleGetEvent))
 	mux.HandleFunc("POST /api/events/{id}/entries", a.requireAuth(a.limitRequests("entry", 20, time.Minute, walletRateKey, a.handleCreateEntry)))
 	mux.HandleFunc("GET /api/entries", a.requireAuth(a.handleMyEntries))
+	mux.HandleFunc("GET /api/lottery", a.requireAuth(a.handleLottery))
+	mux.HandleFunc("GET /api/slip-archive", a.requireAuth(a.handleSlipArchive))
+	mux.HandleFunc("POST /api/slip-archive", a.requireAuth(a.limitRequests("slip-archive", 30, time.Minute, walletRateKey, a.handleIngestSlip)))
 	mux.HandleFunc("POST /api/events/{id}/chain/sync", a.requireAuth(a.limitRequests("chain-sync", 20, time.Minute, walletRateKey, a.handleSyncChain)))
+	mux.HandleFunc("POST /api/reveals", a.requireAuth(a.limitRequests("reveal-arm", 20, time.Minute, walletRateKey, a.handleArmReveal)))
 	mux.HandleFunc("POST /api/events/{id}/payment-recoveries", a.requireAuth(a.limitRequests("payment-recovery", 5, time.Minute, walletRateKey, a.handleCreatePaymentRecovery)))
 
 	mux.HandleFunc("GET /api/users", a.requireAdmin(a.handleListUsers))
 	mux.HandleFunc("PUT /api/users/{wallet}", a.requireAdmin(a.handleAdminUpdateUser))
 	mux.HandleFunc("DELETE /api/users/{wallet}", a.requireAdmin(a.handleAdminDeleteUser))
 	mux.HandleFunc("POST /api/events", a.requireAdmin(a.handleCreateEvent))
+	mux.HandleFunc("DELETE /api/events/{id}", a.requireAdmin(a.handleDeleteEvent))
 	mux.HandleFunc("PUT /api/events/{id}/games", a.requireAdmin(a.handleSetGames))
 	mux.HandleFunc("PUT /api/events/{id}/chain", a.requireAdmin(a.handleSetChain))
 	mux.HandleFunc("POST /api/events/{id}/results", a.requireAdmin(a.handleSetResults))
+	mux.HandleFunc("GET /api/events/{id}/projection", a.requireAuth(a.handleProjection))
+	mux.HandleFunc("POST /api/events/{id}/projection/refresh", a.requireAdmin(a.handleRefreshScores))
 	mux.HandleFunc("GET /api/events/{id}/payouts", a.requireAdmin(a.handlePayouts))
+	mux.HandleFunc("GET /api/football/fixtures", a.requireAdmin(a.handleFixtureSearch))
 	mux.HandleFunc("GET /api/payment-recoveries", a.requireAdmin(a.handleListPaymentRecoveries))
 	mux.HandleFunc("PUT /api/payment-recoveries/{signature}", a.requireAdmin(a.handleRefundPaymentRecovery))
 
@@ -131,6 +162,17 @@ func (a *App) ensureIndexes() error {
 		Keys:    bson.M{"refundSignature": 1},
 		Options: options.Index().SetUnique(true).SetSparse(true),
 	})
+	if err != nil {
+		return err
+	}
+	if _, err = a.reveals.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.M{"coupon": 1}, Options: unique}); err != nil {
+		return err
+	}
+	ttl := options.Index().SetExpireAfterSeconds(0)
+	if _, err = a.nonces.coll.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.M{"expiresAt": 1}, Options: ttl}); err != nil {
+		return err
+	}
+	_, err = a.sessions.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.M{"expiresAt": 1}, Options: options.Index().SetExpireAfterSeconds(0)})
 	return err
 }
 
@@ -155,6 +197,7 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"maxCombinations":     maxCombinations,
 		"programId":           a.cfg.ProgramID,
 		"resultCosigner":      a.cfg.ResultCosigner,
+		"revealKeeper":        a.keeperAddress,
 		"maxOpenVaultEvents":  maxOpenVaultEvents,
 		"defaultGameCount":    defaultGameCount,
 		"defaultTiers":        defaultTiers(defaultGameCount),

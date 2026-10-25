@@ -1,8 +1,8 @@
-import { sha256 } from '@noble/hashes/sha256'
 import { ed25519 } from '@noble/curves/ed25519'
-import { base58Decode, base58Encode, getAccount, getProgramAccounts, latestBlockhash, signAndSendMessage } from './solana.js'
+import { sha256 } from '@noble/hashes/sha256'
+import { base58Decode, base58Encode, getAccount, getProgramAccounts, latestBlockhash, signAndSendTransaction } from './solana.js'
 
-export const PROGRAM_ID = 'H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr'
+export const PROGRAM_ID = 'AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX'
 export const SYSTEM_PROGRAM = '11111111111111111111111111111111'
 export const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111'
 export const RESULT_COSIGNER = '4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH'
@@ -156,6 +156,8 @@ export function placeCouponIx ({ player, admin, nonce, index, commitment, combin
   ], concat([commitment, u32(combinations), sealed]))
 }
 
+// The owner signs this when revealing by hand. After entries close the program also accepts
+// the same instruction with the owner as a non-signer, which is how the keeper publishes picks.
 export function revealCouponIx ({ player, admin, nonce, index, picks, revealNonce }) {
   const event = eventPda(admin, nonce)
   return ix('reveal_coupon', [
@@ -373,10 +375,30 @@ export function correctCounts (picks, results) {
 
 const popcount = mask => (mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1)
 
+// Best row and the prize tiers this coupon actually hit. `each` is the payout of one row at that tier.
+export function couponScore (coupon, event) {
+  if (!coupon?.revealed || event?.status !== 'resolved' || !event.results) return null
+  const counts = correctCounts(coupon.picks, event.results.slice(0, coupon.gameCount))
+  let best = 0
+  for (let score = counts.length - 1; score > 0; score--) {
+    if (counts[score]) {
+      best = score
+      break
+    }
+  }
+  const lines = event.tiers.flatMap(tier => {
+    const rows = counts[tier.correct] ?? 0
+    if (!rows) return []
+    const each = event.perWinner[tier.correct - 1] ?? 0n
+    return [{ correct: tier.correct, rows, each }]
+  }).sort((a, b) => b.correct - a.correct)
+  return { best, games: coupon.gameCount, lines }
+}
+
 export function couponPayout (coupon, event) {
-  if (!coupon.revealed || event.status !== 'resolved') return 0n
-  const counts = correctCounts(coupon.picks, event.results)
-  return event.tiers.reduce((sum, tier) => sum + event.perWinner[tier.correct - 1] * BigInt(counts[tier.correct] ?? 0), 0n)
+  const score = couponScore(coupon, event)
+  if (!score) return 0n
+  return score.lines.reduce((sum, line) => sum + line.each * BigInt(line.rows), 0n)
 }
 
 // The sealed backup is the 13 pick masks and the reveal nonce, XORed with a keystream from
@@ -407,17 +429,94 @@ export function unsealCoupon (key, coupon) {
   return { picks, revealNonce }
 }
 
+// The fee payer signs in Phantom, which also broadcasts the transaction.
+export function serializeTransaction (compiled) {
+  const signatures = compiled.signers.map((address, index) => {
+    if (index === 0) return new Uint8Array(64)
+    throw new Error(`No signer for ${address}`)
+  })
+  const transaction = concat([compactU16(signatures.length), ...signatures, compiled.message])
+  if (transaction.length > 1232) throw new Error('The transaction is too large; use a smaller batch')
+  return transaction
+}
+
 export async function sendProgramTransaction (rpcUrl, feePayer, instructions) {
   const { value } = await latestBlockhash(rpcUrl)
-  const { message } = compileMessage(feePayer, instructions, value.blockhash)
-  if (message.length + 65 > 1232) throw new Error('The transaction is too large; use a smaller batch')
-  const signature = await signAndSendMessage(message)
+  const compiled = compileMessage(feePayer, instructions, value.blockhash)
+  const signature = await signAndSendTransaction(serializeTransaction(compiled))
   return { signature, lastValidBlockHeight: value.lastValidBlockHeight }
+}
+
+export function lotteryPda (admin) {
+  return findPda([text('lottery'), base58Decode(admin, 32)])
+}
+
+export function lotteryVaultPda (lottery) {
+  return findPda([text('lottery-vault'), base58Decode(lottery, 32)])
+}
+
+export function slipsPda (event) {
+  return findPda([text('slips'), base58Decode(event, 32)])
+}
+
+function proofBytes (proof) {
+  return concat([u32(proof.length), ...proof])
+}
+
+function revealArg ({ index, owner, combinations, picks, revealNonce, commitment }) {
+  const padded = new Uint8Array(13)
+  padded.set(picks.subarray(0, 13))
+  return concat([u32(index), base58Decode(owner, 32), u32(combinations), padded, u64(revealNonce), commitment])
+}
+
+export function placeSlipIx ({ player, admin, nonce, commitment, combinations, proof }) {
+  const event = eventPda(admin, nonce)
+  return ix('place_slip', [
+    signer(player, true), writable(event), writable(vaultPda(event)), writable(slipsPda(event)),
+    readonly(gatePda(admin)), readonly(SYSTEM_PROGRAM)
+  ], concat([commitment, u32(combinations), proofBytes(proof)]))
+}
+
+export function revealSlipIx ({ caller, admin, nonce, index, owner, combinations, picks, revealNonce, commitment, proof }) {
+  const event = eventPda(admin, nonce)
+  return ix('reveal_slip', [
+    signer(caller, false), readonly(event), writable(slipsPda(event))
+  ], concat([revealArg({ index, owner, combinations, picks, revealNonce, commitment }), proofBytes(proof)]))
+}
+
+export function scoreSlipIx ({ caller, admin, event, reveal, revealed, entryProof, revealProof, scoredProof }) {
+  return ix('score_slip', [
+    signer(caller, false), writable(event), readonly(vaultPda(event)), writable(slipsPda(event)), writable(schedulePda(admin))
+  ], concat([
+    revealArg(reveal), Uint8Array.of(revealed ? 1 : 0),
+    proofBytes(entryProof), proofBytes(revealProof), proofBytes(scoredProof)
+  ]))
+}
+
+export function claimSlipIx ({ owner, admin, nonce, reveal, entryProof, revealProof, claimedProof }) {
+  const event = eventPda(admin, nonce)
+  return ix('claim_slip', [
+    signer(owner, true), readonly(event), writable(vaultPda(event)), writable(slipsPda(event))
+  ], concat([revealArg(reveal), proofBytes(entryProof), proofBytes(revealProof), proofBytes(claimedProof)]))
+}
+
+export function refundSlipIx ({ owner, admin, nonce, index, combinations, commitment, entryProof, refundProof }) {
+  const event = eventPda(admin, nonce)
+  return ix('refund_slip', [
+    signer(owner, true), readonly(event), writable(vaultPda(event)), writable(slipsPda(event))
+  ], concat([u32(index), u32(combinations), commitment, proofBytes(entryProof), proofBytes(refundProof)]))
 }
 
 export function claimIx ({ owner, event, coupon }) {
   return ix('claim', [
     writable(coupon), writable(event), writable(vaultPda(event)), signer(owner, true)
+  ], new Uint8Array())
+}
+
+export function initLotteryIx (admin) {
+  const lottery = lotteryPda(admin)
+  return ix('init_lottery', [
+    signer(admin, true), writable(lottery), writable(lotteryVaultPda(lottery)), readonly(SYSTEM_PROGRAM)
   ], new Uint8Array())
 }
 

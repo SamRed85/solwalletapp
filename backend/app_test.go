@@ -5,8 +5,10 @@ import (
 	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -69,36 +71,47 @@ func TestWalletSignature(t *testing.T) {
 }
 
 func TestNonceIsSingleUseAndBoundToWallet(t *testing.T) {
-	s := newNonceStore()
+	s := newNonceStore(nil)
 	wallet, _ := testWallet(t)
 	other, _ := testWallet(t)
 	now := time.Now()
 
-	nonce, msg, err := s.issue(wallet, now)
+	nonce, msg, err := s.issue(context.Background(), wallet, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(msg, wallet) || !strings.Contains(msg, nonce) {
 		t.Fatal("message must name the wallet and nonce")
 	}
-	if _, ok := s.consume(nonce, other, now); ok {
+	if _, ok := s.consume(context.Background(), nonce, other, now); ok {
 		t.Fatal("nonce accepted for another wallet")
 	}
-	if _, ok := s.consume(nonce, wallet, now); ok {
+	if _, ok := s.consume(context.Background(), nonce, wallet, now); ok {
 		t.Fatal("nonce usable after a failed attempt")
 	}
 
-	nonce, _, _ = s.issue(wallet, now)
-	if _, ok := s.consume(nonce, wallet, now.Add(nonceTTL+time.Second)); ok {
+	nonce, _, _ = s.issue(context.Background(), wallet, now)
+	if _, ok := s.consume(context.Background(), nonce, wallet, now.Add(nonceTTL+time.Second)); ok {
 		t.Fatal("expired nonce accepted")
 	}
 
-	nonce, _, _ = s.issue(wallet, now)
-	if _, ok := s.consume(nonce, wallet, now); !ok {
+	nonce, _, _ = s.issue(context.Background(), wallet, now)
+	if _, ok := s.consume(context.Background(), nonce, wallet, now); !ok {
 		t.Fatal("valid nonce rejected")
 	}
-	if _, ok := s.consume(nonce, wallet, now); ok {
+	if _, ok := s.consume(context.Background(), nonce, wallet, now); ok {
 		t.Fatal("nonce reused")
+	}
+}
+
+func TestLogoutClearsHttpOnlyCookie(t *testing.T) {
+	app := &App{}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
+	rec := httptest.NewRecorder()
+	app.handleLogout(rec, req)
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != sessionCookie || !cookies[0].HttpOnly || cookies[0].MaxAge >= 0 {
+		t.Fatalf("session cookie %+v", cookies)
 	}
 }
 
@@ -194,8 +207,13 @@ func TestRecoveryCanVerifyHistoricalPayment(t *testing.T) {
 	if err := checkPaymentWithAge(tx, "payer", "treasury", 3000, "expected-memo", time.Now(), 0); err != nil {
 		t.Fatalf("historical payment was rejected for recovery: %v", err)
 	}
-	if err := checkPaymentWithAge(tx, "payer", "treasury", 3000, "", time.Now(), 0); err != nil {
-		t.Fatalf("historical treasury transfer was rejected as a refund: %v", err)
+	if err := checkPaymentWithAge(tx, "payer", "treasury", 3000, refundMemo("original-payment"), time.Now(), 0); err == nil {
+		t.Fatal("a refund without the sol-refund-v1 memo was accepted")
+	}
+	memo, _ := json.Marshal(refundMemo("original-payment"))
+	tx.Transaction.Message.Instructions[1].Parsed = memo
+	if err := checkPaymentWithAge(tx, "payer", "treasury", 3000, refundMemo("original-payment"), time.Now(), 0); err != nil {
+		t.Fatalf("refund bound to the original payment was rejected: %v", err)
 	}
 }
 
@@ -225,6 +243,38 @@ func TestGetTransactionRequiresFinality(t *testing.T) {
 	}
 	if commitment != "finalized" {
 		t.Fatalf("got commitment %q, want finalized", commitment)
+	}
+}
+
+func TestDotEnvFillsOnlyMissingValues(t *testing.T) {
+	t.Setenv("SOLANA_RPC_URL", "")
+	applyDotEnv([]byte("# comment\nSOLANA_RPC_URL=\"https://devnet.example/?api-key=secret\"\n"))
+	if got := os.Getenv("SOLANA_RPC_URL"); got != "https://devnet.example/?api-key=secret" {
+		t.Fatalf("got %q", got)
+	}
+	if redactRPC(os.Getenv("SOLANA_RPC_URL")) != "https://devnet.example/" {
+		t.Fatalf("redacted %q", redactRPC(os.Getenv("SOLANA_RPC_URL")))
+	}
+	applyDotEnv([]byte("SOLANA_RPC_URL=https://other.example\n"))
+	if got := os.Getenv("SOLANA_RPC_URL"); got != "https://devnet.example/?api-key=secret" {
+		t.Fatalf("existing value was replaced with %q", got)
+	}
+}
+
+type secretTrip struct{}
+
+func (secretTrip) RoundTrip(r *http.Request) (*http.Response, error) {
+	return nil, errors.New("Post \"" + r.URL.String() + "\": no such host")
+}
+
+func TestRPCErrorHidesTheQuery(t *testing.T) {
+	rpc := &solanaRPC{url: "https://devnet.example/?api-key=secret", client: &http.Client{Transport: secretTrip{}}}
+	err := rpc.callOnce(context.Background(), "getHealth", nil, new(json.RawMessage))
+	if err == nil || strings.Contains(err.Error(), "api-key") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("query leaked: %v", err)
+	}
+	if !strings.Contains(err.Error(), "https://devnet.example/") {
+		t.Fatalf("redacted host missing: %v", err)
 	}
 }
 
@@ -290,7 +340,7 @@ func TestValidateCoupons(t *testing.T) {
 }
 
 func TestPrepareHidesOtherProgram(t *testing.T) {
-	app := &App{cfg: Config{ProgramID: "H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr", CouponPriceLamports: 1_000_000}}
+	app := &App{cfg: Config{ProgramID: "AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX", CouponPriceLamports: 1_000_000}}
 	event := Event{
 		GameCount: 7,
 		StartTime: time.Now().Add(time.Hour),
@@ -353,7 +403,7 @@ func TestEventStatus(t *testing.T) {
 }
 
 func TestPrepareRemembersHiddenVault(t *testing.T) {
-	app := &App{cfg: Config{ProgramID: "H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr"}}
+	app := &App{cfg: Config{ProgramID: "AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX"}}
 	event := Event{GameCount: 7, Chain: &ChainVault{ProgramID: "11111111111111111111111111111111"}}
 	app.prepare(&event, time.Now())
 	if event.Chain != nil || !event.hasVault {
@@ -366,7 +416,7 @@ func TestPrepareRemembersHiddenVault(t *testing.T) {
 	}
 }
 
-const testProgram = "H4x1HKyzxCgLEJDWHpSERvr4YveennDDPH3VdjkG97tr"
+const testProgram = "AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX"
 
 func pubkeyBytes(t *testing.T, address string) []byte {
 	t.Helper()
