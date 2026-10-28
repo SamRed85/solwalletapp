@@ -78,6 +78,8 @@ import { formatDate, formatSol, statusColors } from '@/utils/format'
 const phantomInstalled = ref(isPhantomInstalled())
 const events = ref([])
 const loading = ref(false)
+
+const newestFirst = (a, b) => new Date(b.createdAt || b.startTime) - new Date(a.createdAt || a.startTime)
 let phantomTimer
 
 onMounted(() => {
@@ -91,7 +93,7 @@ onUnmounted(() => clearInterval(phantomTimer))
 async function loadEvents () {
   loading.value = true
   try {
-    events.value = await eventApi.list()
+    events.value = (await eventApi.list()).sort(newestFirst)
   } catch (error) {
     notifyError(error)
   } finally {

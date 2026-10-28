@@ -9,7 +9,7 @@
         A name can be changed, and a user can be removed, only when they have no coupons on an event still in play.
         Wallet addresses cannot be changed.
       </v-card-subtitle>
-      <v-data-table :headers="headers" :items="users" :loading="loading" item-value="walletAddress">
+      <v-data-table :headers="headers" :items="users" :loading="loading" :sort-by="[{ key: 'lastLoginAt', order: 'desc' }]" item-value="walletAddress">
         <template #[`item.displayName`]="{ value }">{{ value || '—' }}</template>
         <template #[`item.walletAddress`]="{ value }">
           <code>{{ value }}</code>

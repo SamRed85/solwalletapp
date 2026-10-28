@@ -28,6 +28,7 @@
         Entries close {{ when(chain.deadline) }} · reveals and results from {{ when(chain.endTime) }} ·
         anyone can refund the event if it is not resolved by {{ when(chain.resolveTimeout) }}
       </p>
+      <p v-if="auth.isAdmin && event.autoResolveBlock" class="text-caption">{{ event.autoResolveBlock }}</p>
       <v-table density="compact" class="my-2">
         <thead>
           <tr><th>Correct</th><th>Share</th><th>{{ settled ? 'Rows' : 'Pot so far' }}</th><th v-if="settled">Each row wins</th></tr>
@@ -72,14 +73,32 @@
       <div class="text-subtitle-2 mb-1">Result signer</div>
       <p v-if="!resultsOpen" class="text-caption text-medium-emphasis mb-2">Results can be approved from {{ when(resultsFrom) }}.</p>
       <template v-else>
-        <div v-for="(game, index) in event.games" :key="index" class="d-flex align-center flex-wrap ga-2">
+        <p v-if="standingText" class="text-body-2 mb-2">
+          Scores as they stand: <strong>{{ standingText }}</strong>
+        </p>
+        <p v-else class="text-caption text-medium-emphasis mb-2">
+          The score feed has no result for every match yet. Refresh scores, then match each choice to the result shown beside the game.
+        </p>
+        <div v-for="(game, index) in event.games" :key="index" class="d-flex align-center flex-wrap ga-2 mb-1">
           <span class="game-label">{{ index + 1 }}. {{ game.homeTeam }} vs {{ game.awayTeam }}</span>
+          <MatchScore :game="standingGame(index)" :kickoff="game.kickoff" />
+          <strong v-if="standingGame(index)?.projected">{{ standingGame(index).projected }}</strong>
+          <span v-if="standingGame(index)?.projected && !standingGame(index).final" class="text-caption text-medium-emphasis">still in play</span>
           <v-btn-toggle v-model="draft[index]" density="compact" divided>
             <v-btn v-for="value in ['1', 'X', '2']" :key="value" :value="value" size="small">{{ value }}</v-btn>
             <v-btn value="C" size="small" color="warning" title="Void: every pick on this game counts as correct">Void</v-btn>
           </v-btn-toggle>
         </div>
+        <div class="d-flex flex-wrap ga-2 mt-2">
+          <v-btn size="small" variant="tonal" prepend-icon="mdi-check-all" :disabled="!standingReady" @click="useStanding">
+            Use these results
+          </v-btn>
+          <v-btn v-if="auth.isAdmin" size="small" variant="text" prepend-icon="mdi-refresh" :loading="refreshingScores" @click="refreshStanding">
+            Refresh scores
+          </v-btn>
+        </div>
         <p class="text-caption text-medium-emphasis mt-2">
+          Use these results fills the choices from the scores above. A match still in play can change before you approve.
           A void game (postponed or abandoned) counts as correct for every coupon. Both result signers must approve
           exactly the same results, each from their own wallet.
         </p>
@@ -111,6 +130,7 @@
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
+import MatchScore from '@/components/MatchScore.vue'
 import { eventApi } from '@/services/api'
 import { scoreNextSlip } from '@/services/entry'
 import {
@@ -135,6 +155,8 @@ const busy = ref(null)
 const progress = ref('')
 const error = ref('')
 const draft = ref([])
+const projection = ref(null)
+const refreshingScores = ref(false)
 const now = ref(Math.floor(Date.now() / 1000))
 
 const address = computed(() => props.event.chain.address || eventPda(props.event.chain.admin, props.event.chain.nonce))
@@ -150,6 +172,13 @@ const approvedBy = computed(() => (signers.value?.members ?? []).filter((_, inde
 const resultsFrom = computed(() => Math.max(chain.value.revealDeadline, chain.value.endTime))
 const resultsOpen = computed(() => now.value >= resultsFrom.value && now.value < chain.value.resolveTimeout)
 const draftComplete = computed(() => draft.value.length === chain.value?.gameCount && draft.value.every(Boolean))
+const standingText = computed(() => {
+  const games = projection.value?.games
+  if (!games?.length || games.length !== chain.value?.gameCount) return ''
+  if (!games.every(game => ['1', 'X', '2'].includes(game.projected))) return ''
+  return games.map(game => game.projected).join('')
+})
+const standingReady = computed(() => standingText.value.length === chain.value?.gameCount)
 const canExpire = computed(() => chain.value.status === 'open' && now.value >= chain.value.resolveTimeout)
 const canPassRollover = computed(() => ['resolved', 'cancelled'].includes(chain.value.status) && chain.value.rolloverOut > 0n && !chain.value.rolloverForwarded)
 const cosignerMissing = computed(() => signers.value?.members.includes(RESULT_COSIGNER) && !approvedBy.value.includes(RESULT_COSIGNER))
@@ -159,6 +188,44 @@ const tierRows = computed(() => chain.value.tiers.map(tier => {
   const pot = chain.value.sales * BigInt(tier.percent) / 100n + (tier.correct === chain.value.gameCount ? chain.value.rolloverIn : 0n)
   return { ...tier, pot, rows: Number(chain.value.winners[tier.correct]), perWinner: chain.value.perWinner[tier.correct - 1] }
 }))
+
+function standingGame (index) {
+  return projection.value?.games?.[index] || null
+}
+
+function useStanding () {
+  if (!standingReady.value) return
+  draft.value = projection.value.games.map(game => game.projected)
+}
+
+function fillFinalScores () {
+  const games = projection.value?.games
+  if (!chain.value || !games || games.length !== chain.value.gameCount) return
+  if (draft.value.some(Boolean)) return
+  if (!games.every(game => game.final && ['1', 'X', '2'].includes(game.projected))) return
+  draft.value = games.map(game => game.projected)
+}
+
+async function loadStanding () {
+  try {
+    projection.value = await eventApi.projection(props.event.id)
+    fillFinalScores()
+  } catch {
+    projection.value = null
+  }
+}
+
+async function refreshStanding () {
+  refreshingScores.value = true
+  try {
+    projection.value = await eventApi.refreshScores(props.event.id)
+    fillFinalScores()
+  } catch (err) {
+    notifyError(err)
+  } finally {
+    refreshingScores.value = false
+  }
+}
 
 function alreadyApproved (kind) {
   if (!chain.value || chain.value.proposalKind !== kind || !approvedBy.value.includes(auth.wallet)) return false
@@ -185,6 +252,7 @@ async function load () {
     if (draft.value.length !== state.gameCount) {
       draft.value = state.proposalKind === 'resolve' ? [...state.proposalResults] : Array(state.gameCount).fill(null)
     }
+    await loadStanding()
     if (state.status !== (props.event.chain?.status || 'open') && syncedFor !== `${props.event.id}:${state.status}`) {
       syncedFor = `${props.event.id}:${state.status}`
       eventApi.syncChain(props.event.id).then(() => emit('changed')).catch(() => {})

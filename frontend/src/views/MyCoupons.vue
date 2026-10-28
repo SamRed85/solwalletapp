@@ -7,7 +7,7 @@
     />
 
     <v-alert
-      v-for="p in pending" :key="p.signature" type="warning" variant="tonal" class="mb-4"
+      v-for="p in newestPending" :key="p.signature" type="warning" variant="tonal" class="mb-4"
       title="Payment not registered yet"
     >
       You paid {{ formatSol(p.lamports) }} for {{ (p.combinations || p.coupons?.length || 0).toLocaleString() }} combination(s) in {{ p.eventTitle }},
@@ -54,7 +54,7 @@
         <v-chip size="small" variant="flat" :color="concealed(row.id, hasOutcome(row)) ? 'default' : row.color">{{ chipText(row) }}</v-chip>
       </v-card-title>
       <v-card-subtitle class="text-wrap">
-        Coupon #{{ row.index + 1 }} · {{ row.combinations.toLocaleString() }} combination(s) · paid {{ formatSol(row.lamports) }}
+        Coupon #{{ row.index + 1 }} · {{ row.combinations.toLocaleString() }} combination(s)
         <template v-if="row.address && !row.slip"> · <a :href="explorerAddress(row.address)" target="_blank" rel="noopener">account</a></template>
       </v-card-subtitle>
       <v-card-text v-if="folded(row.id)" class="text-medium-emphasis open-row" @click="toggle(row.id)">
@@ -169,8 +169,10 @@ import { notify, notifyError } from '@/stores/notify'
 import { explorerAddress, explorerTx, formatDate, formatSol, statusColors } from '@/utils/format'
 
 const entries = ref([])
+const openEvent = ref('')
 const projections = ref({})
 const pending = ref([])
+const newestPending = computed(() => [...pending.value].sort((a, b) => (b.paidAt || 0) - (a.paidAt || 0)))
 const loading = ref(false)
 const retrying = ref(null)
 const recovering = ref(null)
@@ -321,7 +323,7 @@ async function loadChain () {
       admin: event?.chain?.admin ?? state?.admin ?? local?.admin, nonce: event?.chain?.nonce ?? local?.nonce ?? state?.nonce,
       deadline: state?.deadline, revealDeadline: state?.revealDeadline,
       canSchedule: state?.status === 'open' && now < state.deadline && !coupon.revealed && !!local?.revealNonce && !!system,
-      system, revealNonce: local?.revealNonce,
+      system, revealNonce: local?.revealNonce, placedAt: local?.placedAt || 0,
       results: state?.status === 'resolved' && coupon.revealed ? state.results : '',
       games: event?.games ?? [],
       ...describe(coupon, local, state, now)
@@ -354,7 +356,7 @@ async function loadChain () {
     const canReveal = state?.status === 'open' && now < state.revealDeadline
     return canReveal && !coupon.revealed && !backupMatches(auth.wallet, savedById.get(coupon.address), coupon)
   }).length
-  chainRows.value = rows
+  chainRows.value = rows.sort((a, b) => (b.placedAt || 0) - (a.placedAt || 0) || (b.index ?? 0) - (a.index ?? 0))
   armQuiet(rows)
   loadProjections()
 }
@@ -456,7 +458,13 @@ async function load () {
   loadChain().catch(notifyError)
   loading.value = true
   try {
-    entries.value = await entryApi.mine()
+    entries.value = (await entryApi.mine()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    try {
+      const rounds = await eventApi.list()
+      openEvent.value = rounds.find(round => round.status === 'open')?.id || ''
+    } catch {
+      openEvent.value = ''
+    }
     const registered = new Set(entries.value.map(e => e.signature))
     for (const p of pending.value.filter(p => registered.has(p.signature))) removePending(auth.wallet, p.signature)
     pending.value = loadPending(auth.wallet)

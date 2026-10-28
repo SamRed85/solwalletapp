@@ -176,7 +176,7 @@ pub mod predictions {
     /// is the next free one, so an earlier index cannot be submitted again.
     pub fn place_slip(ctx: Context<PlaceSlip>, slip: SlipArg, proof: Vec<[u8; 32]>) -> Result<()> {
         require!(!ctx.accounts.gate.paused, PredError::Paused);
-        require!(proof.len() == SLIP_DEPTH, PredError::BadPicks);
+        let proof = slip_proof(&proof)?;
         let event = &mut ctx.accounts.event;
         require!(event.status == EventStatus::Open, PredError::BadStatus);
         require!(Clock::get()?.unix_timestamp < event.deadline, PredError::DeadlinePassed);
@@ -436,12 +436,12 @@ pub mod predictions {
         require!(event.status == EventStatus::Resolved, PredError::BadStatus);
         let amount = payout_for(&ctx.accounts.coupon, event)?;
         if amount > 0 {
-            transfer_from_vault(
-                &ctx.accounts.vault.to_account_info(),
-                &ctx.accounts.owner.to_account_info(),
-                amount,
-                event.rent_reserve,
-            )?;
+        transfer_from_vault(
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.owner.to_account_info(),
+            amount,
+            event.rent_reserve,
+        )?;
         }
         Ok(())
     }
@@ -664,21 +664,35 @@ fn check_reveal(reveal: &RevealArg, game_count: u8) -> Result<()> {
     Ok(())
 }
 
+/// A proof may stop once every remaining sibling is an empty subtree. Those hashes are
+/// filled back in here, so the root is still folded through all `SLIP_DEPTH` levels.
+fn slip_proof(proof: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
+    require!(proof.len() <= SLIP_DEPTH, PredError::BadPicks);
+    let mut full = Vec::with_capacity(SLIP_DEPTH);
+    full.extend_from_slice(proof);
+    while full.len() < SLIP_DEPTH {
+        let depth = full.len();
+        full.push(slip_zero(depth));
+    }
+    Ok(full)
+}
+
 fn prove_empty(root: &[u8; 32], index: u32, proof: &[[u8; 32]]) -> Result<()> {
-    require!(proof.len() == SLIP_DEPTH, PredError::BadPicks);
-    require!(slip_fold(index, &slip_zero(0), proof) == *root, PredError::BadCommitment);
+    let proof = slip_proof(proof)?;
+    require!(slip_fold(index, &slip_zero(0), &proof) == *root, PredError::BadCommitment);
     Ok(())
 }
 
 fn require_leaf(root: &[u8; 32], index: u32, leaf: &[u8; 32], proof: &[[u8; 32]]) -> Result<()> {
-    require!(proof.len() == SLIP_DEPTH, PredError::BadPicks);
-    require!(slip_fold(index, leaf, proof) == *root, PredError::BadCommitment);
+    let proof = slip_proof(proof)?;
+    require!(slip_fold(index, leaf, &proof) == *root, PredError::BadCommitment);
     Ok(())
 }
 
 fn write_leaf(root: &mut [u8; 32], index: u32, proof: &[[u8; 32]], leaf: &[u8; 32]) -> Result<()> {
-    prove_empty(root, index, proof)?;
-    *root = slip_fold(index, leaf, proof);
+    let proof = slip_proof(proof)?;
+    require!(slip_fold(index, &slip_zero(0), &proof) == *root, PredError::BadCommitment);
+    *root = slip_fold(index, leaf, &proof);
     Ok(())
 }
 
@@ -1378,4 +1392,22 @@ pub struct ExecuteUpgrade<'info> {
     pub spill: UncheckedAccount<'info>,
     pub rent: Sysvar<'info, Rent>,
     pub clock: Sysvar<'info, Clock>,
+}
+
+#[cfg(test)]
+mod slip_proof_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_proof_matches_the_full_empty_tail() {
+        let full: Vec<[u8; 32]> = (0..SLIP_DEPTH).map(slip_zero).collect();
+        let short = slip_proof(&full[..3]).unwrap();
+        assert_eq!(short, full);
+        let leaf = slip_leaf(4, &Pubkey::default(), 1, &[7; 32]);
+        assert_eq!(slip_fold(4, &leaf, &short), slip_fold(4, &leaf, &full));
+        assert!(slip_proof(&full).is_ok());
+        let mut too_long = full.clone();
+        too_long.push(slip_zero(0));
+        assert!(slip_proof(&too_long).is_err());
+    }
 }

@@ -21,6 +21,8 @@ const COUNCIL_SIGNER = '4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH'
 const COUNCIL = 'D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt'
 const BUFFER_HEADER = 37
 const PROGRAM_DATA_HEADER = 45
+// Devnet rejects an ExtendProgram smaller than 10 KiB unless it reaches the account maximum.
+const MINIMUM_EXTEND_BYTES = 10240
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../programs/predictions')
 const elf = readFileSync(resolve(root, 'target/deploy/predictions.so'))
@@ -307,7 +309,8 @@ const authority = raw[12] === 1 ? base58Encode(raw.subarray(13, 45)) : ''
 if (authority !== DEPLOYER) throw new Error(`upgrade authority is ${authority}`)
 const needed = PROGRAM_DATA_HEADER + elf.length
 if (raw.length < needed) {
-  const additional = needed - raw.length
+  const shortfall = needed - raw.length
+  const additional = Math.max(shortfall, MINIMUM_EXTEND_BYTES)
   const slot = await rpc('getSlot', [{ commitment: 'confirmed' }])
   console.log(`extending program data by ${additional} bytes`)
   console.log(await send([deployer], [extendProgramIx(additional)]))

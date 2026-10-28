@@ -27,7 +27,8 @@ export function standingResults (projection) {
 }
 
 // The figure is what this coupon would pay if the current scores do not change.
-// Before the reveal window closes it is the maximum for this coupon alone.
+// Each tier pot is split equally across every revealed row in that tier. Until those
+// rows are known, the figure is the maximum for this coupon alone.
 export function projectCoupon (system, projection) {
   if (!projection?.complete || !system?.length || system.some(game => !game)) return null
   if (projection.games.length !== system.length) return null
@@ -49,4 +50,31 @@ export function projectCoupon (system, projection) {
   }).sort((a, b) => b.correct - a.correct)
   const total = lines.reduce((sum, line) => sum + line.each * BigInt(line.rows), 0n)
   return { best, games: system.length, lines, total, maximum: !!projection.maximum }
+}
+
+// Every coupon on this event is added into one row count, the same columns a single coupon shows.
+export function combinedScore (systems, results, tiers, maximum) {
+  if (!results || !systems?.length) return null
+  if (systems.some(system => system.length !== results.length || system.some(game => !game))) return null
+  const counts = new Array(results.length + 1).fill(0)
+  for (const system of systems) {
+    correctCounts(picksFromSystem(system), results).forEach((rows, score) => {
+      counts[score] += rows
+    })
+  }
+  let best = 0
+  for (let score = counts.length - 1; score > 0; score--) {
+    if (counts[score]) {
+      best = score
+      break
+    }
+  }
+  const lines = (tiers ?? []).flatMap(tier => {
+    const rows = counts[tier.correct] ?? 0
+    if (!rows) return []
+    const pot = BigInt(tier.potLamports || 0)
+    const each = maximum ? pot / BigInt(rows) : BigInt(tier.perWinnerLamports || 0)
+    return [{ correct: tier.correct, rows, each }]
+  }).sort((a, b) => b.correct - a.correct)
+  return { best, games: results.length, lines, maximum: !!maximum }
 }

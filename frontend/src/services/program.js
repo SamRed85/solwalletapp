@@ -1,6 +1,7 @@
 import { ed25519 } from '@noble/curves/ed25519'
 import { sha256 } from '@noble/hashes/sha256'
 import { base58Decode, base58Encode, getAccount, getProgramAccounts, latestBlockhash, signAndSendTransaction } from './solana.js'
+import { slipZero } from './slipTree.js'
 
 export const PROGRAM_ID = 'AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX'
 export const SYSTEM_PROGRAM = '11111111111111111111111111111111'
@@ -436,7 +437,7 @@ export function serializeTransaction (compiled) {
     throw new Error(`No signer for ${address}`)
   })
   const transaction = concat([compactU16(signatures.length), ...signatures, compiled.message])
-  if (transaction.length > 1232) throw new Error('The transaction is too large; use a smaller batch')
+  if (transaction.length > 1232) throw new Error('The transaction is too large for Solana')
   return transaction
 }
 
@@ -459,8 +460,23 @@ export function slipsPda (event) {
   return findPda([text('slips'), base58Decode(event, 32)])
 }
 
+function sameProofNode (left, right) {
+  if (left.length !== right.length) return false
+  for (let index = 0; index < left.length; index += 1) if (left[index] !== right[index]) return false
+  return true
+}
+
+// Empty subtrees sit at the end of a proof. The program fills those hashes itself,
+// which keeps a count of several coupons inside Solana's transaction size limit.
+function compactProof (proof) {
+  let end = proof.length
+  while (end > 0 && sameProofNode(proof[end - 1], slipZero(end - 1))) end -= 1
+  return proof.slice(0, end)
+}
+
 function proofBytes (proof) {
-  return concat([u32(proof.length), ...proof])
+  const compact = compactProof(proof)
+  return concat([u32(compact.length), ...compact])
 }
 
 function revealArg ({ index, owner, combinations, picks, revealNonce, commitment }) {

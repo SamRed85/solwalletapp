@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { kickoffLabel, matchClock, projectCoupon, standingResults } from '../src/services/projection.js'
+import { combinedScore, kickoffLabel, matchClock, projectCoupon, standingResults } from '../src/services/projection.js'
 
 const projection = {
   complete: true,
@@ -25,6 +25,24 @@ test('several rows of this coupon share one tier instead of each taking the whol
   const lower = view.lines.find(line => line.correct === 1)
   assert.equal(lower.rows, 2)
   assert.equal(lower.each, 125n)
+})
+
+test('every row in a tier takes the same share, however many rows this coupon has', () => {
+  const shared = {
+    ...projection,
+    maximum: false,
+    tiers: [
+      { correct: 2, potLamports: 1500, perWinnerLamports: 100 },
+      { correct: 1, potLamports: 250, perWinnerLamports: 10 }
+    ]
+  }
+  const one = projectCoupon(['1', 'X'], shared)
+  const wider = projectCoupon(['1X', 'X'], shared)
+  const twoCorrect = wider.lines.find(line => line.correct === 2)
+  assert.equal(one.lines[0].each, 100n)
+  assert.equal(twoCorrect.each, 100n)
+  assert.equal(one.total, 100n)
+  assert.equal(wider.total, 110n)
 })
 
 test('after the reveal window the shared payout is used', () => {
@@ -55,6 +73,22 @@ test('a match that has not started stands as X beside the live score', () => {
     games: [{ projected: '1', homeGoals: 2, awayGoals: 1 }, { projected: 'X', status: 'NS' }]
   }), '1X')
   assert.equal(standingResults({ games: [{ projected: '1' }, { projected: '' }] }), '')
+})
+
+test('rows from every coupon on an event are added together', () => {
+  const tiers = [
+    { correct: 2, potLamports: 700, perWinnerLamports: 100 },
+    { correct: 1, potLamports: 250, perWinnerLamports: 10 }
+  ]
+  const view = combinedScore([['1', 'X'], ['1X', 'X']], '1X', tiers, false)
+  assert.equal(view.best, 2)
+  assert.equal(view.lines.find(line => line.correct === 2).rows, 2)
+  assert.equal(view.lines.find(line => line.correct === 2).each, 100n)
+  assert.equal(view.lines.find(line => line.correct === 1).rows, 1)
+  const alone = projectCoupon(['1', 'X'], { ...projection, maximum: false, tiers })
+  const same = combinedScore([['1', 'X']], '1X', tiers, false)
+  assert.equal(same.lines[0].each, alone.lines[0].each)
+  assert.equal(same.lines[0].rows, alone.lines[0].rows)
 })
 
 test('a match without a score has no payout', () => {

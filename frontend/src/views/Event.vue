@@ -70,27 +70,59 @@
           A live score is what the match shows now. It is not the settled result.
         </v-card-subtitle>
         <v-table density="compact">
-          <thead><tr><th>#</th><th>Game</th><th>Kickoff</th><th>Result</th></tr></thead>
+          <thead><tr><th>#</th><th>Game</th><th>Kickoff</th><th class="text-right">Result</th></tr></thead>
           <tbody>
             <tr v-for="(game, index) in event.games" :key="index">
               <td>{{ index + 1 }}</td>
               <td>{{ game.homeTeam }} vs {{ game.awayTeam }}</td>
               <td>{{ formatDate(game.kickoff) }}</td>
-              <td>
-                <template v-if="game.result">
-                  <strong>{{ game.result === 'C' ? 'Void' : game.result }}</strong>
-                  <v-chip v-if="game.result === 'C'" size="x-small" color="warning" class="ml-2">counts for every pick</v-chip>
-                  <v-chip v-else-if="game.cancelled" size="x-small" color="warning" class="ml-2">cancelled, drawn</v-chip>
-                  <div v-if="game.draw" class="text-caption text-medium-emphasis">
-                    Weights 1/X/2: {{ game.draw.weights.join(' / ') }} ·
-                    <a :href="explorerBlock(game.draw.slot)" target="_blank" rel="noopener">block {{ game.draw.slot }}</a>
-                  </div>
-                </template>
-                <MatchScore v-else :game="projection?.games?.[index]" :kickoff="game.kickoff" />
+              <td class="result-cell">
+                <div class="result-line">
+                  <MatchScore
+                    v-if="liveGame(index)?.linked"
+                    :game="liveGame(index)"
+                    :kickoff="game.kickoff"
+                    :placeholder="!game.result"
+                    :finished="game.result === '1' || game.result === 'X' || game.result === '2'"
+                  >
+                    <span class="marks">
+                      <span v-for="mark in marksFor(game)" :key="mark" class="mark" :class="{ on: mark === outcomeAt(index) }">{{ mark }}</span>
+                    </span>
+                  </MatchScore>
+                  <span v-else class="marks">
+                    <span v-for="mark in marksFor(game)" :key="mark" class="mark" :class="{ on: mark === outcomeAt(index) }">{{ mark }}</span>
+                  </span>
+                </div>
+                <div v-if="game.draw" class="text-caption text-medium-emphasis">
+                  Weights 1/X/2: {{ game.draw.weights.join(' / ') }} ·
+                  <a :href="explorerBlock(game.draw.slot)" target="_blank" rel="noopener">block {{ game.draw.slot }}</a>
+                </div>
               </td>
             </tr>
           </tbody>
         </v-table>
+        <v-card-text v-if="allRows.length || projection">
+          <div class="text-subtitle-2">All rows</div>
+          <div v-if="!allRows.length" class="text-caption text-medium-emphasis">
+            The totals appear once every match has a score.
+          </div>
+          <template v-else>
+            <div class="text-caption text-medium-emphasis mb-1">
+              <template v-if="officialResults">Every revealed row in this event.</template>
+              <template v-else>If these scores stand. Counted from revealed coupons. Hidden coupons are not included yet.</template>
+            </div>
+            <v-table density="compact">
+              <thead><tr><th>Correct</th><th>Rows</th><th>Each row wins</th></tr></thead>
+              <tbody>
+                <tr v-for="row in allRows" :key="row.correct">
+                  <td>{{ row.correct }} of {{ event.gameCount }}</td>
+                  <td>{{ Number(row.rows).toLocaleString() }}</td>
+                  <td>{{ row.rows ? formatSol(row.each) : 'rolls over' }}</td>
+                </tr>
+              </tbody>
+            </v-table>
+          </template>
+        </v-card-text>
         <v-card-actions v-if="event.status === 'completed'">
           <v-btn color="primary" prepend-icon="mdi-ticket" to="/coupons">See my coupons</v-btn>
         </v-card-actions>
@@ -240,8 +272,35 @@ async function refreshScores () {
   }
 }
 
+function liveGame (index) {
+  return projection.value?.games?.[index] || null
+}
+
+function outcomeAt (index) {
+  const official = event.value?.games?.[index]?.result
+  if (official === '1' || official === 'X' || official === '2' || official === 'C') return official
+  return liveGame(index)?.projected || ''
+}
+
+function marksFor (game) {
+  return game.result === 'C' ? ['C'] : ['1', 'X', '2']
+}
+
+const officialResults = computed(() => {
+  const games = event.value?.games
+  if (!games?.length || games.some(game => !game.result || !'1X2C'.includes(game.result))) return ''
+  return games.map(game => game.result).join('')
+})
+
+const allRows = computed(() => {
+  const rows = projection.value?.rows || []
+  const paying = new Set((event.value?.tiers || []).map(tier => tier.correct))
+  if (!paying.size) return rows
+  return rows.filter(row => paying.has(row.correct))
+})
+
 async function loadProjection () {
-  if (!event.value || event.value.status === 'completed') {
+  if (!event.value?.games?.some(game => game.fixtureId)) {
     projection.value = null
     return
   }
@@ -268,7 +327,7 @@ function togglePick (game, outcome) {
 }
 
 function selectAll (outcome) {
-  picks.value = picks.value.map(() => [outcome])
+  picks.value = picks.value.map(selected => selected.includes(outcome) ? selected : [...selected, outcome])
 }
 
 function clearPicks () {
@@ -343,4 +402,30 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
 <style scoped>
 .game-row { border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .game-cell { flex: 1 1 220px; }
+.result-cell { text-align: right; }
+.result-line {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+.marks { display: inline-flex; gap: 4px; }
+.mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.16);
+  background: transparent;
+  color: rgba(var(--v-theme-on-surface), 0.45);
+  font-weight: 700;
+  font-size: 13px;
+}
+.mark.on {
+  border-color: transparent;
+  background: rgba(var(--v-theme-on-surface), 0.14);
+  color: rgb(var(--v-theme-on-surface));
+}
 </style>

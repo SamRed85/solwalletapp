@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 const footballBase = "https://v3.football.api-sports.io"
@@ -41,6 +43,15 @@ type projectionView struct {
 	SalesLamports      uint64           `json:"salesLamports"`
 	RolloverInLamports uint64           `json:"rolloverInLamports"`
 	Tiers              []TierPayout     `json:"tiers"`
+	Rows               []correctRow     `json:"rows,omitempty"`
+}
+
+// A correct row is how many paid rows in the whole event have that many games right,
+// and what one of those rows wins if the scores stay as they are.
+type correctRow struct {
+	Correct int    `json:"correct"`
+	Rows    int    `json:"rows"`
+	Each    uint64 `json:"each"`
 }
 
 type fixtureState struct {
@@ -88,6 +99,7 @@ type cachedDay struct {
 
 type cachedCounts struct {
 	at      time.Time
+	results string
 	winners map[int]int
 }
 
@@ -131,7 +143,8 @@ func dueScoreMarks(start, now time.Time, done map[string]bool, eventID string) [
 // change a draw after regular time. A match that has not started counts as X.
 func projectFixture(state fixtureState) (outcome string, home, away *int, final bool) {
 	switch state.Status {
-	case "NS", "TBD":
+	case "NS", "TBD", "PST":
+		// A match that has not been played stands as a draw, so a coupon can show its forecast.
 		return "X", nil, nil, false
 	case "1H", "HT", "2H", "LIVE", "SUSP", "INT":
 		if state.Home == nil || state.Away == nil {
@@ -189,6 +202,8 @@ func buildProjection(games []Game, scores map[int]fixtureState, now, end time.Ti
 				row.AwayGoals = away
 				row.Projected = outcome
 				row.Final = final
+			} else if !now.After(game.Kickoff) || game.Kickoff.IsZero() {
+				row.Projected = "X"
 			}
 		}
 		if row.Projected == "" {
@@ -199,10 +214,22 @@ func buildProjection(games []Game, scores map[int]fixtureState, now, end time.Ti
 		view.Games[i] = row
 	}
 	view.Complete = complete
+	if winners != nil {
+		view.Rows = rowsFromWinners(tiers, winners, len(games), sales, rollover)
+	}
 	if !complete {
 		return view
 	}
-	view.Maximum = !view.RevealClosed
+	// A known set of revealed rows shares each tier pot. Until any row is revealed, the
+	// figure is the maximum this coupon could take on its own.
+	shared := false
+	for _, rows := range winners {
+		if rows > 0 {
+			shared = true
+			break
+		}
+	}
+	view.Maximum = !view.RevealClosed && !shared
 	if view.Maximum {
 		winners = map[int]int{}
 		for _, tier := range tiers {
@@ -211,6 +238,53 @@ func buildProjection(games []Game, scores map[int]fixtureState, now, end time.Ti
 	}
 	view.Tiers = settleCounts(0, winners, len(games), sales, rollover, tiers).Tiers
 	return view
+}
+
+func rowsFromWinners(tiers []Tier, winners map[int]int, gameCount int, sales, rollover uint64) []correctRow {
+	ordered := append([]Tier(nil), tiers...)
+	sortTiers(ordered)
+	rows := make([]correctRow, 0, len(ordered))
+	for _, tier := range ordered {
+		n := winners[tier.Correct]
+		pot := sales * uint64(tier.Percent) / 100
+		if tier.Correct == gameCount {
+			pot += rollover
+		}
+		var each uint64
+		if n > 0 {
+			each = pot / uint64(n)
+		}
+		rows = append(rows, correctRow{Correct: tier.Correct, Rows: n, Each: each})
+	}
+	return rows
+}
+
+func standingOf(view projectionView) string {
+	if !view.Complete || len(view.Games) == 0 {
+		return ""
+	}
+	out := make([]byte, len(view.Games))
+	for i, game := range view.Games {
+		if len(game.Projected) != 1 {
+			return ""
+		}
+		out[i] = game.Projected[0]
+	}
+	return string(out)
+}
+
+func officialResults(games []Game) string {
+	if len(games) == 0 {
+		return ""
+	}
+	out := make([]byte, len(games))
+	for i, game := range games {
+		if len(game.Result) != 1 || !strings.ContainsRune("1X2C", rune(game.Result[0])) {
+			return ""
+		}
+		out[i] = game.Result[0]
+	}
+	return string(out)
 }
 
 func addMaskCounts(winners map[int]int, picks []byte, results string) {
@@ -323,7 +397,7 @@ func (a *App) refreshFixtures() {
 	if len(games) == 0 {
 		return
 	}
-	if err = a.feed.loadFixtures(ctx, games); err != nil {
+	if err = a.fetchFixtures(ctx, games); err != nil {
 		log.Printf("football feed: %v", err)
 		return
 	}
@@ -346,7 +420,15 @@ func (f *footballFeed) score(id int) (fixtureState, bool) {
 }
 
 // The free plan rejects fixtures?ids. A day's list includes the live score, and one fixture id is the fallback.
-func (f *footballFeed) loadFixtures(ctx context.Context, games []Game) error {
+func (f *footballFeed) loadFixtures(ctx context.Context, games []Game) (map[int]fixtureState, error) {
+	return f.collectFixtures(ctx, games, false)
+}
+
+func (f *footballFeed) readFixtures(ctx context.Context, games []Game) (map[int]fixtureState, error) {
+	return f.collectFixtures(ctx, games, true)
+}
+
+func (f *footballFeed) collectFixtures(ctx context.Context, games []Game, fresh bool) (map[int]fixtureState, error) {
 	dates := map[string]struct{}{}
 	want := map[int]struct{}{}
 	for _, game := range games {
@@ -360,9 +442,9 @@ func (f *footballFeed) loadFixtures(ctx context.Context, games []Game) error {
 	}
 	found := map[int]fixtureState{}
 	for date := range dates {
-		rows, err := f.rowsOnDate(ctx, date, "")
+		rows, err := f.rowsOnDateMode(ctx, date, "", fresh)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, row := range rows {
 			if _, ok := want[row.Fixture.ID]; ok {
@@ -376,18 +458,109 @@ func (f *footballFeed) loadFixtures(ctx context.Context, games []Game) error {
 		}
 		state, err := f.fixtureByID(ctx, id)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if state.Status != "" {
 			found[id] = state
 		}
+	}
+	f.remember(found)
+	return found, nil
+}
+
+func (f *footballFeed) remember(found map[int]fixtureState) {
+	if len(found) == 0 {
+		return
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for id, state := range found {
 		f.scores[id] = state
 	}
+}
+
+// A stored score is the last feed reading for one fixture. It survives a backend restart.
+type storedFixture struct {
+	ID       int       `bson:"_id,omitempty"`
+	Status   string    `bson:"status"`
+	Elapsed  *int      `bson:"elapsed,omitempty"`
+	Extra    *int      `bson:"extra,omitempty"`
+	Home     *int      `bson:"home,omitempty"`
+	Away     *int      `bson:"away,omitempty"`
+	FullHome *int      `bson:"fullHome,omitempty"`
+	FullAway *int      `bson:"fullAway,omitempty"`
+	Updated  time.Time `bson:"updatedAt"`
+}
+
+func storedFixtureFrom(id int, state fixtureState) storedFixture {
+	return storedFixture{
+		ID: id, Status: state.Status, Elapsed: state.Elapsed, Extra: state.Extra,
+		Home: state.Home, Away: state.Away, FullHome: state.FullHome, FullAway: state.FullAway,
+		Updated: time.Now().UTC(),
+	}
+}
+
+func (doc storedFixture) state() fixtureState {
+	return fixtureState{
+		Status: doc.Status, Elapsed: doc.Elapsed, Extra: doc.Extra,
+		Home: doc.Home, Away: doc.Away, FullHome: doc.FullHome, FullAway: doc.FullAway,
+	}
+}
+
+func (a *App) fetchFixtures(ctx context.Context, games []Game) error {
+	found, err := a.feed.loadFixtures(ctx, games)
+	if err != nil {
+		return err
+	}
+	if err = a.storeFixtures(ctx, found); err != nil {
+		log.Printf("football scores: %v", err)
+	}
 	return nil
+}
+
+func (a *App) storeFixtures(ctx context.Context, found map[int]fixtureState) error {
+	if a.scores == nil || len(found) == 0 {
+		return nil
+	}
+	models := make([]mongo.WriteModel, 0, len(found))
+	for id, state := range found {
+		doc := storedFixtureFrom(id, state)
+		doc.ID = 0
+		models = append(models, mongo.NewUpdateOneModel().
+			SetFilter(bson.M{"_id": id}).
+			SetUpdate(bson.M{"$set": doc}).
+			SetUpsert(true))
+	}
+	_, err := a.scores.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	return err
+}
+
+func (a *App) loadStoredScores(ctx context.Context) {
+	if a.scores == nil || a.feed == nil {
+		return
+	}
+	cur, err := a.scores.Find(ctx, bson.M{})
+	if err != nil {
+		log.Printf("football scores: %v", err)
+		return
+	}
+	defer cur.Close(ctx)
+	found := map[int]fixtureState{}
+	for cur.Next(ctx) {
+		var doc storedFixture
+		if err = cur.Decode(&doc); err != nil {
+			log.Printf("football scores: %v", err)
+			continue
+		}
+		found[doc.ID] = doc.state()
+	}
+	if err = cur.Err(); err != nil {
+		log.Printf("football scores: %v", err)
+	}
+	a.feed.remember(found)
+	if len(found) > 0 {
+		log.Printf("loaded %d stored scores", len(found))
+	}
 }
 
 func (f *footballFeed) fixtureByID(ctx context.Context, id int) (fixtureState, error) {
@@ -470,13 +643,19 @@ func (f *footballFeed) fixturesOnDate(ctx context.Context, date, timezone string
 }
 
 func (f *footballFeed) rowsOnDate(ctx context.Context, date, timezone string) ([]apiFixture, error) {
+	return f.rowsOnDateMode(ctx, date, timezone, false)
+}
+
+func (f *footballFeed) rowsOnDateMode(ctx context.Context, date, timezone string, fresh bool) ([]apiFixture, error) {
 	key := date + "|" + timezone
-	f.mu.Lock()
-	if cached, ok := f.days[key]; ok && time.Since(cached.at) < 10*time.Minute {
+	if !fresh {
+		f.mu.Lock()
+		if cached, ok := f.days[key]; ok && time.Since(cached.at) < 10*time.Minute {
+			f.mu.Unlock()
+			return cached.rows, nil
+		}
 		f.mu.Unlock()
-		return cached.rows, nil
 	}
-	f.mu.Unlock()
 
 	path := "/fixtures?date=" + date
 	if timezone != "" {
@@ -632,7 +811,7 @@ func (a *App) handleRefreshScores(w http.ResponseWriter, r *http.Request) {
 	a.feed.mu.Unlock()
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
-	if err := a.feed.loadFixtures(ctx, e.Games); err != nil {
+	if err := a.fetchFixtures(ctx, e.Games); err != nil {
 		log.Printf("football refresh: %v", err)
 		writeError(w, http.StatusBadGateway, feedMessage(err))
 		return
@@ -660,8 +839,12 @@ func (a *App) handleProjection(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	view := buildProjection(e.Games, scores, now, e.EndTime, sales, rollover, e.Tiers, nil)
-	if view.RevealClosed && view.Complete {
-		view = buildProjection(e.Games, scores, now, e.EndTime, sales, rollover, e.Tiers, a.projectionWinners(ctx, e))
+	standing := standingOf(view)
+	if standing != "" {
+		view = buildProjection(e.Games, scores, now, e.EndTime, sales, rollover, e.Tiers, a.projectionWinners(ctx, e, standing))
+	}
+	if official := officialResults(e.Games); official != "" && official != standing {
+		view.Rows = rowsFromWinners(e.Tiers, a.projectionWinners(ctx, e, official), len(e.Games), sales, rollover)
 	}
 	writeJSON(w, http.StatusOK, view)
 }
@@ -693,17 +876,19 @@ func (a *App) projectionPool(ctx context.Context, e *Event) (sales, rollover uin
 	return sales, rollover
 }
 
-func (a *App) projectionWinners(ctx context.Context, e *Event) map[int]int {
+func (a *App) projectionWinners(ctx context.Context, e *Event, results string) map[int]int {
+	if results == "" || strings.Contains(results, "\x00") {
+		return map[int]int{}
+	}
 	if a.feed != nil {
 		a.feed.mu.Lock()
-		if cached, ok := a.feed.counts[e.ID.Hex()]; ok && time.Since(cached.at) < time.Minute {
+		if cached, ok := a.feed.counts[e.ID.Hex()]; ok && cached.results == results && time.Since(cached.at) < time.Minute {
 			a.feed.mu.Unlock()
 			return cached.winners
 		}
 		a.feed.mu.Unlock()
 	}
 	winners := map[int]int{}
-	results := projectedResults(e.Games, a.feed)
 	if e.Chain != nil && e.Chain.Address != "" {
 		a.addSlipCounts(ctx, e.Chain.Address, results, winners)
 		if len(winners) == 0 {
@@ -714,26 +899,10 @@ func (a *App) projectionWinners(ctx context.Context, e *Event) map[int]int {
 	}
 	if a.feed != nil {
 		a.feed.mu.Lock()
-		a.feed.counts[e.ID.Hex()] = cachedCounts{at: time.Now(), winners: winners}
+		a.feed.counts[e.ID.Hex()] = cachedCounts{at: time.Now(), results: results, winners: winners}
 		a.feed.mu.Unlock()
 	}
 	return winners
-}
-
-func projectedResults(games []Game, feed *footballFeed) string {
-	out := make([]byte, len(games))
-	if feed == nil {
-		return string(out)
-	}
-	feed.mu.Lock()
-	defer feed.mu.Unlock()
-	for i, game := range games {
-		outcome, _, _, _ := projectFixture(feed.scores[game.FixtureID])
-		if outcome != "" {
-			out[i] = outcome[0]
-		}
-	}
-	return string(out)
 }
 
 func (a *App) addSlipCounts(ctx context.Context, event, results string, winners map[int]int) {

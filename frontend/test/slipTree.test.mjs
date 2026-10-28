@@ -24,3 +24,22 @@ test('a proof rebuilt from the archive matches the slip root', () => {
   assert.deepEqual(claimProof[0], slipMark())
   assert.deepEqual(sparseProof([first], 1)[0], first)
 })
+
+test('counting eight coupons fits in one Solana transaction', async () => {
+  globalThis.window = { addEventListener () {} }
+  const { compileMessage, scoreSlipIx, serializeTransaction } = await import('../src/services/program.js')
+  const owner = '11111111111111111111111111111111'
+  const commitment = new Uint8Array(32)
+  const leaves = Array.from({ length: 8 }, (_, index) => slipLeaf(index, owner, 1, commitment))
+  const reveal = {
+    index: 7, owner, combinations: 1, picks: new Uint8Array(13), revealNonce: 0n, commitment
+  }
+  const proof = sparseProof(leaves, 7)
+  const instruction = scoreSlipIx({
+    caller: owner, admin: owner, event: owner, reveal, revealed: true,
+    entryProof: proof, revealProof: proof, scoredProof: proof
+  })
+  const compiled = compileMessage(owner, [instruction], owner)
+  const transaction = serializeTransaction(compiled)
+  assert.ok(transaction.length <= 1232, `score transaction is ${transaction.length} bytes`)
+})

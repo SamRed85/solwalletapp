@@ -65,21 +65,31 @@ todos:
     status: in_progress
     dependencies:
       - phase9_scale_cost
-  - id: phase12_auto_resolve
-    content: "Phase 12: Auto resolve checkbox, on by default, settling only finished games from the score feed"
-    status: pending
+  - id: phase12_auto_count
+    content: "Phase 12: The reveal keeper counts every coupon after results are approved. The manual count stays as a backup."
+    status: completed
     dependencies:
       - phase11_live_payout
-  - id: phase13_interface
-    content: "Phase 13: Professional player site. Europatipset-style coupon, quiet dark shell. No admin restyle. No rule changes."
+  - id: phase13_auto_resolve
+    content: "Phase 13: Auto resolve checkbox, on by default, settling only finished games from the score feed"
+    status: in_progress
+    dependencies:
+      - phase12_auto_count
+  - id: phase14_interface
+    content: "Phase 14: Professional player site. Europatipset-style coupon, quiet dark shell. No admin restyle. No rule changes."
     status: pending
     dependencies:
-      - phase12_auto_resolve
+      - phase13_auto_resolve
+  - id: phase15_canopy
+    content: "Phase 15: Canopy so one score, place, or claim still fits at 1,000,000 coupons. The program refuses coupon 1,000,001. The tree stays depth 20."
+    status: pending
+    dependencies:
+      - phase14_interface
   - id: phase10_audit_mainnet
     content: "Final phase: Tests, fuzzing, external audit, bug bounty, capped mainnet launch. Do not start until the user says start final phase."
     status: pending
     dependencies:
-      - phase13_interface
+      - phase15_canopy
 ---
 
 # Master Plan: Product First, Then Strict Safety
@@ -556,24 +566,44 @@ Each saved game stores that feed's fixture id. Team names are not matched again 
 
 ---
 
-## Phase 12: Auto resolve
+## Phase 12: Automatic count
+
+**Goal:** after the result signers approve, the reveal keeper counts every coupon and the last one settles the event. Nobody signs once per coupon.
+
+`score_slip` already accepts any signer, and approving the results already moves the event to tallying with `tallied` at zero. This phase adds the loop. It does not change the payout math, and it does not pay winners. Each winner still claims their own coupon.
+
+- [x] When a vault event is tallying, the keeper sends `score_slip` for `tallied`, then the next index, until the event is resolved. One coupon per transaction, in order.
+- [x] The proof comes from the slip archive, including a coupon that was never revealed. An unrevealed coupon scores nothing.
+- [x] A restart continues from the on-chain `tallied` counter. A coupon that is already scored is not sent again.
+- [x] The keeper pays the network fee. The count does not wait for the admin's wallet.
+- [x] **Count coupons and settle** stays and still counts from the same counter.
+- [x] If one score transaction does not fit, the keeper stops and says so. This phase does not add a canopy. A few hundred coupons fit. Ten thousand do not. Phase 15 is the canopy.
+
+**Done when:** an approved event with several coupons settles with no Phantom approval for the count, and a stopped keeper finishes the remaining coupons on its own.
+
+---
+
+## Phase 13: Auto resolve
 
 **Goal:** an event can settle itself from finished matches, while a manual event stays manual.
 
-- [ ] The create-event form has an **Auto resolve** checkbox. It is on by default and is stored with the event.
-- [ ] When it is off, the admin sets results as today.
-- [ ] When it is on, the keeper submits a result only after every linked game is finished, cancelled, or postponed. A live or suspended game waits. Cancelled and postponed become `C`. Finished games use the same 1, X, 2 mapping as Phase 11, read twice and accepted only when both reads agree.
-- [ ] A game with no fixture id blocks auto resolve and is shown to the admin. It does not guess a match from the team names.
-- [ ] Submission uses the existing resolution path, including the cosigner. The result can still be saved only once.
-- [ ] The player-facing event says whether it will auto resolve.
+- [x] The create-event form has an **Auto resolve** checkbox. It is on by default and is stored with the event.
+- [x] When it is off, the admin sets results as today.
+- [x] When it is on, the keeper submits a result only after every linked game is finished, cancelled, or postponed. A live or suspended game waits. Cancelled and postponed become `C`. Finished games use the same 1, X, 2 mapping as Phase 11, read twice and accepted only when both reads agree.
+- [x] A game with no fixture id blocks auto resolve and is shown to the admin. It does not guess a match from the team names.
+- [x] Submission uses the existing resolution path, including the cosigner. The result can still be saved only once.
+- [x] The player-facing event says whether it will auto resolve.
+- [x] After the results are on chain, Phase 12 counts the coupons. Auto resolve is not finished while the event is still tallying.
 
 **Done when:** a finished auto-resolve event settles without the admin picking 1, X, 2 or C, and a live score cannot settle it.
 
 ---
 
-## Phase 13: Player interface
+## Phase 14: Player interface
 
 **Goal:** the player site looks like a finished product. That is home, an event, entering a coupon, My Coupons, and profile. Admin, Users, and the vault signer tools stay as they are, including the theme they use now. The rules and the payout math do not change.
+
+The first restyle was reverted. It hid the live forecast and removed coupon controls. These items are open again.
 
 Inspiration, not a copy. The coupon follows [Europatipset](https://spela.svenskaspel.se/europatipset): one round, a header with the close time and the pool, then match rows with a number, the two teams, and three equal 1 / X / 2 squares. The shell follows [fomo](https://fomo.family/): a dark, quiet bar, large type, one primary action, and space around it. Do not reuse either site's name, logo, colors, photos, or wording. Do not add odds, public pick shares, or the responsible-play bar from Europatipset. Do not add a feed, a leaderboard, or a marketing page from fomo.
 
@@ -589,6 +619,23 @@ Inspiration, not a copy. The coupon follows [Europatipset](https://spela.svenska
 - [ ] **Leave admin as it is.** Do not restyle Admin, Users, or the signer and admin controls in the vault panel. A player can still read the vault status and the prize figures in the coupon layout. Those admin buttons do not move and do not get the new look.
 
 **Done when:** a player can find an event, fill the coupon, pay, and read a projected payout on a phone, and the player site no longer looks like the default Vuetify app. No payout figure changed because of the restyle. Admin and Users look as they do now.
+
+---
+
+## Phase 15: Canopy for large events
+
+**Goal:** placing, counting, and claiming one coupon still fit in a Solana transaction at 1,000,000 coupons, and the program refuses another one. The tree stays depth 20, which could hold 1,048,576. The event stops at 1,000,000.
+
+Empty proof hashes are already left out. Above a few hundred coupons the upper hashes are real, and three of those proofs do not fit. A canopy is the upper part of the tree stored by the program. The wallet sends only the bottom of the proof. The program attaches the stored top and checks the same root.
+
+- [ ] New events grow a canopy as coupons are placed. The program writes the shared upper nodes. The client does not send them again on place, reveal, score, claim, or refund.
+- [ ] A score, place, or claim for one coupon stays under the Solana size limit at coupon 1,000,000.
+- [ ] `place_slip` rejects the coupon that would make the count 1,000,001. The create-event page and the coupon page say the event is full.
+- [ ] The tree depth stays 20. Events already on chain keep the proofs they use now.
+- [ ] The stored nodes have to fit in accounts the event can rent.
+- [ ] The payout math does not change. Counting is still one coupon per transaction, in order, by the Phase 12 keeper. A canopy makes each transaction fit. It does not settle every coupon in one approval.
+
+**Done when:** coupon 1,000,000 can be placed, counted, and claimed in a transaction that fits, and coupon 1,000,001 is rejected.
 
 ---
 
@@ -621,8 +668,10 @@ Do not start this phase until the user says "start final phase". Other product f
 | 8 | Restarts, failures or a second instance lose data or let abuse through |
 | 9 | Players keep paying about 0.002 SOL per coupon into a monthly draw that pays out almost nothing |
 | 11 | Players cannot see what the current scores would pay, or a live score is mistaken for a settlement |
-| 12 | Someone has to type every result, or a live match is settled before it is finished |
-| 13 | The product works but the player site still looks like a default app |
+| 12 | Someone has to approve a transaction for every coupon before the event can settle |
+| 13 | Someone has to type every result, or a live match is settled before it is finished |
+| 14 | The product works but the player site still looks like a default app |
+| 15 | An event past a few hundred coupons cannot be counted or claimed, or it keeps accepting coupons after 1,000,000 |
 | Final | Real users lose real money |
 
-**Next step:** Phase 11 is in progress on API-Football. Put `API_FOOTBALL_KEY` in the gitignored `.env` and restart the backend before linking fixtures. A live score projects a payout and does not settle the event. `Test1` still waits until 31 Oct 2026. Do not start the final phase until the user says "start final phase". The old lottery vault is not paid by this program.
+**Next step:** Phase 13 auto resolve is in review. The Phase 14 restyle was reverted after it hid the live forecast. Phase 11 stays in progress until a linked event has shown a projected payout. Phase 15 does not start until the user asks for it. `Test1` still waits until 31 Oct 2026. Do not start the final phase until the user says "start final phase". The old lottery vault is not paid by this program.

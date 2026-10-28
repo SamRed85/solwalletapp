@@ -1,8 +1,10 @@
 <template>
   <span v-if="linked" class="match-score">
-    <span v-if="playing" class="clock" :class="done ? 'clock-done' : 'clock-live'">{{ clock }}</span>
+    <span v-if="finished" class="clock clock-done">FT</span>
+    <span v-else-if="playing" class="clock" :class="done ? 'clock-done' : 'clock-live'">{{ clock }}</span>
     <span v-else class="when">{{ when }}</span>
-    <span class="pill">{{ home }} - {{ away }}</span>
+    <slot />
+    <span v-if="showPill" class="pill">{{ home }} - {{ away }}</span>
   </span>
   <span v-else-if="when" class="when">{{ when }}</span>
 </template>
@@ -13,16 +15,20 @@ import { kickoffLabel, matchClock } from '@/services/projection'
 
 const props = defineProps({
   game: { type: Object, default: null },
-  kickoff: { type: [String, Number, Date], default: '' }
+  kickoff: { type: [String, Number, Date], default: '' },
+  placeholder: { type: Boolean, default: true },
+  finished: { type: Boolean, default: false }
 })
 
 const linked = computed(() => !!props.game?.linked)
 const playing = computed(() => props.game?.homeGoals != null && props.game?.awayGoals != null)
 const done = computed(() => ['HT', 'FT', 'AET', 'PEN'].includes(props.game?.status))
+const finished = computed(() => props.finished || props.game?.final || ['FT', 'AET', 'PEN'].includes(props.game?.status))
 const clock = computed(() => matchClock(props.game))
 const when = computed(() => kickoffLabel(props.kickoff))
 const home = computed(() => playing.value ? props.game.homeGoals : 0)
 const away = computed(() => playing.value ? props.game.awayGoals : 0)
+const showPill = computed(() => playing.value || props.placeholder)
 </script>
 
 <style scoped>

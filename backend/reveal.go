@@ -523,7 +523,8 @@ func (s *solanaRPC) send(ctx context.Context, tx []byte) (string, error) {
 func (s *solanaRPC) simulate(ctx context.Context, tx []byte) error {
 	var out struct {
 		Value struct {
-			Err any `json:"err"`
+			Err  any      `json:"err"`
+			Logs []string `json:"logs"`
 		} `json:"value"`
 	}
 	if err := s.call(ctx, "simulateTransaction", []any{

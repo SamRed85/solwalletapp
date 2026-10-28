@@ -147,7 +147,7 @@ func (a *App) handleListPaymentRecoveries(w http.ResponseWriter, r *http.Request
 	defer cancel()
 	cur, err := a.payments.Find(ctx,
 		bson.M{"status": paymentRecoveryPending},
-		options.Find().SetSort(bson.M{"createdAt": 1}),
+		options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}),
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load payment recoveries")

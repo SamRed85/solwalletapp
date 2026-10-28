@@ -53,6 +53,8 @@ type Event struct {
 	Games               []Game        `json:"games" bson:"games"`
 	CreatedBy           string        `json:"createdBy" bson:"createdBy"`
 	CreatedAt           time.Time     `json:"createdAt" bson:"createdAt"`
+	AutoResolve         bool          `json:"autoResolve" bson:"autoResolve"`
+	AutoResolveBlock    string        `json:"autoResolveBlock,omitempty" bson:"-"`
 	ResultsSetAt        *time.Time    `json:"resultsSetAt,omitempty" bson:"resultsSetAt,omitempty"`
 	Settlement          *Settlement   `json:"settlement,omitempty" bson:"settlement,omitempty"`
 	Status              string        `json:"status" bson:"-"`
@@ -102,6 +104,9 @@ func (a *App) prepare(e *Event, now time.Time) {
 	e.hasVault = e.Chain != nil
 	if e.Chain != nil && e.Chain.ProgramID != a.cfg.ProgramID {
 		e.Chain = nil
+	}
+	if e.AutoResolve {
+		e.AutoResolveBlock = autoResolveBlock(e.Games)
 	}
 }
 
@@ -195,7 +200,7 @@ func (a *App) loadEvent(w http.ResponseWriter, r *http.Request) (*Event, bool) {
 func (a *App) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	cur, err := a.events.Find(ctx, bson.M{}, options.Find().SetSort(bson.M{"startTime": -1}))
+	cur, err := a.events.Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "createdAt", Value: -1}}))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load events")
 		return
@@ -233,6 +238,7 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		// Required for special events (not 13 games); optional overrides for standard events.
 		CouponPriceLamports uint64 `json:"couponPriceLamports"`
 		Tiers               []Tier `json:"tiers"`
+		AutoResolve         *bool  `json:"autoResolve"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -292,6 +298,7 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		Games:               []Game{},
 		CreatedBy:           walletFrom(r),
 		CreatedAt:           now,
+		AutoResolve:         wantAutoResolve(req.AutoResolve),
 	}
 	if _, err := a.events.InsertOne(ctx, e); err != nil {
 		_ = a.applyRollover(ctx, nil, e.RolloverInLamports)

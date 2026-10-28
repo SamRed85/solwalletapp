@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -82,6 +83,14 @@ func sparseProof(nodes [][]byte, index uint32) [][]byte {
 		cursor >>= 1
 	}
 	return proof
+}
+
+func compactProof(proof [][]byte) [][]byte {
+	end := len(proof)
+	for end > 0 && bytes.Equal(proof[end-1], slipZero(end-1)) {
+		end--
+	}
+	return proof[:end]
 }
 
 func (a *App) armSlipReveal(w http.ResponseWriter, r *http.Request, wallet, coupon, ciphertext string) {
@@ -212,7 +221,7 @@ func (a *App) publishSlip(ctx context.Context, item scheduledReveal) {
 	for int(item.Index) >= len(nodes) {
 		nodes = append(nodes, nil)
 	}
-	proof := sparseProof(nodes, item.Index)
+	proof := compactProof(sparseProof(nodes, item.Index))
 	program, err := base58Decode(a.cfg.ProgramID)
 	eventKey, err2 := base58Decode(item.Event)
 	if err != nil || err2 != nil {

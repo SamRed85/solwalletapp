@@ -4,6 +4,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 func intptr(n int) *int { return &n }
@@ -24,6 +26,9 @@ func TestProjectFixtureUsesRegularTime(t *testing.T) {
 	if outcome, _, _, final := projectFixture(fixtureState{Status: "NS"}); outcome != "X" || final {
 		t.Fatalf("a match that has not started projected %s final %v", outcome, final)
 	}
+	if outcome, _, _, final := projectFixture(fixtureState{Status: "PST"}); outcome != "X" || final {
+		t.Fatalf("a postponed match projected %s final %v", outcome, final)
+	}
 	if outcome, _, _, _ := projectFixture(fixtureState{Status: "CANC", Home: intptr(1), Away: intptr(0)}); outcome != "" {
 		t.Fatalf("a cancelled match projected %s", outcome)
 	}
@@ -37,20 +42,32 @@ func TestProjectionIsAMaximumUntilTheRevealWindowCloses(t *testing.T) {
 		8: {Status: "1H", Home: intptr(0), Away: intptr(0)},
 	}
 	tiers := []Tier{{Correct: 2, Percent: 70}, {Correct: 1, Percent: 25}}
-	open := buildProjection(games, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, map[int]int{2: 9})
+	open := buildProjection(games, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, nil)
 	if !open.Complete || !open.Maximum {
 		t.Fatalf("open projection complete %v maximum %v", open.Complete, open.Maximum)
 	}
 	if open.Tiers[0].PerWinnerLamports != 700_000 {
 		t.Fatalf("maximum payout = %d", open.Tiers[0].PerWinnerLamports)
 	}
+	known := buildProjection(games, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, map[int]int{2: 9})
+	if known.Maximum || known.Tiers[0].PerWinnerLamports != 700_000/9 || known.Rows[0].Rows != 9 || known.Rows[0].Each != 700_000/9 {
+		t.Fatalf("shared rows maximum %v each %d rows %+v", known.Maximum, known.Tiers[0].PerWinnerLamports, known.Rows)
+	}
+	hidden := buildProjection(games, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, map[int]int{})
+	if !hidden.Maximum || len(hidden.Rows) != 2 || hidden.Rows[0].Correct != 2 || hidden.Rows[0].Rows != 0 || hidden.Tiers[0].Winners != 1 {
+		t.Fatalf("hidden coupons leaked a total %+v winners %d", hidden.Rows, hidden.Tiers[0].Winners)
+	}
 	shared := buildProjection(games, scores, now, now.Add(-time.Minute), 1_000_000, 0, tiers, map[int]int{2: 2})
 	if shared.Maximum || shared.Tiers[0].PerWinnerLamports != 350_000 {
 		t.Fatalf("shared payout maximum %v each %d", shared.Maximum, shared.Tiers[0].PerWinnerLamports)
 	}
-	waiting := buildProjection([]Game{{FixtureID: 7}, {FixtureID: 9}}, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, nil)
-	if waiting.Complete || len(waiting.Tiers) != 0 {
-		t.Fatal("a match without a score produced a payout")
+	notStarted := buildProjection([]Game{{FixtureID: 7}, {FixtureID: 9, Kickoff: now.Add(time.Hour)}}, scores, now, now.Add(2*time.Hour), 1_000_000, 0, tiers, nil)
+	if !notStarted.Complete || notStarted.Games[1].Projected != "X" || len(notStarted.Tiers) == 0 {
+		t.Fatal("a match that has not started did not count as X")
+	}
+	unlinked := buildProjection([]Game{{FixtureID: 7}, {}}, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, nil)
+	if unlinked.Complete || len(unlinked.Tiers) != 0 {
+		t.Fatal("an unlinked match produced a payout")
 	}
 }
 
@@ -116,5 +133,27 @@ func TestFootballErrorIsShownToTheAdmin(t *testing.T) {
 	}
 	if cleanZone("Europe/Stockholm") != "Europe/Stockholm" || cleanZone("bad zone") != "" {
 		t.Fatal("timezone was not cleaned")
+	}
+}
+
+func TestStoredScoreKeepsAZeroGoal(t *testing.T) {
+	state := fixtureState{Status: "FT", Elapsed: intptr(90), Extra: intptr(2), Home: intptr(0), Away: intptr(1), FullHome: intptr(0), FullAway: intptr(1)}
+	raw, err := bson.Marshal(storedFixtureFrom(1570430, state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc storedFixture
+	if err = bson.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	got := doc.state()
+	if doc.ID != 1570430 || got.Status != "FT" || got.Home == nil || *got.Home != 0 || got.Away == nil || *got.Away != 1 || got.Elapsed == nil || *got.Elapsed != 90 {
+		t.Fatalf("round trip id %d %+v", doc.ID, got)
+	}
+	feed := newFootballFeed("")
+	feed.remember(map[int]fixtureState{doc.ID: got})
+	loaded, ok := feed.score(doc.ID)
+	if !ok || loaded.Home == nil || *loaded.Home != 0 || loaded.Status != "FT" {
+		t.Fatal("stored score was not remembered")
 	}
 }

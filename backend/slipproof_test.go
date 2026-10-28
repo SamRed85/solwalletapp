@@ -26,4 +26,11 @@ func TestSlipProofMatchesTheEmptyTree(t *testing.T) {
 	if bytes.Equal(next[0], second) {
 		t.Fatal("a leaf must not be its own sibling")
 	}
+	if len(compactProof(proof)) != 0 {
+		t.Fatal("an empty tree proof should drop every empty sibling")
+	}
+	short := compactProof(next)
+	if len(short) == 0 || !bytes.Equal(short[0], first) || len(short) >= slipDepth {
+		t.Fatalf("compact second proof len %d", len(short))
+	}
 }

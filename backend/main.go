@@ -26,11 +26,17 @@ type App struct {
 	reveals  *mongo.Collection
 	sessions *mongo.Collection
 	slips    *mongo.Collection
+	scores   *mongo.Collection
 	feed     *footballFeed
 
-	rpc           *solanaRPC
-	keeper        ed25519.PrivateKey
-	keeperAddress string
+	rpc                *solanaRPC
+	keeper             ed25519.PrivateKey
+	keeperAddress      string
+	adminKey           ed25519.PrivateKey
+	adminKeyAddress    string
+	cosignerKey        ed25519.PrivateKey
+	cosignerKeyAddress string
+	resolveNotes       map[string]string
 
 	verifyPayment         func(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string) error
 	verifyRecoveryPayment func(ctx context.Context, signature, payer, treasury string, lamports uint64, memo string) error
@@ -68,6 +74,7 @@ func main() {
 		reveals:               db.Collection("reveals"),
 		sessions:              db.Collection("sessions"),
 		slips:                 db.Collection("slipArchive"),
+		scores:                db.Collection("fixtureScores"),
 		rpc:                   rpc,
 		feed:                  newFootballFeed(cfg.APIFootballKey),
 		verifyPayment:         rpc.verifyPayment,
@@ -80,7 +87,13 @@ func main() {
 		log.Fatalf("failed to create indexes: %v", err)
 	}
 	app.loadKeeper()
+	app.loadResolutionKeys()
+	scoreCtx, scoreCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	app.loadStoredScores(scoreCtx)
+	scoreCancel()
 	go app.revealLoop()
+	go app.scoreLoop()
+	go app.resolveLoop()
 	go app.lotteryLoop()
 	go app.mirrorLoop()
 	go app.rolloverRepairLoop()

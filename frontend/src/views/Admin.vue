@@ -12,7 +12,7 @@
         An event can be deleted while it is not on chain, has no coupons, and has no results.
       </v-card-subtitle>
 
-      <v-data-table :headers="headers" :items="events" :loading="loading" item-value="id">
+      <v-data-table :headers="headers" :items="events" :loading="loading" :sort-by="[{ key: 'createdAt', order: 'desc' }]" item-value="id">
         <template #[`item.status`]="{ value }">
           <v-chip :color="statusColors[value]" size="small" variant="flat">{{ value }}</v-chip>
         </template>
@@ -132,6 +132,10 @@
               v-model="newEvent.endTime" label="End time" type="datetime-local"
               :rules="[required, v => new Date(v) > new Date(newEvent.startTime) || 'Must be after start time']"
             />
+            <v-checkbox v-model="newEvent.autoResolve" label="Auto resolve" density="compact" hide-details class="mt-2" />
+            <div class="text-caption text-medium-emphasis mb-2">
+              When this is on, finished matches settle the round. A match still in play waits. Turn it off to set 1, X, 2 or C yourself.
+            </div>
           </v-form>
         </v-card-text>
         <v-card-actions>
@@ -198,7 +202,11 @@
             coupons picked it, from the first devnet block 1 hour after kickoff. This is allowed from then on.
           </p>
           <div v-for="(game, index) in selected?.games" :key="index" class="mb-2">
-            <div class="text-subtitle-1">{{ index + 1 }}. {{ game.homeTeam }} vs {{ game.awayTeam }}</div>
+            <div class="text-subtitle-1 d-flex align-center flex-wrap ga-2">
+              {{ index + 1 }}. {{ game.homeTeam }} vs {{ game.awayTeam }}
+              <MatchScore :game="standing?.games?.[index]" :kickoff="game.kickoff" />
+              <strong v-if="standing?.games?.[index]?.projected">{{ standing.games[index].projected }}</strong>
+            </div>
             <v-radio-group v-model="results[index]" inline hide-details>
               <v-radio v-for="o in outcomes" :key="o.value" :label="o.label" :value="o.value" />
               <v-radio label="Cancelled" value="C" color="warning" :disabled="!canDraw(game)" />
@@ -239,8 +247,15 @@
                 <td>{{ game.awayTeam }}</td>
                 <td>{{ formatDate(game.kickoff) }}</td>
                 <td>
-                  {{ game.result === 'C' ? 'Void' : (outcomeLabels[game.result] || '—') }}
-                  <v-chip v-if="game.cancelled && game.result !== 'C'" size="x-small" color="warning" class="ml-1">drawn</v-chip>
+                  <template v-if="game.result">
+                    {{ game.result === 'C' ? 'Void' : (outcomeLabels[game.result] || game.result) }}
+                    <v-chip v-if="game.cancelled && game.result !== 'C'" size="x-small" color="warning" class="ml-1">drawn</v-chip>
+                  </template>
+                  <template v-else>
+                    <MatchScore :game="standing?.games?.[index]" :kickoff="game.kickoff" />
+                    <strong v-if="standing?.games?.[index]?.projected" class="ml-2">{{ standing.games[index].projected }}</strong>
+                    <span v-else>—</span>
+                  </template>
                 </td>
               </tr>
             </tbody>
@@ -295,6 +310,7 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import MatchScore from '@/components/MatchScore.vue'
 import VaultPanel from '@/components/VaultPanel.vue'
 import { eventApi, recoveryApi } from '@/services/api'
 import {
@@ -319,10 +335,12 @@ const integerRule = v => Number.isInteger(v) || 'Must be a whole number'
 
 const events = ref([])
 const loading = ref(false)
+const newestFirst = (a, b) => new Date(b.createdAt || b.startTime) - new Date(a.createdAt || a.startTime)
 const saving = ref(false)
 const selected = ref(null)
 const details = ref(null)
 const payouts = ref(null)
+const standing = ref(null)
 const config = computed(() => auth.config)
 const recoveries = ref([])
 const refunding = ref(null)
@@ -380,7 +398,7 @@ const resultsComplete = computed(() =>
 async function loadEvents () {
   loading.value = true
   try {
-    events.value = await eventApi.list()
+    events.value = (await eventApi.list()).sort(newestFirst)
   } catch (error) {
     notifyError(error)
   } finally {
@@ -562,10 +580,21 @@ const saveGames = () => save(
 const drawTime = game => new Date(new Date(game.kickoff).getTime() + DRAW_DELAY_MS)
 const canDraw = game => Date.now() >= drawTime(game).getTime()
 
+async function loadStanding (event) {
+  standing.value = null
+  if (!event?.id || event.status === 'completed') return
+  try {
+    standing.value = await eventApi.projection(event.id)
+  } catch {
+    standing.value = null
+  }
+}
+
 function openResults (event) {
   selected.value = event
   results.value = event.games.map(() => null)
   resultsDialog.value = true
+  loadStanding(event)
 }
 
 const saveResults = () => save(
@@ -577,6 +606,7 @@ const saveResults = () => save(
 async function openDetails (event) {
   details.value = event
   payouts.value = null
+  loadStanding(event)
   if (!event.settlement) return
   try {
     payouts.value = (await eventApi.payouts(event.id)).payouts
