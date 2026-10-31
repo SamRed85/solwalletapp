@@ -131,7 +131,7 @@ const coupon = couponPda(event, 0)
 const picks = picksFromSystem(Array.from({ length: 7 }, () => ['1']))
 const commitment = couponCommitment(player.address, picks, REVEAL_NONCE)
 
-const created = await send(admin, [admin], [createEventIx({ admin: admin.address, other: other.address, nonce, deadline, revealDeadline })])
+const created = await send(admin, [admin], [createEventIx({ admin: admin.address, other: other.address, nonce, deadline, revealDeadline, price: 200_000_000 })])
 if (created instanceof Error) throw created
 const placed = await send(player, [player], [placeCouponIx({ player: player.address, admin: admin.address, nonce, index: 0, commitment, combinations: 1 })])
 if (placed instanceof Error) throw placed
@@ -157,7 +157,7 @@ const eventData = await account(event)
 const settled = decodeEvent(eventData)
 const house = settled.house
 const perWinner = settled.perWinner[6]
-if (settled.status !== 'resolved' || perWinner !== 950_000n || house !== 50_000n) {
+if (settled.status !== 'resolved' || perWinner !== 190_000_000n || house !== 10_000_000n) {
   throw new Error(`unexpected settlement perWinner=${perWinner} house=${house}`)
 }
 

@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func finished(status string, home, away int) fixtureState {
 	return fixtureState{Status: status, FullHome: intptr(home), FullAway: intptr(away), Home: intptr(home), Away: intptr(away)}
@@ -47,6 +50,44 @@ func TestAutoResolveBlocksAnUnlinkedGame(t *testing.T) {
 	got := decideAutoResolve([]Game{{HomeTeam: "Home", AwayTeam: "Away"}}, nil, nil)
 	if got.Results != "" || got.Block == "" {
 		t.Fatalf("an unlinked game was scored: %+v", got)
+	}
+}
+
+func TestAutoResolveUsesSavedScoresUntilTheyAreFinal(t *testing.T) {
+	games := []Game{{FixtureID: 7}}
+	live := map[int]fixtureState{7: {Status: "2H", Home: intptr(1), Away: intptr(0)}}
+	settled, blocked := savedScoreState(games, live)
+	if settled || blocked {
+		t.Fatal("a live saved score looked finished")
+	}
+	now := time.Now()
+	if !allowScoreFetch(0, time.Time{}, now) {
+		t.Fatal("the first look at an unfinished saved score was skipped")
+	}
+	if allowScoreFetch(1, now, now.Add(time.Minute)) {
+		t.Fatal("a second feed call was allowed inside the gap")
+	}
+	if !allowScoreFetch(1, now, now.Add(resolveScoreGap)) {
+		t.Fatal("a later confirm of an unfinished score was skipped")
+	}
+	if allowScoreFetch(resolveScoreFetches, time.Time{}, now) {
+		t.Fatal("the feed was called again after the saved scores stayed unfinished")
+	}
+	if resolveScoreFetches != 5 || resolveScoreGap != 5*time.Minute {
+		t.Fatalf("retries = %d gap = %s", resolveScoreFetches, resolveScoreGap)
+	}
+	notice := scoreGiveUpMessage("game 1 is still in play")
+	if notice != "Auto resolve stopped after 5 tries, 5 minutes apart: game 1 is still in play. Set the results by hand." {
+		t.Fatal(notice)
+	}
+	final := map[int]fixtureState{7: finished("FT", 1, 0)}
+	settled, blocked = savedScoreState(games, final)
+	if !settled || blocked {
+		t.Fatal("a finished saved score was not used")
+	}
+	got := decideAutoResolve(games, final, final)
+	if got.Results != "1" {
+		t.Fatalf("saved score decision %+v", got)
 	}
 }
 

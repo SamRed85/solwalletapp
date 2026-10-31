@@ -1,5 +1,5 @@
 <template>
-  <div v-if="projection" class="mt-3">
+  <div v-if="projection?.revealClosed" class="mt-3">
     <div class="text-subtitle-2">If these scores stand</div>
     <div v-if="!projection.complete" class="text-caption text-medium-emphasis">
       {{ waiting }}

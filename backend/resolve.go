@@ -19,6 +19,12 @@ const (
 	eventApprovalsOffset       = 304
 	proposalResolve            = 1
 	proposalCancel             = 2
+
+	// Auto resolve uses scores already saved by the timed refreshes. It calls the
+	// feed only when a saved score is missing or still in play: five tries, five
+	// minutes apart, and then it stops and tells the admin.
+	resolveScoreFetches = 5
+	resolveScoreGap     = 5 * time.Minute
 )
 
 type chainProposal struct {
@@ -230,35 +236,128 @@ func (a *App) resolveEvent(ctx context.Context, event *Event) error {
 		a.noteResolve(event.Chain.Address, "the resolution window has closed")
 		return nil
 	}
-	first, err := a.feed.readFixtures(ctx, event.Games)
-	if err != nil {
-		return err
+	saved := a.savedScores(event.Games)
+	settled, blocked := savedScoreState(event.Games, saved)
+	if a.feed != nil && !settled && !blocked && allowScoreFetch(event.ScoreChecks, event.ScoreCheckedAt, time.Now()) {
+		a.markScoreCheck(ctx, event, time.Now())
+		if err = a.fetchFixtures(ctx, event.Games); err != nil {
+			return err
+		}
+		saved = a.savedScores(event.Games)
 	}
-	_ = a.storeFixtures(ctx, first)
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(3 * time.Second):
-	}
-	second, err := a.feed.readFixtures(ctx, event.Games)
-	if err != nil {
-		return err
-	}
-	_ = a.storeFixtures(ctx, second)
-	decision := decideAutoResolve(event.Games, first, second)
+	// Both sides are the same saved reading. A finished score does not need a second feed call.
+	decision := decideAutoResolve(event.Games, saved, saved)
 	switch {
 	case decision.Block != "":
+		a.rememberScoreBlock(ctx, event, decision.Block)
 		a.noteResolve(event.Chain.Address, decision.Block)
 		return nil
 	case decision.Results == "":
-		a.noteResolve(event.Chain.Address, decision.Wait)
+		message := decision.Wait
+		if event.ScoreChecks >= resolveScoreFetches {
+			message = scoreGiveUpMessage(decision.Wait)
+			a.rememberScoreBlock(ctx, event, message)
+		}
+		a.noteResolve(event.Chain.Address, message)
 		return nil
 	}
+	a.clearScoreBlock(ctx, event)
 	if err = a.submitResolution(ctx, event, account.Data, decision.Results); err != nil {
 		return err
 	}
 	a.noteResolve(event.Chain.Address, "submitted "+decision.Results)
 	return nil
+}
+
+func (a *App) savedScores(games []Game) map[int]fixtureState {
+	saved := map[int]fixtureState{}
+	if a.feed == nil {
+		return saved
+	}
+	for _, game := range games {
+		if state, ok := a.feed.score(game.FixtureID); ok {
+			saved[game.FixtureID] = state
+		}
+	}
+	return saved
+}
+
+// savedScoreState reports whether every saved score is finished, and whether one
+// is finished in a way auto resolve will not score. A blocked game is not fetched again.
+func savedScoreState(games []Game, saved map[int]fixtureState) (settled, blocked bool) {
+	settled = len(games) > 0
+	for _, game := range games {
+		state, ok := saved[game.FixtureID]
+		if !ok {
+			return false, false
+		}
+		_, kind := terminalOutcome(state)
+		if kind == "block" {
+			return false, true
+		}
+		if kind != "" {
+			settled = false
+		}
+	}
+	return settled, blocked
+}
+
+func scoreGiveUpMessage(wait string) string {
+	message := "Auto resolve stopped after 5 tries, 5 minutes apart. Set the results by hand."
+	if wait != "" {
+		message = "Auto resolve stopped after 5 tries, 5 minutes apart: " + wait + ". Set the results by hand."
+	}
+	return message
+}
+
+func allowScoreFetch(checks int, checkedAt, now time.Time) bool {
+	if checks >= resolveScoreFetches {
+		return false
+	}
+	return checkedAt.IsZero() || now.Sub(checkedAt) >= resolveScoreGap
+}
+
+func (a *App) markScoreCheck(ctx context.Context, event *Event, now time.Time) {
+	event.ScoreChecks++
+	event.ScoreCheckedAt = now
+	if a.events == nil || event.ID.IsZero() {
+		return
+	}
+	_, err := a.events.UpdateByID(ctx, event.ID, bson.M{"$set": bson.M{
+		"scoreChecks":    event.ScoreChecks,
+		"scoreCheckedAt": event.ScoreCheckedAt,
+	}})
+	if err != nil {
+		log.Printf("auto resolve score check: %v", err)
+	}
+}
+
+func (a *App) rememberScoreBlock(ctx context.Context, event *Event, message string) {
+	if event.ScoreBlock == message {
+		return
+	}
+	event.ScoreBlock = message
+	if a.events == nil || event.ID.IsZero() {
+		return
+	}
+	_, err := a.events.UpdateByID(ctx, event.ID, bson.M{"$set": bson.M{"scoreBlock": message}})
+	if err != nil {
+		log.Printf("auto resolve score block: %v", err)
+	}
+}
+
+func (a *App) clearScoreBlock(ctx context.Context, event *Event) {
+	if event.ScoreBlock == "" {
+		return
+	}
+	event.ScoreBlock = ""
+	if a.events == nil || event.ID.IsZero() {
+		return
+	}
+	_, err := a.events.UpdateByID(ctx, event.ID, bson.M{"$unset": bson.M{"scoreBlock": ""}})
+	if err != nil {
+		log.Printf("auto resolve score block: %v", err)
+	}
 }
 
 func (a *App) noteResolve(event, message string) {

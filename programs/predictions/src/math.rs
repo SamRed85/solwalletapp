@@ -4,6 +4,8 @@
 pub const MAX_GAMES: usize = 13;
 pub const MAX_COMBINATIONS: u32 = 44_000;
 pub const TIER_PERCENT_TOTAL: u8 = 95;
+/// A winning row paid less than this rolls its whole tier into the next event.
+pub const MIN_ROW_PAYOUT: u64 = 10_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tier {
@@ -130,10 +132,10 @@ pub fn settle(sales: u64, rollover_in: u64, game_count: u8, tiers: &[Tier], winn
         }
         let pot = u64::try_from(pot).map_err(|_| "tier pot overflows")?;
         let winner_count = winners[tier.correct as usize];
-        if winner_count == 0 {
+        let per_winner = if winner_count == 0 { 0 } else { pot / winner_count };
+        if winner_count == 0 || per_winner < MIN_ROW_PAYOUT {
             settlement.rollover_out = settlement.rollover_out.checked_add(pot).ok_or("rollover overflows")?;
         } else {
-            let per_winner = pot / winner_count;
             let paid = per_winner * winner_count;
             settlement.per_winner[index] = per_winner;
             settlement.paid = settlement.paid.checked_add(paid).ok_or("payout overflows")?;
@@ -174,11 +176,13 @@ mod tests {
     fn settlement_matches_the_shared_pool_rules() {
         let results = "1111111111111";
         let rows = ["1111111111111", "1111111111112", "1111111111122", "111111111112X", "2222222222222"];
-        let settlement = settle(5_000_000, 2_000_000, 13, &standard_tiers(), &winners_for(&rows, results)).unwrap();
-        assert_eq!(settlement.per_winner, vec![4_500_000, 1_250_000, 375_000, 0]);
-        assert_eq!(settlement.rollover_out, 250_000);
-        assert_eq!(settlement.house, 250_000);
-        assert_eq!(settlement.paid, 4_500_000 + 1_250_000 + 375_000 * 2);
+        // Scaled so every paid row stays at or above 0.01 SOL. The 10-correct tier still has no winner.
+        let scale = 400;
+        let settlement = settle(5_000_000 * scale, 2_000_000 * scale, 13, &standard_tiers(), &winners_for(&rows, results)).unwrap();
+        assert_eq!(settlement.per_winner, vec![4_500_000 * scale, 1_250_000 * scale, 375_000 * scale, 0]);
+        assert_eq!(settlement.rollover_out, 250_000 * scale);
+        assert_eq!(settlement.house, 250_000 * scale);
+        assert_eq!(settlement.paid, (4_500_000 + 1_250_000 + 375_000 * 2) * scale);
     }
 
     #[test]
@@ -194,10 +198,31 @@ mod tests {
     fn rounding_remainder_goes_to_the_house() {
         let tiers = [Tier { correct: 7, percent: 95 }];
         let winners = winners_for(&["1111111", "1111111", "1111111"], "1111111");
-        let settlement = settle(1_000_001, 0, 7, &tiers, &winners).unwrap();
-        assert_eq!(settlement.per_winner, vec![950_000 / 3]);
-        assert!(settlement.paid <= 950_000);
-        assert_eq!(settlement.house, 1_000_001 - settlement.paid);
+        let sales = 400_000_001;
+        let settlement = settle(sales, 0, 7, &tiers, &winners).unwrap();
+        let pot = sales * 95 / 100;
+        assert!(settlement.per_winner[0] >= MIN_ROW_PAYOUT);
+        assert_eq!(settlement.per_winner, vec![pot / 3]);
+        assert!(settlement.paid < pot);
+        assert_eq!(settlement.house, sales - settlement.paid);
+    }
+
+    #[test]
+    fn a_share_under_a_hundredth_of_a_sol_rolls_the_whole_tier() {
+        let tiers = [Tier { correct: 7, percent: 95 }];
+        let mut winners = vec![0u64; 8];
+        winners[7] = 10;
+        let settlement = settle(100_000_000, 0, 7, &tiers, &winners).unwrap();
+        assert_eq!(settlement.per_winner, vec![0]);
+        assert_eq!(settlement.paid, 0);
+        assert_eq!(settlement.rollover_out, 95_000_000);
+        assert_eq!(settlement.house, 5_000_000);
+
+        winners[7] = 1;
+        let exact = settle(10_526_316, 0, 7, &tiers, &winners).unwrap();
+        assert_eq!(exact.per_winner, vec![MIN_ROW_PAYOUT]);
+        assert_eq!(exact.paid, MIN_ROW_PAYOUT);
+        assert_eq!(exact.rollover_out, 0);
     }
 
     #[test]

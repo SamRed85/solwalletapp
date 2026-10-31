@@ -123,8 +123,8 @@ func (a *App) routes() *http.ServeMux {
 
 	mux.HandleFunc("GET /api/me", a.requireAuth(a.handleMe))
 	mux.HandleFunc("PUT /api/me", a.requireAuth(a.handleUpdateMe))
-	mux.HandleFunc("GET /api/events", a.requireAuth(a.handleListEvents))
-	mux.HandleFunc("GET /api/events/{id}", a.requireAuth(a.handleGetEvent))
+	mux.HandleFunc("GET /api/events", a.withSession(a.handleListEvents))
+	mux.HandleFunc("GET /api/events/{id}", a.withSession(a.handleGetEvent))
 	mux.HandleFunc("POST /api/events/{id}/entries", a.requireAuth(a.limitRequests("entry", 20, time.Minute, walletRateKey, a.handleCreateEntry)))
 	mux.HandleFunc("GET /api/entries", a.requireAuth(a.handleMyEntries))
 	mux.HandleFunc("GET /api/lottery", a.requireAuth(a.handleLottery))
@@ -146,6 +146,7 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/events/{id}/projection/refresh", a.requireAdmin(a.handleRefreshScores))
 	mux.HandleFunc("GET /api/events/{id}/payouts", a.requireAdmin(a.handlePayouts))
 	mux.HandleFunc("GET /api/football/fixtures", a.requireAdmin(a.handleFixtureSearch))
+	mux.HandleFunc("GET /api/football/fixtures/day", a.requireAdmin(a.handleFixturesByDate))
 	mux.HandleFunc("GET /api/payment-recoveries", a.requireAdmin(a.handleListPaymentRecoveries))
 	mux.HandleFunc("PUT /api/payment-recoveries/{signature}", a.requireAdmin(a.handleRefundPaymentRecovery))
 

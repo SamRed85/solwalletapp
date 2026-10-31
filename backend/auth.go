@@ -164,6 +164,18 @@ func (a *App) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// withSession attaches a wallet when the request has a valid session and still
+// serves the handler when it does not. Public event pages use this so admins
+// keep seeing drafts while visitors do not.
+func (a *App) withSession(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if wallet, ok := a.authenticatedWallet(r); ok {
+			r = r.WithContext(context.WithValue(r.Context(), walletContext, wallet))
+		}
+		next(w, r)
+	}
+}
+
 func (a *App) authenticatedWallet(r *http.Request) (string, bool) {
 	now := time.Now()
 	if a.sessions != nil {

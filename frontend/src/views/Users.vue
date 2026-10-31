@@ -1,7 +1,7 @@
 <template>
   <v-container class="py-6">
     <v-card>
-      <v-card-title class="d-flex align-center">
+      <v-card-title class="d-flex align-center flex-wrap ga-2">
         <v-icon class="mr-2">mdi-account-group</v-icon>
         Users
       </v-card-title>
@@ -9,16 +9,28 @@
         A name can be changed, and a user can be removed, only when they have no coupons on an event still in play.
         Wallet addresses cannot be changed.
       </v-card-subtitle>
-      <v-data-table :headers="headers" :items="users" :loading="loading" :sort-by="[{ key: 'lastLoginAt', order: 'desc' }]" item-value="walletAddress">
-        <template #[`item.displayName`]="{ value }">{{ value || '—' }}</template>
+      <v-data-table class="phone-stack" :headers="headers" :items="users" :loading="loading" :sort-by="[{ key: 'lastLoginAt', order: 'desc' }]" item-value="walletAddress">
+        <template #[`item.displayName`]="{ value }">
+          <span class="cell-label">Name</span>{{ value || '—' }}
+        </template>
         <template #[`item.walletAddress`]="{ value }">
+          <span class="cell-label">Wallet</span>
           <code>{{ value }}</code>
         </template>
-        <template #[`item.isAdmin`]="{ value }">
-          <v-chip v-if="value" color="warning" size="small" variant="flat">admin</v-chip>
+        <template #[`item.activeCoupons`]="{ value }">
+          <span class="cell-label">Active coupons</span>{{ value }}
         </template>
-        <template #[`item.createdAt`]="{ value }">{{ formatDate(value) }}</template>
-        <template #[`item.lastLoginAt`]="{ value }">{{ formatDate(value) }}</template>
+        <template #[`item.isAdmin`]="{ value }">
+          <span class="cell-label">Role</span>
+          <v-chip v-if="value" color="warning" size="small" variant="flat">admin</v-chip>
+          <span v-else>player</span>
+        </template>
+        <template #[`item.createdAt`]="{ value }">
+          <span class="cell-label">First sign-in</span>{{ formatDate(value) }}
+        </template>
+        <template #[`item.lastLoginAt`]="{ value }">
+          <span class="cell-label">Last sign-in</span>{{ formatDate(value) }}
+        </template>
         <template #[`item.actions`]="{ item }">
           <v-btn icon="mdi-pencil" size="small" variant="text" title="Edit name" :disabled="!canManage(item)" @click="openEdit(item)" />
           <v-btn

@@ -62,8 +62,8 @@ fn main() {
 
     let settled = rpc.event(&event);
     assert_eq!(settled.status, EventStatus::Resolved);
-    assert_eq!(settled.per_winner[6], 950_000);
-    assert_eq!(settled.house, 50_000);
+    assert_eq!(settled.per_winner[6], 190_000_000);
+    assert_eq!(settled.house, 10_000_000);
 
     let claim = claim_ix(coupon, event, vault, player.pubkey());
     let redirected = claim_ix(coupon, event, vault, stranger.pubkey());
@@ -101,7 +101,7 @@ fn create_ix(admin: &Keypair, other: &Keypair, nonce: u64, deadline: i64, reveal
             args: CreateEventArgs {
                 nonce,
                 game_count: 7,
-                price: 1_000_000,
+                price: 200_000_000,
                 deadline,
                 reveal_deadline,
                 end_time: reveal_deadline,

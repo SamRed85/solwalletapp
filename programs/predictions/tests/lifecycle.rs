@@ -62,7 +62,7 @@ fn event_args(nonce: u64, deadline: i64) -> CreateEventArgs {
     CreateEventArgs {
         nonce,
         game_count: 7,
-        price: 1_000_000,
+        price: 200_000_000,
         deadline,
         reveal_deadline: deadline + 20,
         end_time: deadline + 20,
@@ -309,8 +309,8 @@ async fn winner_is_paid_once_from_the_vault() {
 
     let settled = load_event(&mut context, event).await;
     assert_eq!(settled.status, EventStatus::Resolved);
-    assert_eq!(settled.per_winner[6], 950_000);
-    assert_eq!(settled.house, 50_000);
+    assert_eq!(settled.per_winner[6], 190_000_000);
+    assert_eq!(settled.house, 10_000_000);
     let stranger = Keypair::new();
     fund(&mut context, &stranger.pubkey(), 1_000_000).await;
     let redirected = Instruction {
@@ -387,7 +387,7 @@ async fn rollover_reaches_only_the_earliest_future_event() {
     set_clock(&mut context, now + 30);
     resolve(&mut context, &admin, &other, event_a, vec![b'2'; 7], &[coupon]).await;
     let source = load_event(&mut context, event_a).await;
-    assert_eq!(source.rollover_out, 950_000);
+    assert_eq!(source.rollover_out, 190_000_000);
     assert!(send(&mut context, &admin, park_ix(admin.pubkey(), 10)).await.is_err(), "an open future event must receive the rollover");
     assert!(send(&mut context, &admin, forward_ix(admin.pubkey(), 10, 12)).await.is_err(), "a later event is not the earliest");
     send(&mut context, &admin, forward_ix(admin.pubkey(), 10, 11)).await.unwrap();
@@ -395,9 +395,9 @@ async fn rollover_reaches_only_the_earliest_future_event() {
     let forwarded = load_event(&mut context, event_a).await;
     let destination = load_event(&mut context, event_b).await;
     assert!(forwarded.rollover_forwarded);
-    assert_eq!(destination.rollover_in, 950_000);
+    assert_eq!(destination.rollover_in, 190_000_000);
     assert_eq!(context.banks_client.get_balance(vault_a).await.unwrap(), source.rent_reserve + source.house);
-    assert_eq!(context.banks_client.get_balance(vault_b).await.unwrap(), destination.rent_reserve + 950_000);
+    assert_eq!(context.banks_client.get_balance(vault_b).await.unwrap(), destination.rent_reserve + 190_000_000);
     assert_eq!(load_event(&mut context, event_c).await.rollover_in, 0);
 }
 
@@ -418,7 +418,7 @@ async fn parked_rollover_is_assigned_to_the_next_event() {
     set_clock(&mut context, now + 30);
     resolve(&mut context, &admin, &other, event_a, vec![b'2'; 7], &[coupon]).await;
     send(&mut context, &admin, park_ix(admin.pubkey(), 20)).await.unwrap();
-    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, 950_000);
+    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, 190_000_000);
 
     let intruder = Keypair::new();
     let accomplice = Keypair::new();
@@ -426,21 +426,21 @@ async fn parked_rollover_is_assigned_to_the_next_event() {
     let (create_x, event_x, _) = create_ix(intruder.pubkey(), accomplice.pubkey(), 99, now + 400);
     send(&mut context, &intruder, create_x).await.unwrap();
     assert_eq!(load_event(&mut context, event_x).await.rollover_in, 0, "another admin's event must not take parked rollover");
-    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, 950_000);
+    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, 190_000_000);
 
     let (create_b, event_b, _) = create_ix(admin.pubkey(), other.pubkey(), 21, now + 500);
     send(&mut context, &admin, create_b).await.unwrap();
-    assert_eq!(load_event(&mut context, event_b).await.rollover_in, 950_000);
+    assert_eq!(load_event(&mut context, event_b).await.rollover_in, 190_000_000);
     assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, 0);
     cancel(&mut context, &admin, &other, event_b).await;
-    assert_eq!(load_event(&mut context, event_b).await.rollover_out, 950_000);
+    assert_eq!(load_event(&mut context, event_b).await.rollover_out, 190_000_000);
 
     let (create_c, event_c, vault_c) = create_ix(admin.pubkey(), other.pubkey(), 22, now + 5_000);
     send(&mut context, &admin, create_c).await.unwrap();
     send(&mut context, &admin, forward_ix(admin.pubkey(), 21, 22)).await.unwrap();
     let destination = load_event(&mut context, event_c).await;
-    assert_eq!(destination.rollover_in, 950_000);
-    assert_eq!(context.banks_client.get_balance(vault_c).await.unwrap(), destination.rent_reserve + 950_000);
+    assert_eq!(destination.rollover_in, 190_000_000);
+    assert_eq!(context.banks_client.get_balance(vault_c).await.unwrap(), destination.rent_reserve + 190_000_000);
 }
 
 #[tokio::test]
@@ -482,8 +482,8 @@ async fn forwarding_rollover_leaves_unclaimed_winnings() {
     set_clock(&mut context, now + 30);
     resolve(&mut context, &admin, &other, event, vec![b'1'; 7], &[coupon]).await;
     let settled = load_event(&mut context, event).await;
-    assert_eq!(settled.per_winner[6], 500_000);
-    assert_eq!(settled.rollover_out, 450_000);
+    assert_eq!(settled.per_winner[6], 100_000_000);
+    assert_eq!(settled.rollover_out, 90_000_000);
     send(&mut context, &admin, forward_ix(admin.pubkey(), 30, 31)).await.unwrap();
     assert_eq!(
         context.banks_client.get_balance(vault).await.unwrap(),
@@ -605,7 +605,7 @@ async fn batched_tally_settles_a_full_thirteen_game_event() {
     let other = Keypair::new();
     let player = Keypair::new();
     let stranger = Keypair::new();
-    fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    fund(&mut context, &player.pubkey(), 10_000_000_000).await;
     fund(&mut context, &stranger.pubkey(), 10_000_000).await;
     let now = clock(&mut context).await.unix_timestamp;
     let deadline = now + 100;
@@ -691,7 +691,7 @@ async fn batched_tally_settles_a_full_thirteen_game_event() {
     assert_eq!(settled.tallied, count);
     assert_eq!(settled.winners[13], 1, "the void game counts as correct for the home coupon");
     assert_eq!(settled.winners[1], 33, "away coupons only score the void game");
-    let sales = u64::from(count) * 1_000_000;
+    let sales = u64::from(count) * 200_000_000;
     assert_eq!(settled.per_winner[12], sales / 2);
     assert_eq!(settled.rollover_out, sales * 45 / 100);
     assert_eq!(settled.house, sales * 5 / 100);
@@ -997,9 +997,9 @@ async fn one_slip_pays_no_coupon_account() {
     send(&mut context, &player, place_slip_ix(player.pubkey(), admin.pubkey(), 90, slip.clone(), empty_proof())).await.unwrap();
     let stored = load_event(&mut context, event).await;
     assert_eq!(stored.coupon_count, 1);
-    assert_eq!(stored.sales, 1_000_000);
+    assert_eq!(stored.sales, 200_000_000);
     let vault_account = context.banks_client.get_account(vault).await.unwrap().unwrap();
-    assert_eq!(vault_account.lamports, stored.rent_reserve + 1_000_000);
+    assert_eq!(vault_account.lamports, stored.rent_reserve + 200_000_000);
     assert!(context.banks_client.get_account(pda(&[b"coupon", event.as_ref(), &0u32.to_le_bytes()])).await.unwrap().is_none());
 
     let book_account = context.banks_client.get_account(slips_of(&event)).await.unwrap().unwrap();
@@ -1083,8 +1083,8 @@ async fn a_slip_claim_pays_the_owner_once() {
     send(&mut context, &stranger, score_slip_ix(stranger.pubkey(), admin.pubkey(), 91, reveal.clone(), true, proof.clone(), proof.clone(), proof.clone())).await.unwrap();
     let settled = load_event(&mut context, event).await;
     assert_eq!(settled.status, EventStatus::Resolved);
-    assert_eq!(settled.per_winner[6], 950_000);
-    assert_eq!(settled.house, 50_000);
+    assert_eq!(settled.per_winner[6], 190_000_000);
+    assert_eq!(settled.house, 10_000_000);
 
     let redirected = claim_slip_ix(stranger.pubkey(), admin.pubkey(), 91, reveal.clone(), proof.clone(), proof.clone(), proof.clone());
     assert!(send(&mut context, &stranger, redirected).await.is_err(), "a claim cannot be redirected");
@@ -1146,8 +1146,8 @@ async fn an_unrevealed_slip_cannot_win() {
 
     let settled = load_event(&mut context, event).await;
     assert_eq!(settled.status, EventStatus::Resolved);
-    assert_eq!(settled.per_winner[6], 1_900_000, "the hidden stake stays in the pool");
-    assert_eq!(settled.house, 100_000);
+    assert_eq!(settled.per_winner[6], 380_000_000, "the hidden stake stays in the pool");
+    assert_eq!(settled.house, 20_000_000);
     assert!(
         send(&mut context, &player, claim_slip_ix(player.pubkey(), admin.pubkey(), 92, hidden, proof.clone(), proof.clone(), proof.clone())).await.is_err(),
         "an unrevealed slip cannot be claimed"

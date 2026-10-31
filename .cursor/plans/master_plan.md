@@ -601,24 +601,6 @@ Each saved game stores that feed's fixture id. Team names are not matched again 
 
 ## Phase 14: Player interface
 
-**Goal:** the player site looks like a finished product. That is home, an event, entering a coupon, My Coupons, and profile. Admin, Users, and the vault signer tools stay as they are, including the theme they use now. The rules and the payout math do not change.
-
-The first restyle was reverted. It hid the live forecast and removed coupon controls. These items are open again.
-
-Inspiration, not a copy. The coupon follows [Europatipset](https://spela.svenskaspel.se/europatipset): one round, a header with the close time and the pool, then match rows with a number, the two teams, and three equal 1 / X / 2 squares. The shell follows [fomo](https://fomo.family/): a dark, quiet bar, large type, one primary action, and space around it. Do not reuse either site's name, logo, colors, photos, or wording. Do not add odds, public pick shares, or the responsible-play bar from Europatipset. Do not add a feed, a leaderboard, or a marketing page from fomo.
-
-- [ ] **Look.** Dark by default. Light stays available. One accent, used for a selected pick, a win, and the pay button. Player surfaces are flat and quiet: no default blue app bar, no pile of outlined cards, no chip on every fact. Type carries the page. The event name and the pool are the large lines. Admin, Users, and the vault signer controls keep the theme they have now, so this look does not land on them.
-- [ ] **Bar.** A wordmark, the balance, the name, and one menu. Connect is the only action when signed out. Home, My Coupons, and Profile are the player destinations.
-- [ ] **Home.** Signed out: one short line and Connect, or install Phantom. Signed in: the open event is a round card with the title, time left to close, coupon price, game count, and the jackpot when rollover is waiting. Later events sit under it, smaller. An empty list says there are no events yet.
-- [ ] **Coupon.** The event page is the coupon. The header shows the title, status, when entries close, and the pool. Each game is one row: a number, home and away, kickoff, and 1, X, 2 as three equal squares. A chosen square is filled. All 1, All X, All 2, and Clear stay, as one quiet row. A closed event uses the same rows and shows the result, or a blank until there is one. A live score from Phase 11 sits on its row.
-- [ ] **Pay bar.** Combinations, price, and total stay fixed at the bottom while the player picks, including on a phone. Pay with Phantom is the one primary button. The Phantom step is one line of status. A low balance and the treasury-wallet warning sit in that bar.
-- [ ] **Prize and projection.** Tier shares and the pool read as a short summary under the header, not a wide table. "If these scores stand" from Phase 11 sits on the coupon being entered and on each slip in My Coupons. A figure that is a maximum is still labeled as a maximum. A score change and that payout number are the only motion.
-- [ ] **My Coupons.** Each coupon is a slip in the same row language: the event, the picks, how many are correct once results exist, and one next action (reveal, claim, or refund). Pending payments, backup export and import, and "hide results until I open a coupon" stay. An empty list points back to the open event.
-- [ ] **Profile.** A short form for the display name and the wallet address, on the same surfaces as the rest of the player site.
-- [ ] **States.** Loading, a failed load, and a disconnected wallet each have their own layout. Check home, an open event, a closed event, and My Coupons at a phone width. The coupon rows stack so 1, X, and 2 stay easy to tap.
-- [ ] **Leave admin as it is.** Do not restyle Admin, Users, or the signer and admin controls in the vault panel. A player can still read the vault status and the prize figures in the coupon layout. Those admin buttons do not move and do not get the new look.
-
-**Done when:** a player can find an event, fill the coupon, pay, and read a projected payout on a phone, and the player site no longer looks like the default Vuetify app. No payout figure changed because of the restyle. Admin and Users look as they do now.
 
 ---
 

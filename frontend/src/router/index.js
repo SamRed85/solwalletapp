@@ -9,8 +9,7 @@ const router = createRouter({
     {
       path: '/events/:id',
       name: 'Event',
-      component: () => import('@/views/Event.vue'),
-      meta: { requiresAuth: true }
+      component: () => import('@/views/Event.vue')
     },
     {
       path: '/profile',

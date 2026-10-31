@@ -1,21 +1,19 @@
 <template>
   <div class="mb-2">
-    <div class="text-body-2 mb-1">Best row: {{ best }} of {{ games }} correct</div>
+    <div class="text-body-2 mb-1">Best row: {{ best }}</div>
     <v-table v-if="payouts && lines.length" density="compact">
       <thead>
         <tr>
           <th>Correct</th>
-          <th>Your rows</th>
           <th>Each row wins</th>
-          <th>Total</th>
+          <th>Correct rows</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="line in lines" :key="line.correct">
-          <td>{{ line.correct }} of {{ games }}</td>
-          <td>{{ Number(line.rows).toLocaleString() }}</td>
+          <td>{{ line.correct }}</td>
           <td>{{ formatSol(Number(line.each)) }}</td>
-          <td>{{ formatSol(Number(lineTotal(line))) }}</td>
+          <td>{{ rowCount(line) }}</td>
         </tr>
       </tbody>
     </v-table>
@@ -32,8 +30,14 @@ defineProps({
   payouts: { type: Boolean, default: true }
 })
 
-function lineTotal (line) {
-  const each = typeof line.each === 'bigint' ? line.each : BigInt(Math.round(Number(line.each)))
-  return each * BigInt(line.rows)
+function rowCount (line) {
+  const yours = Number(line.rows).toLocaleString()
+  const total = Number(line.total)
+  if (!Number.isFinite(total)) return yours
+  return `${total.toLocaleString()} (${yours})`
 }
 </script>
+
+<style scoped>
+th, td { white-space: normal; }
+</style>

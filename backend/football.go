@@ -250,10 +250,7 @@ func rowsFromWinners(tiers []Tier, winners map[int]int, gameCount int, sales, ro
 		if tier.Correct == gameCount {
 			pot += rollover
 		}
-		var each uint64
-		if n > 0 {
-			each = pot / uint64(n)
-		}
+		each, _ := rowPayout(pot, n)
 		rows = append(rows, correctRow{Correct: tier.Correct, Rows: n, Each: each})
 	}
 	return rows
@@ -599,6 +596,38 @@ func (a *App) handleFixtureSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"fixtures": hits, "message": message})
+}
+
+func (a *App) handleFixturesByDate(w http.ResponseWriter, r *http.Request) {
+	if a.feed == nil || a.feed.key == "" {
+		writeError(w, http.StatusServiceUnavailable, "the score feed is not configured")
+		return
+	}
+	date := strings.TrimSpace(r.URL.Query().Get("date"))
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		writeError(w, http.StatusBadRequest, "a date is required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	hits, err := a.feed.fixturesOnDate(ctx, date, cleanZone(r.URL.Query().Get("timezone")))
+	if err != nil {
+		log.Printf("football search: %v", err)
+		writeError(w, http.StatusBadGateway, feedMessage(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"fixtures": orderFixtures(hits)})
+}
+
+func orderFixtures(hits []footballHit) []footballHit {
+	ordered := append([]footballHit(nil), hits...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Kickoff.Equal(ordered[j].Kickoff) {
+			return ordered[i].ID < ordered[j].ID
+		}
+		return ordered[i].Kickoff.Before(ordered[j].Kickoff)
+	})
+	return ordered
 }
 
 func (f *footballFeed) searchFixtures(ctx context.Context, team, away, date, timezone string) ([]footballHit, string, error) {

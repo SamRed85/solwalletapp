@@ -1,5 +1,8 @@
 import { correctCounts, picksFromSystem } from './program.js'
 
+// A winning row paid less than this rolls its whole tier into the next event.
+export const MIN_ROW_PAYOUT_LAMPORTS = 10_000_000n
+
 // FT and half time use the status. Added time is shown as 90+'. Otherwise the minute.
 export function matchClock (game) {
   if (!game) return ''
@@ -7,6 +10,14 @@ export function matchClock (game) {
   if (game.elapsed != null && game.extra > 0) return `${game.elapsed}+'`
   if (game.elapsed != null) return `${game.elapsed}'`
   return game.status || ''
+}
+
+export function kickoffStamp (kickoff) {
+  const date = new Date(kickoff)
+  if (Number.isNaN(date.getTime())) return ''
+  const day = date.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+  const time = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+  return `${day}, ${time}`
 }
 
 export function kickoffLabel (kickoff, now = new Date()) {
@@ -46,7 +57,9 @@ export function projectCoupon (system, projection) {
     if (!rows) return []
     const pot = BigInt(tier.potLamports || 0)
     const each = projection.maximum ? pot / BigInt(rows) : BigInt(tier.perWinnerLamports || 0)
-    return [{ correct: tier.correct, rows, each }]
+    if (each < MIN_ROW_PAYOUT_LAMPORTS) return []
+    const total = projection.maximum ? rows : Number(tier.winners || rows)
+    return [{ correct: tier.correct, rows, each, total }]
   }).sort((a, b) => b.correct - a.correct)
   const total = lines.reduce((sum, line) => sum + line.each * BigInt(line.rows), 0n)
   return { best, games: system.length, lines, total, maximum: !!projection.maximum }
@@ -74,7 +87,8 @@ export function combinedScore (systems, results, tiers, maximum) {
     if (!rows) return []
     const pot = BigInt(tier.potLamports || 0)
     const each = maximum ? pot / BigInt(rows) : BigInt(tier.perWinnerLamports || 0)
-    return [{ correct: tier.correct, rows, each }]
+    if (each < MIN_ROW_PAYOUT_LAMPORTS) return []
+    return [{ correct: tier.correct, rows, each, total: rows }]
   }).sort((a, b) => b.correct - a.correct)
   return { best, games: results.length, lines, maximum: !!maximum }
 }

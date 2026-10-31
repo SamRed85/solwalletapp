@@ -66,29 +66,48 @@ func TestSettle(t *testing.T) {
 		"111111111112X", // 11
 		"2222222222222", // 0
 	}
-	price := uint64(1_000_000)
+	// Scaled so every paid row stays at or above 0.01 SOL.
+	const scale = uint64(400)
+	price := uint64(1_000_000) * scale
 	sales := price * uint64(len(coupons))
-	s := settle(coupons, results, sales, 2_000_000, defaultTiers(13))
+	s := settle(coupons, results, sales, 2_000_000*scale, defaultTiers(13))
 	checkConservation(t, s)
 
 	pots := map[int]TierPayout{}
 	for _, tp := range s.Tiers {
 		pots[tp.Correct] = tp
 	}
-	if pots[13].PotLamports != 2_500_000+2_000_000 || pots[13].PerWinnerLamports != 4_500_000 {
+	if pots[13].PotLamports != (2_500_000+2_000_000)*scale || pots[13].PerWinnerLamports != 4_500_000*scale {
 		t.Fatalf("top tier should get 50%% of sales plus the rollover: %+v", pots[13])
 	}
-	if pots[12].PerWinnerLamports != 1_250_000 {
+	if pots[12].PerWinnerLamports != 1_250_000*scale {
 		t.Fatalf("12 correct: %+v", pots[12])
 	}
-	if pots[11].Winners != 2 || pots[11].PerWinnerLamports != 375_000 {
+	if pots[11].Winners != 2 || pots[11].PerWinnerLamports != 375_000*scale {
 		t.Fatalf("11 correct should be split between two coupons: %+v", pots[11])
 	}
-	if pots[10].Winners != 0 || s.RolloverOutLamports != 250_000 {
+	if pots[10].Winners != 0 || s.RolloverOutLamports != 250_000*scale {
 		t.Fatalf("unwon 10-correct tier should roll over: %+v rollover=%d", pots[10], s.RolloverOutLamports)
 	}
-	if s.HouseLamports != 250_000 {
+	if s.HouseLamports != 250_000*scale {
 		t.Fatalf("house should keep 5%%, got %d", s.HouseLamports)
+	}
+}
+
+func TestSettleSmallRowRollsTheWholeTier(t *testing.T) {
+	coupons := []string{"1111111", "1111111", "1111111", "1111111", "1111111", "1111111", "1111111", "1111111", "1111111", "1111111"}
+	s := settle(coupons, "1111111", 100_000_000, 0, []Tier{{7, 95}})
+	checkConservation(t, s)
+	if s.Tiers[0].Winners != 10 || s.Tiers[0].PerWinnerLamports != 0 || s.PaidLamports != 0 || s.RolloverOutLamports != 95_000_000 {
+		t.Fatalf("ten rows under 0.01 SOL should roll the whole pot: %+v", s)
+	}
+	if s.HouseLamports != 5_000_000 {
+		t.Fatalf("house should keep only the cut, got %d", s.HouseLamports)
+	}
+	exact := settle([]string{"1111111"}, "1111111", 10_526_316, 0, []Tier{{7, 95}})
+	checkConservation(t, exact)
+	if exact.Tiers[0].PerWinnerLamports != minRowPayoutLamports || exact.RolloverOutLamports != 0 {
+		t.Fatalf("exactly 0.01 SOL should still be paid: %+v", exact)
 	}
 }
 
@@ -103,13 +122,15 @@ func TestSettleNoTopWinnerRollsOverJackpot(t *testing.T) {
 func TestSettleRoundingGoesToHouse(t *testing.T) {
 	coupons := []string{"1111111", "1111111", "1111111"}
 	tiers := []Tier{{7, 95}}
-	s := settle(coupons, "1111111", 1_000_001, 0, tiers)
+	const sales = uint64(400_000_001)
+	s := settle(coupons, "1111111", sales, 0, tiers)
 	checkConservation(t, s)
-	if s.Tiers[0].PerWinnerLamports != 950_000/3 {
+	pot := sales * 95 / 100
+	if s.Tiers[0].PerWinnerLamports != pot/3 || s.Tiers[0].PerWinnerLamports < minRowPayoutLamports {
 		t.Fatalf("per winner: %+v", s.Tiers[0])
 	}
-	if s.PaidLamports > 950_000 {
-		t.Fatalf("paid more than the pot: %+v", s)
+	if s.PaidLamports >= pot || s.HouseLamports != sales-s.PaidLamports {
+		t.Fatalf("remainder should go to the house: %+v", s)
 	}
 }
 

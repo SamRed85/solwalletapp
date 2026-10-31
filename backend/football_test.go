@@ -42,30 +42,33 @@ func TestProjectionIsAMaximumUntilTheRevealWindowCloses(t *testing.T) {
 		8: {Status: "1H", Home: intptr(0), Away: intptr(0)},
 	}
 	tiers := []Tier{{Correct: 2, Percent: 70}, {Correct: 1, Percent: 25}}
-	open := buildProjection(games, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, nil)
+	// Large enough that a shared row still pays at least 0.01 SOL.
+	const sales = uint64(2_000_000_000)
+	const top = sales * 70 / 100
+	open := buildProjection(games, scores, now, now.Add(time.Hour), sales, 0, tiers, nil)
 	if !open.Complete || !open.Maximum {
 		t.Fatalf("open projection complete %v maximum %v", open.Complete, open.Maximum)
 	}
-	if open.Tiers[0].PerWinnerLamports != 700_000 {
+	if open.Tiers[0].PerWinnerLamports != top {
 		t.Fatalf("maximum payout = %d", open.Tiers[0].PerWinnerLamports)
 	}
-	known := buildProjection(games, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, map[int]int{2: 9})
-	if known.Maximum || known.Tiers[0].PerWinnerLamports != 700_000/9 || known.Rows[0].Rows != 9 || known.Rows[0].Each != 700_000/9 {
+	known := buildProjection(games, scores, now, now.Add(time.Hour), sales, 0, tiers, map[int]int{2: 9})
+	if known.Maximum || known.Tiers[0].PerWinnerLamports != top/9 || known.Rows[0].Rows != 9 || known.Rows[0].Each != top/9 {
 		t.Fatalf("shared rows maximum %v each %d rows %+v", known.Maximum, known.Tiers[0].PerWinnerLamports, known.Rows)
 	}
-	hidden := buildProjection(games, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, map[int]int{})
+	hidden := buildProjection(games, scores, now, now.Add(time.Hour), sales, 0, tiers, map[int]int{})
 	if !hidden.Maximum || len(hidden.Rows) != 2 || hidden.Rows[0].Correct != 2 || hidden.Rows[0].Rows != 0 || hidden.Tiers[0].Winners != 1 {
 		t.Fatalf("hidden coupons leaked a total %+v winners %d", hidden.Rows, hidden.Tiers[0].Winners)
 	}
-	shared := buildProjection(games, scores, now, now.Add(-time.Minute), 1_000_000, 0, tiers, map[int]int{2: 2})
-	if shared.Maximum || shared.Tiers[0].PerWinnerLamports != 350_000 {
+	shared := buildProjection(games, scores, now, now.Add(-time.Minute), sales, 0, tiers, map[int]int{2: 2})
+	if shared.Maximum || shared.Tiers[0].PerWinnerLamports != top/2 {
 		t.Fatalf("shared payout maximum %v each %d", shared.Maximum, shared.Tiers[0].PerWinnerLamports)
 	}
-	notStarted := buildProjection([]Game{{FixtureID: 7}, {FixtureID: 9, Kickoff: now.Add(time.Hour)}}, scores, now, now.Add(2*time.Hour), 1_000_000, 0, tiers, nil)
+	notStarted := buildProjection([]Game{{FixtureID: 7}, {FixtureID: 9, Kickoff: now.Add(time.Hour)}}, scores, now, now.Add(2*time.Hour), sales, 0, tiers, nil)
 	if !notStarted.Complete || notStarted.Games[1].Projected != "X" || len(notStarted.Tiers) == 0 {
 		t.Fatal("a match that has not started did not count as X")
 	}
-	unlinked := buildProjection([]Game{{FixtureID: 7}, {}}, scores, now, now.Add(time.Hour), 1_000_000, 0, tiers, nil)
+	unlinked := buildProjection([]Game{{FixtureID: 7}, {}}, scores, now, now.Add(time.Hour), sales, 0, tiers, nil)
 	if unlinked.Complete || len(unlinked.Tiers) != 0 {
 		t.Fatal("an unlinked match produced a payout")
 	}
@@ -118,6 +121,22 @@ func TestFixtureSearchRanksBothNamesFirst(t *testing.T) {
 	}
 	if msg := searchMessage("Arsenal", "", "2026-10-25", nil); msg != "No match on 2026-10-25 includes Arsenal. Check the spelling and the kickoff date." {
 		t.Fatalf("empty = %s", msg)
+	}
+}
+
+func TestOrderFixturesIsByKickoff(t *testing.T) {
+	noon := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	hits := []footballHit{
+		{ID: 9, Kickoff: noon.Add(2 * time.Hour)},
+		{ID: 4, Kickoff: noon},
+		{ID: 2, Kickoff: noon},
+	}
+	ordered := orderFixtures(hits)
+	if ordered[0].ID != 2 || ordered[1].ID != 4 || ordered[2].ID != 9 {
+		t.Fatalf("order = %+v", ordered)
+	}
+	if hits[0].ID != 9 {
+		t.Fatal("the source list was reordered")
 	}
 }
 

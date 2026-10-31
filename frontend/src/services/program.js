@@ -391,7 +391,9 @@ export function couponScore (coupon, event) {
     const rows = counts[tier.correct] ?? 0
     if (!rows) return []
     const each = event.perWinner[tier.correct - 1] ?? 0n
-    return [{ correct: tier.correct, rows, each }]
+    const pool = event.winners?.[tier.correct]
+    const total = pool > 0n ? Number(pool) : rows
+    return [{ correct: tier.correct, rows, each, total }]
   }).sort((a, b) => b.correct - a.correct)
   return { best, games: coupon.gameCount, lines }
 }

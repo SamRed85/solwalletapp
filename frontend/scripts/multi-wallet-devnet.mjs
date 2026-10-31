@@ -20,7 +20,8 @@ const DEPLOYER = '955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun'
 const COUNCIL = '4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH'
 const CLOCK = 'SysvarC1ock11111111111111111111111111111111'
 const REVEAL_NONCE = 7
-const FUND = 30_000_000
+const FUND = 400_000_000
+const TICKET = 200_000_000
 
 function rpcUrl () {
   if (process.env.SOLANA_RPC_URL) return process.env.SOLANA_RPC_URL
@@ -164,7 +165,7 @@ async function vaultRun (admin, council, payer) {
   const loseCoupon = couponPda(event, 1)
 
   console.log('vault: creating the event')
-  must(await send(admin, [admin], [createEventIx({ admin: admin.address, other: council.address, nonce, deadline, revealDeadline })]), 'create event')
+  must(await send(admin, [admin], [createEventIx({ admin: admin.address, other: council.address, nonce, deadline, revealDeadline, price: TICKET })]), 'create event')
   must(await send(winner, [winner], [placeCouponIx({ player: winner.address, admin: admin.address, nonce, index: 0, commitment: couponCommitment(winner.address, winPicks, REVEAL_NONCE), combinations: 1 })]), 'winner entry')
   must(await send(loser, [loser], [placeCouponIx({ player: loser.address, admin: admin.address, nonce, index: 1, commitment: couponCommitment(loser.address, losePicks, REVEAL_NONCE), combinations: 1 })]), 'loser entry')
 
@@ -182,7 +183,7 @@ async function vaultRun (admin, council, payer) {
   must(await send(admin, [admin], [tallyIx({ admin: admin.address, event, coupons: [winCoupon, loseCoupon] })]), 'tally')
 
   const settled = decodeEvent(await account(event))
-  if (settled.status !== 'resolved' || settled.perWinner[6] !== 1_900_000n || settled.house !== 100_000n) {
+  if (settled.status !== 'resolved' || settled.perWinner[6] !== 380_000_000n || settled.house !== 20_000_000n) {
     throw new Error(`unexpected vault settlement perWinner=${settled.perWinner[6]} house=${settled.house} status=${settled.status}`)
   }
 
@@ -244,7 +245,7 @@ async function treasuryRun (admin, deployer) {
     title: 'Multi-wallet test',
     description: 'Automated two-wallet treasury run',
     gameCount: 7,
-    couponPriceLamports: 1_000_000,
+    couponPriceLamports: TICKET,
     tiers: [{ correct: 7, percent: 95 }],
     startTime: start.toISOString(),
     endTime: end.toISOString()
@@ -267,7 +268,7 @@ async function treasuryRun (admin, deployer) {
     const { blockhash } = (await rpc('getLatestBlockhash', [{ commitment: 'confirmed' }])).value
     const memoBytes = new TextEncoder().encode(memo)
     const memoIx = { programId: 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr', accounts: [], data: memoBytes }
-    const message = compileMessage(key.address, [transferIx(key.address, TREASURY, 1_000_000), memoIx], blockhash)
+    const message = compileMessage(key.address, [transferIx(key.address, TREASURY, TICKET), memoIx], blockhash)
     const signatureBytes = ed25519.sign(message.message, key.seed)
     const transaction = concat([Uint8Array.of(1), signatureBytes, message.message])
     const signature = await rpc('sendTransaction', [Buffer.from(transaction).toString('base64'), { encoding: 'base64', preflightCommitment: 'confirmed' }])
@@ -292,13 +293,13 @@ async function treasuryRun (admin, deployer) {
   const report = await call('GET', `/api/events/${event.id}/payouts`)
   const won = report.payouts.find(row => row.walletAddress === winner.address)
   const lost = report.payouts.find(row => row.walletAddress === loser.address)
-  if (!won || won.winningsLamports !== 1_900_000) throw new Error(`winner payout ${JSON.stringify(won)}`)
+  if (!won || won.winningsLamports !== 380_000_000) throw new Error(`winner payout ${JSON.stringify(won)}`)
   if (lost) throw new Error('a wallet with no winning rows must be omitted')
-  if (settled.settlement?.houseLamports !== 100_000 || report.settlement?.paidLamports !== 1_900_000) {
+  if (settled.settlement?.houseLamports !== 20_000_000 || report.settlement?.paidLamports !== 380_000_000) {
     throw new Error(`settlement house ${settled.settlement?.houseLamports} paid ${report.settlement?.paidLamports}`)
   }
   console.log(`treasury: event ${event.id}`)
-  console.log(`treasury: winner ${winner.address} is owed 1900000 lamports`)
+  console.log(`treasury: winner ${winner.address} is owed 380000000 lamports`)
   console.log(`treasury: loser ${loser.address} is owed nothing`)
 }
 

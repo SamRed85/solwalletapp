@@ -1,37 +1,13 @@
 <template>
   <v-container class="py-8" max-width="900">
-    <div class="text-center mb-8">
-      <v-icon size="72" color="primary" class="mb-4">mdi-target</v-icon>
-      <h1 class="text-h3 font-weight-light mb-2">Welcome to Sol</h1>
+    <div class="text-center mb-6 home-hero">
+      <v-icon :size="mobile ? 48 : 72" color="primary" class="mb-3">mdi-target</v-icon>
+      <h1 class="text-h3 mb-2">Welcome to Sol</h1>
       <p class="text-h6 text-medium-emphasis">Predict match outcomes with your Solana wallet</p>
     </div>
 
-    <v-card v-if="!auth.wallet" variant="outlined" class="pa-6 text-center">
-      <template v-if="phantomInstalled">
-        <v-icon size="48" color="primary" class="mb-4">mdi-wallet</v-icon>
-        <h2 class="text-h5 mb-2">Ready to get started?</h2>
-        <p class="text-body-1 text-medium-emphasis mb-4">
-          Connect Phantom and sign a message to prove you own the wallet. Signing is free and sends no transaction.
-        </p>
-        <v-btn color="primary" size="large" prepend-icon="mdi-wallet" :loading="auth.busy" @click="onLogin">
-          Connect wallet
-        </v-btn>
-      </template>
-      <template v-else>
-        <v-icon size="48" color="warning" class="mb-4">mdi-wallet-outline</v-icon>
-        <h2 class="text-h5 mb-2">Phantom wallet required</h2>
-        <p class="text-body-1 text-medium-emphasis mb-4">
-          Install the Phantom browser extension and switch it to Devnet in its settings.
-        </p>
-        <v-btn color="primary" href="https://phantom.app/" target="_blank" prepend-icon="mdi-download">
-          Install Phantom
-        </v-btn>
-      </template>
-    </v-card>
-
-    <template v-else>
-      <v-card>
-        <v-card-title class="d-flex align-center">
+    <v-card>
+        <v-card-title class="d-flex align-center flex-wrap ga-2">
           <v-icon class="mr-2">mdi-calendar</v-icon>
           Events
           <v-spacer />
@@ -43,38 +19,64 @@
         <v-card-text v-if="!loading && events.length === 0" class="text-center text-medium-emphasis">
           No events yet.
         </v-card-text>
-        <v-list v-else lines="two">
+        <v-list v-else lines="three">
           <v-list-item
-            v-for="event in events" :key="event.id" :title="event.title" :to="`/events/${event.id}`" lines="three"
+            v-for="event in events" :key="event.id" class="event-link" :to="`/events/${event.id}`"
             :disabled="event.status === 'draft' && !auth.isAdmin"
-            :subtitle="`${event.gameCount} games · ${formatSol(event.couponPriceLamports)} per coupon · entries close ${formatDate(event.startTime)}`"
           >
-            <template #append>
-              <v-chip v-if="event.rolloverInLamports" color="amber" size="small" variant="flat" class="mr-2" prepend-icon="mdi-trophy">
+            <v-list-item-title>{{ event.title }}</v-list-item-title>
+            <v-list-item-subtitle>
+              {{ event.gameCount }} games · {{ formatSol(event.couponPriceLamports) }} per coupon · entries close {{ formatDate(event.startTime) }}
+            </v-list-item-subtitle>
+            <div class="d-flex flex-wrap ga-2 mt-2">
+              <v-chip v-if="event.rolloverInLamports" color="amber" size="small" variant="flat" prepend-icon="mdi-trophy">
                 +{{ formatSol(event.rolloverInLamports) }}
               </v-chip>
               <v-chip :color="statusColors[event.status]" size="small" variant="flat">
                 {{ event.status === 'open' ? 'play' : event.status }}
               </v-chip>
-            </template>
+            </div>
           </v-list-item>
         </v-list>
       </v-card>
-      <div class="text-center mt-4">
+
+      <v-card v-if="!auth.wallet" variant="outlined" class="pa-6 text-center mt-4">
+        <template v-if="phantomInstalled">
+          <h2 class="text-h6 mb-2">Play when you are ready</h2>
+          <p class="text-body-1 text-medium-emphasis mb-4">
+            You can look through the events without a wallet. Connect Phantom and sign a message when you want to enter a coupon. Signing is free and sends no transaction.
+          </p>
+          <v-btn color="primary" size="large" prepend-icon="mdi-wallet" :loading="auth.busy" @click="onLogin">
+            Connect wallet
+          </v-btn>
+        </template>
+        <template v-else>
+          <h2 class="text-h6 mb-2">Phantom wallet required to play</h2>
+          <p class="text-body-1 text-medium-emphasis mb-4">
+            Install the Phantom browser extension and switch it to Devnet in its settings. You can still browse the events first.
+          </p>
+          <v-btn color="primary" href="https://phantom.app/" target="_blank" prepend-icon="mdi-download">
+            Install Phantom
+          </v-btn>
+        </template>
+      </v-card>
+
+      <div v-else class="text-center mt-4">
         <v-btn variant="text" prepend-icon="mdi-ticket" to="/coupons">My Coupons</v-btn>
       </div>
-    </template>
   </v-container>
 </template>
 
 <script setup>
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useDisplay } from 'vuetify'
 import { eventApi } from '@/services/api'
 import { isPhantomInstalled } from '@/services/solana'
 import { auth, login } from '@/stores/auth'
 import { notifyError } from '@/stores/notify'
 import { formatDate, formatSol, statusColors } from '@/utils/format'
 
+const { smAndDown: mobile } = useDisplay()
 const phantomInstalled = ref(isPhantomInstalled())
 const events = ref([])
 const loading = ref(false)
@@ -83,6 +85,7 @@ const newestFirst = (a, b) => new Date(b.createdAt || b.startTime) - new Date(a.
 let phantomTimer
 
 onMounted(() => {
+  loadEvents()
   phantomTimer = setInterval(() => {
     phantomInstalled.value = isPhantomInstalled()
     if (phantomInstalled.value) clearInterval(phantomTimer)
@@ -109,8 +112,24 @@ async function onLogin () {
   }
 }
 
-watch(() => auth.wallet, wallet => {
-  if (wallet) loadEvents()
-  else events.value = []
-}, { immediate: true })
+watch(() => auth.wallet, () => loadEvents())
 </script>
+
+<style scoped>
+.event-link {
+  transition: transform 180ms ease, box-shadow 180ms ease;
+}
+
+.event-link:not(.v-list-item--disabled):hover {
+  transform: translateY(-2px);
+  box-shadow: 0 1px 2px rgba(13, 71, 161, 0.06), 0 8px 24px rgba(13, 71, 161, 0.08);
+}
+
+.event-link:not(.v-list-item--disabled):active {
+  transform: translateY(0);
+}
+
+.v-theme--dark .event-link:not(.v-list-item--disabled):hover {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+</style>

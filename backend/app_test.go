@@ -246,6 +246,42 @@ func TestGetTransactionRequiresFinality(t *testing.T) {
 	}
 }
 
+func TestFootballAPIKeys(t *testing.T) {
+	t.Setenv("API_FOOTBALL_KEY", "first-key-value9316")
+	t.Setenv("API_FOOTBALL_KEY_2", "second-key-value3b08")
+	got := footballAPIKeys()
+	if len(got) != 2 || got[0] != "first-key-value9316" || got[1] != "second-key-value3b08" {
+		t.Fatalf("got %#v", got)
+	}
+	if maskAPIKey(got[0]) != "…9316" || maskAPIKey(got[1]) != "…3b08" {
+		t.Fatalf("masked %#v", []string{maskAPIKey(got[0]), maskAPIKey(got[1])})
+	}
+	t.Setenv("API_FOOTBALL_KEY_2", "")
+	got = footballAPIKeys()
+	if len(got) != 1 || got[0] != "first-key-value9316" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestChooseAPIFootballKey(t *testing.T) {
+	keys := []string{"first", "second"}
+	if got := chooseAPIFootballKeyFrom(keys, strings.NewReader(""), false); got != "first" {
+		t.Fatalf("non-interactive got %q", got)
+	}
+	if got := chooseAPIFootballKeyFrom(keys, strings.NewReader("\n"), true); got != "first" {
+		t.Fatalf("blank choice got %q", got)
+	}
+	if got := chooseAPIFootballKeyFrom(keys, strings.NewReader("2\n"), true); got != "second" {
+		t.Fatalf("choice 2 got %q", got)
+	}
+	if got := chooseAPIFootballKeyFrom(keys, strings.NewReader("9\n1\n"), true); got != "first" {
+		t.Fatalf("retry got %q", got)
+	}
+	if _, ok := parseKeyChoice("x", 2); ok {
+		t.Fatal("junk accepted")
+	}
+}
+
 func TestDotEnvFillsOnlyMissingValues(t *testing.T) {
 	t.Setenv("SOLANA_RPC_URL", "")
 	applyDotEnv([]byte("# comment\nSOLANA_RPC_URL=\"https://devnet.example/?api-key=secret\"\n"))

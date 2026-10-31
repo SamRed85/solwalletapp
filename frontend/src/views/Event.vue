@@ -6,7 +6,7 @@
     <template v-if="event">
       <v-card class="mb-4">
         <v-card-title class="d-flex align-center flex-wrap ga-2">
-          {{ event.title }}
+          <span class="event-title">{{ event.title }}</span>
           <v-chip :color="statusColors[event.status]" size="small" variant="flat">{{ event.status }}</v-chip>
           <v-chip v-if="event.rolloverInLamports" color="amber" size="small" variant="flat" prepend-icon="mdi-trophy">
             Jackpot +{{ formatSol(event.rolloverInLamports) }}
@@ -27,81 +27,83 @@
         <v-card-text>
           <p v-if="event.description" class="mb-4">{{ event.description }}</p>
           <p v-if="event.chain" class="text-body-2">
-            Entries are held by the on-chain vault below. Reveal your picks in My Coupons after entries close; a coupon that
+            Entries are held by the on-chain vault. Reveal your picks in My Coupons after entries close; a coupon that
             is not revealed before {{ formatDate(event.endTime) }} cannot win and its stake stays in the prize pool.
           </p>
           <template v-if="!event.chain">
-            <v-table density="compact">
-              <thead>
-                <tr>
-                  <th>Correct picks</th><th>Share</th><th>{{ settlement ? 'Pot' : 'Pot so far' }}</th>
-                  <th v-if="settlement">Winning coupons</th><th v-if="settlement">Each wins</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="tier in tierRows" :key="tier.correct">
-                  <td>{{ tier.correct }} of {{ event.gameCount }}</td>
-                  <td>{{ tier.percent }}%</td>
-                  <td>{{ formatSol(tier.potLamports) }}</td>
-                  <template v-if="settlement">
-                    <td>{{ tier.winners }}</td>
-                    <td>{{ tier.winners ? formatSol(tier.perWinnerLamports) : 'rolls over' }}</td>
-                  </template>
-                </tr>
-              </tbody>
-            </v-table>
-            <p class="text-caption text-medium-emphasis mt-2">
+            <div class="sales-block mb-2">
+              <div class="sales-label">Pot</div>
+              <div class="sales-amount">{{ formatSol(salesLamports) }}</div>
+            </div>
+            <p class="text-caption text-medium-emphasis mb-3">
               {{ event.couponsSold }} coupon{{ event.couponsSold === 1 ? '' : 's' }} sold. The house keeps {{ houseCut }}% of ticket sales.
-              A prize tier without winners rolls over to the jackpot (all games correct) of the next event.
             </p>
-            <p v-if="settlement?.rolloverOutLamports" class="text-caption mt-1">
-              {{ formatSol(settlement.rolloverOutLamports) }} rolled over to
-              <router-link v-if="settlement.rolloverToEventId" :to="`/events/${settlement.rolloverToEventId}`">the next event</router-link>
-              <span v-else>the next event that is created</span>.
-            </p>
+            <v-expansion-panels>
+              <v-expansion-panel>
+                <v-expansion-panel-title>{{ settlement ? 'Winnings' : 'Pot so far' }}</v-expansion-panel-title>
+                <v-expansion-panel-text>
+                  <v-table density="compact">
+                    <thead>
+                      <tr>
+                        <th>Correct picks</th><th>Share</th><th>{{ settlement ? 'Pot' : 'Pot so far' }}</th>
+                        <th v-if="settlement">Winning coupons</th><th v-if="settlement">Each wins</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="tier in tierRows" :key="tier.correct">
+                        <td>{{ tier.correct }}</td>
+                        <td>{{ tier.percent }}%</td>
+                        <td>{{ formatSol(tier.potLamports) }}</td>
+                        <template v-if="settlement">
+                          <td>{{ tier.winners }}</td>
+                          <td>{{ tier.perWinnerLamports ? formatSol(tier.perWinnerLamports) : 'rolls over' }}</td>
+                        </template>
+                      </tr>
+                    </tbody>
+                  </v-table>
+                  <p class="text-caption text-medium-emphasis mt-2 mb-0">
+                    A prize tier rolls over to the jackpot (all games correct) of the next event when nobody hits it, or when each winning row would receive less than 0.01 SOL.
+                  </p>
+                  <p v-if="settlement?.rolloverOutLamports" class="text-caption mt-1 mb-0">
+                    {{ formatSol(settlement.rolloverOutLamports) }} rolled over to
+                    <router-link v-if="settlement.rolloverToEventId" :to="`/events/${settlement.rolloverToEventId}`">the next event</router-link>
+                    <span v-else>the next event that is created</span>.
+                  </p>
+                </v-expansion-panel-text>
+              </v-expansion-panel>
+            </v-expansion-panels>
           </template>
         </v-card-text>
+        <VaultPanel v-if="event.chain" embedded :event="event" @changed="refreshEvent" />
       </v-card>
-
-      <VaultPanel v-if="event.chain" :event="event" class="mb-4" @changed="refreshEvent" />
 
       <v-card v-if="event.status !== 'open'" class="mb-4" title="Games">
         <v-card-subtitle v-if="event.status !== 'completed'" class="text-wrap">
           A live score is what the match shows now. It is not the settled result.
         </v-card-subtitle>
-        <v-table density="compact">
-          <thead><tr><th>#</th><th>Game</th><th>Kickoff</th><th class="text-right">Result</th></tr></thead>
-          <tbody>
-            <tr v-for="(game, index) in event.games" :key="index">
-              <td>{{ index + 1 }}</td>
-              <td>{{ game.homeTeam }} vs {{ game.awayTeam }}</td>
-              <td>{{ formatDate(game.kickoff) }}</td>
-              <td class="result-cell">
-                <div class="result-line">
-                  <MatchScore
-                    v-if="liveGame(index)?.linked"
-                    :game="liveGame(index)"
-                    :kickoff="game.kickoff"
-                    :placeholder="!game.result"
-                    :finished="game.result === '1' || game.result === 'X' || game.result === '2'"
-                  >
-                    <span class="marks">
-                      <span v-for="mark in marksFor(game)" :key="mark" class="mark" :class="{ on: mark === outcomeAt(index) }">{{ mark }}</span>
-                    </span>
-                  </MatchScore>
-                  <span v-else class="marks">
-                    <span v-for="mark in marksFor(game)" :key="mark" class="mark" :class="{ on: mark === outcomeAt(index) }">{{ mark }}</span>
-                  </span>
-                </div>
-                <div v-if="game.draw" class="text-caption text-medium-emphasis">
-                  Weights 1/X/2: {{ game.draw.weights.join(' / ') }} ·
-                  <a :href="explorerBlock(game.draw.slot)" target="_blank" rel="noopener">block {{ game.draw.slot }}</a>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </v-table>
-        <v-card-text v-if="allRows.length || projection">
+        <div v-for="(game, index) in event.games" :key="index" class="game-row">
+          <div class="game-top">
+            <div class="game-name-line">
+              <div class="font-weight-medium"><span class="game-no">{{ index + 1 }}.</span>{{ game.homeTeam }} vs {{ game.awayTeam }}</div>
+              <MatchScore
+                v-if="liveGame(index)?.linked"
+                :game="liveGame(index)"
+                :kickoff="game.kickoff"
+                :placeholder="!game.result"
+                :finished="game.result === '1' || game.result === 'X' || game.result === '2'"
+              />
+            </div>
+            <span class="marks">
+              <span v-for="mark in marksFor(game)" :key="mark" class="mark" :class="{ on: mark === outcomeAt(index) }">{{ mark }}</span>
+            </span>
+          </div>
+          <div class="game-when">{{ kickoffStamp(game.kickoff) }}</div>
+          <div v-if="game.draw" class="text-caption text-medium-emphasis">
+            Weights 1/X/2: {{ game.draw.weights.join(' / ') }} ·
+            <a :href="explorerBlock(game.draw.slot)" target="_blank" rel="noopener">block {{ game.draw.slot }}</a>
+          </div>
+        </div>
+        <v-card-text v-if="officialResults || projection?.revealClosed">
           <div class="text-subtitle-2">All rows</div>
           <div v-if="!allRows.length" class="text-caption text-medium-emphasis">
             The totals appear once every match has a score.
@@ -109,26 +111,26 @@
           <template v-else>
             <div class="text-caption text-medium-emphasis mb-1">
               <template v-if="officialResults">Every revealed row in this event.</template>
-              <template v-else>If these scores stand. Counted from revealed coupons. Hidden coupons are not included yet.</template>
+              <template v-else>If these scores stand. Counted from revealed coupons.</template>
             </div>
-            <v-table density="compact">
-              <thead><tr><th>Correct</th><th>Rows</th><th>Each row wins</th></tr></thead>
+            <v-table>
+              <thead><tr><th>Correct picks</th><th>Rows</th><th>Payout</th></tr></thead>
               <tbody>
                 <tr v-for="row in allRows" :key="row.correct">
-                  <td>{{ row.correct }} of {{ event.gameCount }}</td>
+                  <td>{{ row.correct }}</td>
                   <td>{{ Number(row.rows).toLocaleString() }}</td>
-                  <td>{{ row.rows ? formatSol(row.each) : 'rolls over' }}</td>
+                  <td>{{ row.each ? formatSol(row.each) : 'rolls over' }}</td>
                 </tr>
               </tbody>
             </v-table>
           </template>
         </v-card-text>
-        <v-card-actions v-if="event.status === 'completed'">
+        <v-card-actions v-if="event.status === 'completed' && auth.wallet">
           <v-btn color="primary" prepend-icon="mdi-ticket" to="/coupons">See my coupons</v-btn>
         </v-card-actions>
       </v-card>
 
-      <v-card v-if="event.status === 'open'">
+      <v-card v-if="event.status === 'open'" class="coupon-entry">
         <v-card-title>Your coupon</v-card-title>
         <v-card-subtitle class="text-wrap">
           Select one or more of 1 (home win), X (draw) and 2 (away win) for every game.
@@ -142,25 +144,37 @@
           <v-alert v-if="isTreasury" type="warning" variant="tonal" class="mb-4">
             This wallet is the treasury wallet and cannot pay itself. Sign in with another wallet to play.
           </v-alert>
-          <div class="d-flex flex-wrap ga-2 mb-4">
-            <v-btn size="small" color="success" variant="tonal" prepend-icon="mdi-home" :disabled="paying" @click="selectAll('1')">All 1</v-btn>
-            <v-btn size="small" color="warning" variant="tonal" prepend-icon="mdi-minus" :disabled="paying" @click="selectAll('X')">All X</v-btn>
-            <v-btn size="small" color="info" variant="tonal" prepend-icon="mdi-arrow-right" :disabled="paying" @click="selectAll('2')">All 2</v-btn>
-            <v-btn size="small" color="error" variant="tonal" prepend-icon="mdi-close" :disabled="paying" @click="clearPicks">Clear</v-btn>
-          </div>
-          <div v-for="(game, g) in event.games" :key="g" class="d-flex align-center flex-wrap ga-3 py-2 game-row">
-            <div class="game-cell">
-              <div class="font-weight-medium">{{ g + 1 }}. {{ game.homeTeam }} vs {{ game.awayTeam }}</div>
-              <MatchScore :game="projection?.games?.[g]" :kickoff="game.kickoff" />
+          <div v-if="event.games.length" class="game-row fill-row">
+            <div class="game-top">
+              <div class="fill-spacer">
+                <v-btn class="pick-btn" variant="text" :disabled="paying" title="Clear every pick" @click="clearPicks">
+                  <v-icon icon="mdi-close" size="16" />
+                </v-btn>
+              </div>
+              <v-btn
+                v-for="o in outcomes" :key="o.value" class="pick-btn" variant="text" :disabled="paying"
+                :title="`${o.label} on every game`" @click="selectAll(o.value)"
+              >
+                <v-icon icon="mdi-arrow-down" size="16" />
+              </v-btn>
             </div>
-            <v-btn
-              v-for="o in outcomes" :key="o.value" :title="o.label" min-width="44" :disabled="paying"
-              :color="isSelected(g, o.value) ? 'primary' : undefined"
-              :variant="isSelected(g, o.value) ? 'flat' : 'outlined'"
-              @click="togglePick(g, o.value)"
-            >
-              {{ o.value }}
-            </v-btn>
+          </div>
+          <div v-for="(game, g) in event.games" :key="g" class="game-row">
+            <div class="game-top">
+              <div class="game-name-line">
+                <div class="font-weight-medium"><span class="game-no">{{ g + 1 }}.</span>{{ game.homeTeam }} vs {{ game.awayTeam }}</div>
+                <MatchScore v-if="projection?.games?.[g]?.linked" :game="projection.games[g]" :kickoff="game.kickoff" />
+              </div>
+              <v-btn
+                v-for="o in outcomes" :key="o.value" class="pick-btn" :title="o.label" :disabled="paying"
+                :color="isSelected(g, o.value) ? 'primary' : undefined"
+                :variant="isSelected(g, o.value) ? 'flat' : 'outlined'"
+                @click="togglePick(g, o.value)"
+              >
+                {{ o.value }}
+              </v-btn>
+            </div>
+            <div class="game-when">{{ kickoffStamp(game.kickoff) }}</div>
           </div>
           <div v-if="preview.length" class="mt-4">
             <div class="text-subtitle-2 mb-2">Combinations</div>
@@ -170,7 +184,7 @@
           </div>
         </v-card-text>
         <v-divider />
-        <v-card-actions class="flex-wrap ga-2 pa-4">
+        <v-card-actions class="pay-bar flex-wrap ga-2 pa-4">
           <div>
             <div class="text-subtitle-1">
               {{ combinationTotal.toLocaleString() }} combination{{ combinationTotal === 1 ? '' : 's' }} × {{ formatSol(event.couponPriceLamports) }} =
@@ -187,6 +201,14 @@
           </div>
           <v-spacer />
           <v-btn
+            v-if="!auth.wallet"
+            color="primary" variant="flat" size="large" prepend-icon="mdi-wallet"
+            :loading="auth.busy" @click="onLogin"
+          >
+            Connect wallet to play
+          </v-btn>
+          <v-btn
+            v-else
             color="primary" variant="flat" size="large" prepend-icon="mdi-wallet"
             :disabled="!complete || isTreasury" :loading="paying" @click="pay"
           >
@@ -208,9 +230,10 @@ import ProjectedPayout from '@/components/ProjectedPayout.vue'
 import VaultPanel from '@/components/VaultPanel.vue'
 import { eventApi } from '@/services/api'
 import { payAndEnter, placeOnChain } from '@/services/entry'
-import { auth, loadConfig, refreshBalance } from '@/stores/auth'
+import { auth, loadConfig, login, refreshBalance } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { combinationCount, expandCombinations, systemRows } from '@/utils/coupons'
+import { kickoffStamp } from '@/services/projection'
 import { explorerBlock, formatDate, formatSol, outcomes, statusColors } from '@/utils/format'
 
 const route = useRoute()
@@ -250,10 +273,16 @@ const statusText = computed(() => {
   return 'Plus a small Solana network fee, paid from your wallet.'
 })
 
+const salesLamports = computed(() => {
+  const e = event.value
+  if (!e) return 0
+  return e.couponsSold * e.couponPriceLamports
+})
+
 const tierRows = computed(() => {
   const e = event.value
   if (settlement.value) return settlement.value.tiers
-  const sales = e.couponsSold * e.couponPriceLamports
+  const sales = salesLamports.value
   return e.tiers.map(t => ({
     ...t,
     potLamports: Math.floor(sales * t.percent / 100) + (t.correct === e.gameCount ? e.rolloverInLamports : 0)
@@ -299,8 +328,16 @@ const allRows = computed(() => {
   return rows.filter(row => paying.has(row.correct))
 })
 
+async function onLogin () {
+  try {
+    await login()
+  } catch (error) {
+    notifyError(error)
+  }
+}
+
 async function loadProjection () {
-  if (!event.value?.games?.some(game => game.fixtureId)) {
+  if (!auth.wallet || !event.value?.games?.some(game => game.fixtureId)) {
     projection.value = null
     return
   }
@@ -395,37 +432,115 @@ watch(() => route.params.id, id => {
   load().then(loadProjection)
 }, { immediate: true })
 
+watch(() => auth.wallet, wallet => {
+  if (wallet && event.value) loadProjection()
+})
+
 const projectionTimer = setInterval(loadProjection, 60000)
 onBeforeUnmount(() => clearInterval(projectionTimer))
 </script>
 
 <style scoped>
-.game-row { border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
-.game-cell { flex: 1 1 220px; }
-.result-cell { text-align: right; }
-.result-line {
+.event-title {
+  font-size: 3.4rem;
+  font-weight: 600;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+}
+.game-row {
   display: flex;
-  justify-content: flex-end;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+.game-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+.fill-row { border-bottom: 0; padding-bottom: 0; }
+.fill-spacer { display: flex; justify-content: flex-end; min-width: 0; }
+.coupon-entry .game-top {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(3, 25px);
+  column-gap: 8px;
   align-items: center;
 }
-.marks { display: inline-flex; gap: 4px; }
+.game-no { margin-right: 3px; }
+.game-name-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  max-width: 100%;
+  min-width: 0;
+}
+.game-name-line .font-weight-medium {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.game-name-line :deep(.when) { display: none; }
+.game-name-line :deep(.match-score) { flex: none; gap: 4px; }
+.game-name-line :deep(.clock) { min-width: 0; font-size: 11px; }
+.game-name-line :deep(.pill) { min-width: 0; padding: 1px 6px; font-size: 11px; }
+.game-when {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.1;
+  font-weight: 600;
+  color: rgba(var(--v-theme-on-surface), 0.62);
+  white-space: nowrap;
+}
+.pick-btn {
+  flex: 0 0 25px;
+  width: 25px !important;
+  min-width: 25px !important;
+  height: 25px !important;
+  min-height: 25px !important;
+  padding: 0 !important;
+  font-size: 12px;
+  transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+.pick-btn:active {
+  transform: scale(0.98);
+}
+.marks { display: inline-flex; gap: 8px; flex: none; }
 .mark {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 28px;
-  height: 28px;
-  padding: 0 6px;
-  border-radius: 8px;
+  width: 25px;
+  min-width: 25px;
+  height: 25px;
+  padding: 0;
+  border-radius: 6px;
   border: 1px solid rgba(var(--v-theme-on-surface), 0.16);
   background: transparent;
   color: rgba(var(--v-theme-on-surface), 0.45);
   font-weight: 700;
-  font-size: 13px;
+  font-size: 12px;
 }
 .mark.on {
   border-color: transparent;
   background: rgba(var(--v-theme-on-surface), 0.14);
   color: rgb(var(--v-theme-on-surface));
+}
+@media (max-width: 959px) {
+  .event-title { font-size: 2rem; }
+  .game-row { flex-wrap: nowrap; width: 100%; }
+  .game-name-line .font-weight-medium { font-size: 10px; }
+  .coupon-entry .game-name-line .font-weight-medium { font-size: 14px; }
+  .game-when { font-size: 9px; }
+  .pay-bar { flex-direction: column; align-items: stretch; }
+  .pay-bar .v-btn { width: 100%; }
 }
 </style>

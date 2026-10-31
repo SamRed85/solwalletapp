@@ -1,7 +1,7 @@
 <template>
   <v-container class="py-6">
     <v-card>
-      <v-card-title class="d-flex align-center">
+      <v-card-title class="d-flex align-center flex-wrap ga-2">
         <v-icon color="warning" class="mr-2">mdi-shield-crown</v-icon>
         Events
         <v-spacer />
@@ -11,12 +11,27 @@
         Games can be set once while the event is a draft. Results can be set once, after the start time.
         An event can be deleted while it is not on chain, has no coupons, and has no results.
       </v-card-subtitle>
+      <v-alert
+        v-for="event in blockedEvents" :key="event.id" type="warning" variant="tonal"
+        class="mx-4 mb-2" density="compact"
+      >
+        {{ event.title }}: {{ event.autoResolveBlock }}
+      </v-alert>
 
-      <v-data-table :headers="headers" :items="events" :loading="loading" :sort-by="[{ key: 'createdAt', order: 'desc' }]" item-value="id">
+      <v-data-table class="phone-stack" :headers="headers" :items="events" :loading="loading" :sort-by="[{ key: 'createdAt', order: 'desc' }]" item-value="id">
+        <template #[`item.title`]="{ value }">
+          <span class="cell-label">Title</span>{{ value }}
+        </template>
         <template #[`item.status`]="{ value }">
+          <span class="cell-label">Status</span>
           <v-chip :color="statusColors[value]" size="small" variant="flat">{{ value }}</v-chip>
         </template>
-        <template #[`item.startTime`]="{ value }">{{ formatDate(value) }}</template>
+        <template #[`item.gameCount`]="{ value }">
+          <span class="cell-label">Games</span>{{ value }}
+        </template>
+        <template #[`item.startTime`]="{ value }">
+          <span class="cell-label">Entries close</span>{{ formatDate(value) }}
+        </template>
         <template #[`item.actions`]="{ item }">
           <v-btn icon="mdi-eye" size="small" variant="text" title="Details" @click="openDetails(item)" />
           <v-btn
@@ -55,13 +70,13 @@
           Connect the configured treasury wallet to send these refunds.
         </v-alert>
         <p v-if="recoveries.length === 0" class="text-medium-emphasis">No refunds are waiting.</p>
-        <v-table v-else density="compact">
+        <v-table v-else class="phone-stack" density="compact">
           <thead><tr><th>Wallet</th><th>Event</th><th>Amount</th><th /></tr></thead>
           <tbody>
             <tr v-for="recovery in recoveries" :key="recovery.signature">
-              <td><code>{{ recovery.walletAddress }}</code></td>
-              <td><code>{{ recovery.eventId }}</code></td>
-              <td>{{ formatSol(recovery.lamports) }}</td>
+              <td><span class="cell-label">Wallet</span><code>{{ recovery.walletAddress }}</code></td>
+              <td><span class="cell-label">Event</span><code>{{ recovery.eventId }}</code></td>
+              <td><span class="cell-label">Amount</span>{{ formatSol(recovery.lamports) }}</td>
               <td class="text-right">
                 <v-btn
                   color="warning" size="small" variant="flat"
@@ -157,13 +172,48 @@
               Kickoffs must be between the event start ({{ formatDate(selected?.startTime) }}) and end. Entries close at the event start.
             </p>
             <p class="text-caption text-medium-emphasis mb-2">
-              Find fixture lists that day's matches whose names include the home team. A game without a fixture has no live score.
+              Show games lists every match on that date. Tick the ones for this coupon. A game without a fixture has no live score.
             </p>
+            <v-row dense align="center">
+              <v-col cols="12" sm="4">
+                <v-text-field v-model="fixtureDate" label="Match date" type="date" density="compact" hide-details />
+              </v-col>
+              <v-col cols="12" sm="8">
+                <v-btn type="button" size="small" variant="tonal" prepend-icon="mdi-soccer" :loading="loadingFixtures" @click="loadDayFixtures">
+                  Show games
+                </v-btn>
+              </v-col>
+            </v-row>
+            <p class="text-caption text-medium-emphasis mb-2">
+              {{ pickedFixtures }} of {{ selected?.gameCount }} on the coupon<span v-if="dayFixtures.length"> · {{ dayFixtures.length }} games on this date</span>
+            </p>
+            <v-text-field
+              v-if="dayFixtures.length" v-model="fixtureQuery" label="Filter by team or league" density="compact"
+              hide-details clearable class="mb-2"
+            />
+            <p v-if="fixtureMessage" class="text-caption text-warning mb-2">{{ fixtureMessage }}</p>
+            <v-sheet v-if="shownFixtures.length" :key="fixtureDate" border rounded class="fixture-list mb-4">
+              <div v-for="hit in shownFixtures" :key="hit.id" class="fixture-row">
+                <v-checkbox
+                  :model-value="rowForFixture(hit.id) >= 0"
+                  :disabled="fixtureDisabled(hit)"
+                  :label="`${hit.home} vs ${hit.away}`"
+                  density="compact" hide-details
+                  @update:model-value="checked => toggleFixture(hit, !!checked)"
+                />
+                <div class="text-caption text-medium-emphasis fixture-meta">
+                  {{ hit.league }} · {{ formatDate(hit.kickoff) }}
+                  <span v-if="hit.status && hit.status !== 'NS' && hit.status !== 'TBD'"> · {{ hit.status }}</span>
+                  <span v-if="!kickoffInEvent(hit)" class="text-warning"> · outside this event</span>
+                </div>
+              </div>
+            </v-sheet>
+            <p v-else-if="dayFixtures.length" class="text-caption text-medium-emphasis mb-4">No games match that filter.</p>
             <v-row v-for="(game, index) in newGames" :key="index" dense align="center">
-              <v-col cols="1" class="text-medium-emphasis">{{ index + 1 }}.</v-col>
-              <v-col cols="4"><v-text-field v-model="game.homeTeam" label="Home team" density="compact" :rules="[required]" /></v-col>
-              <v-col cols="4"><v-text-field v-model="game.awayTeam" label="Away team" density="compact" :rules="[required]" /></v-col>
-              <v-col cols="3"><v-text-field v-model="game.kickoff" label="Kickoff" type="datetime-local" density="compact" :rules="[required]" /></v-col>
+              <v-col cols="12" sm="1" class="text-medium-emphasis">{{ index + 1 }}.</v-col>
+              <v-col cols="12" sm="4"><v-text-field v-model="game.homeTeam" label="Home team" density="compact" :rules="[required]" /></v-col>
+              <v-col cols="12" sm="4"><v-text-field v-model="game.awayTeam" label="Away team" density="compact" :rules="[required]" /></v-col>
+              <v-col cols="12" sm="3"><v-text-field v-model="game.kickoff" label="Kickoff" type="datetime-local" density="compact" :rules="[required]" /></v-col>
               <v-col cols="12" class="pt-0">
                 <div class="d-flex flex-wrap align-center ga-2">
                   <v-btn type="button" size="small" variant="tonal" :loading="game.searching" @click="findFixture(index)">Find fixture</v-btn>
@@ -334,6 +384,7 @@ const required = v => !!v?.trim?.() || 'Required'
 const integerRule = v => Number.isInteger(v) || 'Must be a whole number'
 
 const events = ref([])
+const blockedEvents = computed(() => events.value.filter(event => event.autoResolveBlock))
 const loading = ref(false)
 const newestFirst = (a, b) => new Date(b.createdAt || b.startTime) - new Date(a.createdAt || a.startTime)
 const saving = ref(false)
@@ -375,6 +426,17 @@ function resetTiers () {
 const gamesDialog = ref(false)
 const gamesValid = ref(false)
 const newGames = ref([])
+const fixtureDate = ref('')
+const dayFixtures = ref([])
+const fixtureQuery = ref('')
+const fixtureMessage = ref('')
+const loadingFixtures = ref(false)
+const pickedFixtures = computed(() => newGames.value.filter(game => game.fixtureId).length)
+const shownFixtures = computed(() => {
+  const query = fixtureQuery.value.trim().toLowerCase()
+  if (!query) return dayFixtures.value
+  return dayFixtures.value.filter(hit => `${hit.home} ${hit.away} ${hit.league}`.toLowerCase().includes(query))
+})
 
 const resultsDialog = ref(false)
 const deleteDialog = ref(false)
@@ -532,6 +594,10 @@ function openGames (event) {
   selected.value = event
   const kickoff = toLocalInput(event.startTime)
   newGames.value = Array.from({ length: event.gameCount }, () => ({ homeTeam: '', awayTeam: '', kickoff, fixtureId: 0, hits: [], searching: false, message: '' }))
+  fixtureDate.value = kickoff.slice(0, 10)
+  dayFixtures.value = []
+  fixtureQuery.value = ''
+  fixtureMessage.value = ''
   gamesDialog.value = true
 }
 
@@ -557,6 +623,70 @@ async function findFixture (index) {
   } finally {
     game.searching = false
   }
+}
+
+async function loadDayFixtures () {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fixtureDate.value)) {
+    notify('Choose a date first', 'warning')
+    return
+  }
+  loadingFixtures.value = true
+  fixtureMessage.value = ''
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    const found = await eventApi.fixturesOnDate(fixtureDate.value, zone)
+    dayFixtures.value = found.fixtures ?? []
+    fixtureQuery.value = ''
+    if (!dayFixtures.value.length) fixtureMessage.value = 'No games on that date'
+  } catch (error) {
+    dayFixtures.value = []
+    fixtureMessage.value = error?.message || 'The score feed could not be read'
+    notifyError(error)
+  } finally {
+    loadingFixtures.value = false
+  }
+}
+
+const rowForFixture = id => newGames.value.findIndex(game => game.fixtureId === id)
+
+const nextOpenRow = () => {
+  const blank = newGames.value.findIndex(game => !game.fixtureId && !game.homeTeam.trim() && !game.awayTeam.trim())
+  if (blank >= 0) return blank
+  return newGames.value.findIndex(game => !game.fixtureId)
+}
+
+function kickoffInEvent (hit) {
+  const kickoff = new Date(hit.kickoff).getTime()
+  if (!selected.value || Number.isNaN(kickoff)) return false
+  return kickoff >= new Date(selected.value.startTime).getTime() && kickoff <= new Date(selected.value.endTime).getTime()
+}
+
+function fixtureDisabled (hit) {
+  if (!kickoffInEvent(hit)) return true
+  if (rowForFixture(hit.id) >= 0) return false
+  return nextOpenRow() < 0
+}
+
+function clearGameRow (index) {
+  newGames.value[index] = {
+    homeTeam: '', awayTeam: '', kickoff: toLocalInput(selected.value.startTime),
+    fixtureId: 0, hits: [], searching: false, message: ''
+  }
+}
+
+function toggleFixture (hit, checked) {
+  const existing = rowForFixture(hit.id)
+  if (!checked) {
+    if (existing >= 0) clearGameRow(existing)
+    return
+  }
+  if (existing >= 0 || !kickoffInEvent(hit)) return
+  const index = nextOpenRow()
+  if (index < 0) {
+    notify(`This coupon already has ${selected.value.gameCount} games`, 'info')
+    return
+  }
+  useFixture(index, hit)
 }
 
 function useFixture (index, hit) {
@@ -621,3 +751,21 @@ onMounted(() => {
   loadConfig().catch(notifyError)
 })
 </script>
+
+<style scoped>
+.fixture-list {
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px 8px;
+  animation: fixture-in 160ms ease;
+}
+
+@keyframes fixture-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.fixture-meta {
+  margin: -4px 0 8px 40px;
+}
+</style>

@@ -20,16 +20,19 @@ import (
 // Payout rules (Phase 1 decisions, see .cursor/plans/master_plan.md):
 //   - The house keeps houseCutPercent of ticket sales; the tiers share the rest.
 //   - Each tier's pot is split equally between the coupons with exactly that many correct picks.
-//   - A tier without winners rolls over into the top tier of the next event that has not started.
+//   - A tier rolls over into the top tier of the next event that has not started when it has
+//     no winners, or when each winning row would receive less than 0.01 SOL.
 //   - Rollover received from earlier events is added to the top tier (all games correct).
-//   - Integer division leftovers (at most winners-1 lamports per tier) go to the house.
+//   - Integer division leftovers (at most winners-1 lamports per tier) go to the house
+//     only for a tier that is actually paid.
 const (
-	defaultGameCount   = 13
-	houseCutPercent    = 5
-	tierPercentTotal   = 100 - houseCutPercent
-	cancelledResult    = "C"
-	cancelledDrawDelay = time.Hour
-	maxCombinations    = 44000
+	defaultGameCount     = 13
+	houseCutPercent      = 5
+	tierPercentTotal     = 100 - houseCutPercent
+	cancelledResult      = "C"
+	minRowPayoutLamports = 10_000_000 // 0.01 SOL. A smaller share rolls the whole tier.
+	cancelledDrawDelay   = time.Hour
+	maxCombinations      = 44000
 )
 
 // Percentages for "all correct", "one wrong", "two wrong" and "three wrong".
@@ -158,6 +161,19 @@ func settle(coupons []string, results string, salesLamports, rolloverIn uint64, 
 	return settleCounts(len(coupons), winners, len(results), salesLamports, rolloverIn, tiers)
 }
 
+// rowPayout is what each winning row receives. Fewer than 0.01 SOL pays nobody,
+// and the caller rolls that whole pot into the next event.
+func rowPayout(pot uint64, winners int) (uint64, bool) {
+	if winners <= 0 {
+		return 0, false
+	}
+	per := pot / uint64(winners)
+	if per < minRowPayoutLamports {
+		return 0, false
+	}
+	return per, true
+}
+
 func settleCounts(rows int, winners map[int]int, resultCount int, salesLamports, rolloverIn uint64, tiers []Tier) Settlement {
 	s := Settlement{Coupons: rows, SalesLamports: salesLamports, RolloverInLamports: rolloverIn}
 	var allocated uint64
@@ -168,11 +184,12 @@ func settleCounts(rows int, winners map[int]int, resultCount int, salesLamports,
 			pot += rolloverIn
 		}
 		tp := TierPayout{Correct: t.Correct, Percent: t.Percent, PotLamports: pot, Winners: winners[t.Correct]}
-		if tp.Winners == 0 {
+		perWinner, pays := rowPayout(pot, tp.Winners)
+		if !pays {
 			s.RolloverOutLamports += pot
 		} else {
-			tp.PerWinnerLamports = pot / uint64(tp.Winners)
-			paid := tp.PerWinnerLamports * uint64(tp.Winners)
+			tp.PerWinnerLamports = perWinner
+			paid := perWinner * uint64(tp.Winners)
 			s.PaidLamports += paid
 			s.HouseLamports += pot - paid
 		}

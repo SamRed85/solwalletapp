@@ -1,5 +1,5 @@
 <template>
-  <v-card variant="outlined">
+  <component :is="embedded ? 'div' : VCard" v-bind="embedded ? {} : { variant: 'outlined' }">
     <v-card-title class="d-flex align-center flex-wrap ga-2">
       <v-icon class="mr-1">mdi-safe</v-icon>
       On-chain vault
@@ -21,27 +21,43 @@
     </v-card-text>
 
     <v-card-text v-if="chain">
-      <p>
-        {{ chain.couponCount }} coupon(s) · sales {{ sol(chain.sales) }} · rollover in {{ sol(chain.rolloverIn) }}
+      <div class="sales-block mb-2">
+        <div class="sales-label">Pot</div>
+        <div class="sales-amount">{{ sol(chain.sales) }}</div>
+      </div>
+      <p class="text-caption text-medium-emphasis mb-3">
+        {{ chain.couponCount }} coupon(s) · rollover in {{ sol(chain.rolloverIn) }}
       </p>
       <p class="text-caption text-medium-emphasis">
         Entries close {{ when(chain.deadline) }} · reveals and results from {{ when(chain.endTime) }} ·
         anyone can refund the event if it is not resolved by {{ when(chain.resolveTimeout) }}
       </p>
-      <p v-if="auth.isAdmin && event.autoResolveBlock" class="text-caption">{{ event.autoResolveBlock }}</p>
-      <v-table density="compact" class="my-2">
-        <thead>
-          <tr><th>Correct</th><th>Share</th><th>{{ settled ? 'Rows' : 'Pot so far' }}</th><th v-if="settled">Each row wins</th></tr>
-        </thead>
-        <tbody>
-          <tr v-for="tier in tierRows" :key="tier.correct">
-            <td>{{ tier.correct }} of {{ chain.gameCount }}</td>
-            <td>{{ tier.percent }}%</td>
-            <td>{{ settled ? tier.rows : sol(tier.pot) }}</td>
-            <td v-if="settled">{{ tier.rows ? sol(tier.perWinner) : 'rolls over' }}</td>
-          </tr>
-        </tbody>
-      </v-table>
+      <v-alert v-if="auth.isAdmin && event.autoResolveBlock" type="warning" variant="tonal" density="compact" class="mt-2">
+        {{ event.autoResolveBlock }}
+      </v-alert>
+      <v-expansion-panels class="mt-2">
+        <v-expansion-panel>
+          <v-expansion-panel-title>{{ settled ? 'Winnings' : 'Pot so far' }}</v-expansion-panel-title>
+          <v-expansion-panel-text>
+            <v-table density="compact">
+              <thead>
+                <tr><th>Correct</th><th>Share</th><th>{{ settled ? 'Rows' : 'Pot so far' }}</th><th v-if="settled">Each row wins</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="tier in tierRows" :key="tier.correct">
+                  <td>{{ tier.correct }} of {{ chain.gameCount }}</td>
+                  <td>{{ tier.percent }}%</td>
+                  <td>{{ settled ? tier.rows : sol(tier.pot) }}</td>
+                  <td v-if="settled">{{ tier.perWinner ? sol(tier.perWinner) : 'rolls over' }}</td>
+                </tr>
+              </tbody>
+            </v-table>
+            <p class="text-caption text-medium-emphasis mt-2 mb-0">
+              A prize tier rolls over to the jackpot (all games correct) of the next event when nobody hits it, or when each winning row would receive less than 0.01 SOL.
+            </p>
+          </v-expansion-panel-text>
+        </v-expansion-panel>
+      </v-expansion-panels>
       <p v-if="settled">
         House {{ sol(chain.house) }}{{ chain.houseWithdrawn ? ' (withdrawn)' : '' }} · to winners {{ sol(chain.paid) }} ·
         rollover out {{ sol(chain.rolloverOut) }}{{ chain.rolloverForwarded ? ' (passed on)' : '' }}
@@ -79,15 +95,18 @@
         <p v-else class="text-caption text-medium-emphasis mb-2">
           The score feed has no result for every match yet. Refresh scores, then match each choice to the result shown beside the game.
         </p>
-        <div v-for="(game, index) in event.games" :key="index" class="d-flex align-center flex-wrap ga-2 mb-1">
-          <span class="game-label">{{ index + 1 }}. {{ game.homeTeam }} vs {{ game.awayTeam }}</span>
-          <MatchScore :game="standingGame(index)" :kickoff="game.kickoff" />
-          <strong v-if="standingGame(index)?.projected">{{ standingGame(index).projected }}</strong>
-          <span v-if="standingGame(index)?.projected && !standingGame(index).final" class="text-caption text-medium-emphasis">still in play</span>
-          <v-btn-toggle v-model="draft[index]" density="compact" divided>
+        <div v-for="(game, index) in event.games" :key="index" class="game-line mb-1">
+          <div class="game-top">
+            <span class="game-label"><span class="game-no">{{ index + 1 }}.</span>{{ game.homeTeam }} vs {{ game.awayTeam }}</span>
+            <MatchScore :game="standingGame(index)" :kickoff="game.kickoff" />
+            <strong v-if="standingGame(index)?.projected">{{ standingGame(index).projected }}</strong>
+            <span v-if="standingGame(index)?.projected && !standingGame(index).final" class="text-caption text-medium-emphasis">still in play</span>
+            <v-btn-toggle v-model="draft[index]" density="compact" divided>
             <v-btn v-for="value in ['1', 'X', '2']" :key="value" :value="value" size="small">{{ value }}</v-btn>
-            <v-btn value="C" size="small" color="warning" title="Void: every pick on this game counts as correct">Void</v-btn>
-          </v-btn-toggle>
+            <v-btn class="pick-void" value="C" size="small" color="warning" title="Void: every pick on this game counts as correct">Void</v-btn>
+            </v-btn-toggle>
+          </div>
+          <span class="game-when">{{ kickoffStamp(game.kickoff) }}</span>
         </div>
         <div class="d-flex flex-wrap ga-2 mt-2">
           <v-btn size="small" variant="tonal" prepend-icon="mdi-check-all" :disabled="!standingReady" @click="useStanding">
@@ -125,12 +144,14 @@
       </template>
     </v-card-actions>
     <v-alert v-if="progress" type="info" variant="tonal" class="ma-4 mt-0">{{ progress }}</v-alert>
-  </v-card>
+  </component>
 </template>
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
+import { VCard } from 'vuetify/components'
 import MatchScore from '@/components/MatchScore.vue'
+import { kickoffStamp } from '@/services/projection'
 import { eventApi } from '@/services/api'
 import { scoreNextSlip } from '@/services/entry'
 import {
@@ -143,7 +164,10 @@ import { auth, loadConfig } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { explorerAddress, formatDate, formatSol, shortAddress } from '@/utils/format'
 
-const props = defineProps({ event: { type: Object, required: true } })
+const props = defineProps({
+  event: { type: Object, required: true },
+  embedded: { type: Boolean, default: false }
+})
 const emit = defineEmits(['changed'])
 
 const chain = ref(null)
@@ -252,8 +276,8 @@ async function load () {
     if (draft.value.length !== state.gameCount) {
       draft.value = state.proposalKind === 'resolve' ? [...state.proposalResults] : Array(state.gameCount).fill(null)
     }
-    await loadStanding()
-    if (state.status !== (props.event.chain?.status || 'open') && syncedFor !== `${props.event.id}:${state.status}`) {
+    if (auth.wallet) await loadStanding()
+    if (auth.wallet && state.status !== (props.event.chain?.status || 'open') && syncedFor !== `${props.event.id}:${state.status}`) {
       syncedFor = `${props.event.id}:${state.status}`
       eventApi.syncChain(props.event.id).then(() => emit('changed')).catch(() => {})
     }
@@ -347,5 +371,22 @@ onMounted(load)
 </script>
 
 <style scoped>
-.game-label { min-width: 220px; }
+.game-line { display: flex; flex-direction: column; gap: 1px; width: 100%; }
+.game-top { display: flex; align-items: center; flex-wrap: nowrap; gap: 8px; width: 100%; min-width: 0; }
+.game-line :deep(.v-btn-toggle) { flex: none; }
+.game-label { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.game-no { margin-right: 3px; }
+.game-when { font-size: 11px; line-height: 1.1; font-weight: 600; color: rgba(var(--v-theme-on-surface), 0.62); }
+.game-line :deep(.v-btn) {
+  width: 25px !important;
+  min-width: 25px !important;
+  height: 25px !important;
+  padding: 0 !important;
+  font-size: 12px;
+}
+.game-line :deep(.pick-void) { width: auto !important; padding-inline: 8px !important; }
+@media (max-width: 959px) {
+  .game-label { font-size: 10px; }
+  .game-when { font-size: 9px; }
+}
 </style>

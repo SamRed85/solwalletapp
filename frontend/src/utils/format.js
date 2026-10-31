@@ -1,10 +1,33 @@
+import { display } from '@/stores/currency'
+
 export const shortAddress = address => address ? `${address.slice(0, 4)}...${address.slice(-4)}` : ''
 
 export const formatDate = value => value ? new Date(value).toLocaleString() : '—'
 
-export const lamportsToSol = lamports => lamports / 1e9
+export const lamportsToSol = lamports => Number(lamports) / 1e9
 
-export const formatSol = lamports => `${Number((lamports / 1e9).toFixed(9))} SOL`
+const solText = sol => `${Number(sol.toFixed(9))} SOL`
+
+const fiatText = (amount, currency) => {
+  const abs = Math.abs(amount)
+  const digits = abs !== 0 && abs < 0.01 ? 4 : 2
+  return new Intl.NumberFormat(currency === 'SEK' ? 'sv-SE' : 'en-US', {
+    style: 'currency',
+    currency,
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  }).format(amount)
+}
+
+// Screen label only. Payments and settlement stay in SOL.
+export const formatSol = lamports => {
+  const sol = lamportsToSol(lamports)
+  if (!Number.isFinite(sol)) return '—'
+  const code = display.currency
+  const perSol = code === 'USD' ? display.rates?.usd : code === 'SEK' ? display.rates?.sek : null
+  if (!perSol) return solText(sol)
+  return fiatText(sol * perSol, code)
+}
 
 export const explorerTx = signature => `https://explorer.solana.com/tx/${signature}?cluster=devnet`
 

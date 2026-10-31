@@ -55,11 +55,15 @@ type Event struct {
 	CreatedAt           time.Time     `json:"createdAt" bson:"createdAt"`
 	AutoResolve         bool          `json:"autoResolve" bson:"autoResolve"`
 	AutoResolveBlock    string        `json:"autoResolveBlock,omitempty" bson:"-"`
-	ResultsSetAt        *time.Time    `json:"resultsSetAt,omitempty" bson:"resultsSetAt,omitempty"`
-	Settlement          *Settlement   `json:"settlement,omitempty" bson:"settlement,omitempty"`
-	Status              string        `json:"status" bson:"-"`
-	CouponsSold         int           `json:"couponsSold" bson:"-"`
-	Chain               *ChainVault   `json:"chain,omitempty" bson:"chain,omitempty"`
+	// ScoreChecks counts feed reads made by auto resolve after the saved scores were not final.
+	ScoreChecks    int         `json:"-" bson:"scoreChecks,omitempty"`
+	ScoreCheckedAt time.Time   `json:"-" bson:"scoreCheckedAt,omitempty"`
+	ScoreBlock     string      `json:"-" bson:"scoreBlock,omitempty"`
+	ResultsSetAt   *time.Time  `json:"resultsSetAt,omitempty" bson:"resultsSetAt,omitempty"`
+	Settlement     *Settlement `json:"settlement,omitempty" bson:"settlement,omitempty"`
+	Status         string      `json:"status" bson:"-"`
+	CouponsSold    int         `json:"couponsSold" bson:"-"`
+	Chain          *ChainVault `json:"chain,omitempty" bson:"chain,omitempty"`
 
 	// hasVault stays true when prepare hides a vault from another program deployment:
 	// such an event still never takes treasury money.
@@ -105,8 +109,11 @@ func (a *App) prepare(e *Event, now time.Time) {
 	if e.Chain != nil && e.Chain.ProgramID != a.cfg.ProgramID {
 		e.Chain = nil
 	}
-	if e.AutoResolve {
+	if e.AutoResolve && e.Status != "completed" && e.Status != "cancelled" {
 		e.AutoResolveBlock = autoResolveBlock(e.Games)
+		if e.AutoResolveBlock == "" {
+			e.AutoResolveBlock = e.ScoreBlock
+		}
 	}
 }
 
@@ -214,18 +221,43 @@ func (a *App) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	for i := range events {
 		a.prepare(&events[i], now)
 	}
+	events = a.visibleEvents(r, events)
 	a.countCoupons(ctx, events)
 	writeJSON(w, http.StatusOK, events)
 }
 
 func (a *App) handleGetEvent(w http.ResponseWriter, r *http.Request) {
-	if e, ok := a.loadEvent(w, r); ok {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		events := []Event{*e}
-		a.countCoupons(ctx, events)
-		writeJSON(w, http.StatusOK, events[0])
+	e, ok := a.loadEvent(w, r)
+	if !ok {
+		return
 	}
+	if !a.canSeeEvent(r, e) {
+		writeError(w, http.StatusNotFound, "event not found")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	events := []Event{*e}
+	a.countCoupons(ctx, events)
+	writeJSON(w, http.StatusOK, events[0])
+}
+
+// Drafts stay admin-only. Everyone else can read events that already have games.
+func (a *App) canSeeEvent(r *http.Request, e *Event) bool {
+	return e.Status != "draft" || a.cfg.AdminWallets[walletFrom(r)]
+}
+
+func (a *App) visibleEvents(r *http.Request, events []Event) []Event {
+	if a.cfg.AdminWallets[walletFrom(r)] {
+		return events
+	}
+	visible := make([]Event, 0, len(events))
+	for _, e := range events {
+		if a.canSeeEvent(r, &e) {
+			visible = append(visible, e)
+		}
+	}
+	return visible
 }
 
 func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {

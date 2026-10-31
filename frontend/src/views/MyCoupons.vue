@@ -1,6 +1,6 @@
 <template>
   <v-container class="py-6" max-width="1000">
-    <h1 class="text-h4 font-weight-light mb-2">My Coupons</h1>
+    <h1 class="text-h4 mb-2">My Coupons</h1>
     <v-checkbox
       v-model="hideResults" label="Hide each coupon until I open it"
       density="compact" hide-details class="mb-4"
@@ -64,7 +64,8 @@
         <CouponCompare v-if="row.system?.length" :picks="row.system" :results="shownResults(row.results, row.eventId)" :live="liveScores(row.results, row.eventId)" :games="row.games" />
         <CouponScore v-if="row.score" :best="row.score.best" :games="row.score.games" :lines="row.score.lines" />
         <ProjectedPayout v-if="row.system?.length && !row.results" :system="row.system" :projection="projections[row.eventId]" />
-        <div v-if="row.detail" class="text-body-2 mb-2">{{ row.detail }}</div>
+        <div v-if="row.label === 'Claimed' && row.payout" class="text-body-2 mb-2">Won {{ formatSol(row.payout) }} from the vault.</div>
+        <div v-else-if="row.detail" class="text-body-2 mb-2">{{ row.detail }}</div>
         <div class="d-flex flex-wrap ga-2">
           <v-btn v-if="row.canSchedule && !armed.includes(row.address)" color="primary" variant="flat" :loading="acting === row.id" @click="schedule(row)">Arm automatic reveal</v-btn>
           <v-btn v-if="row.action === 'reveal'" color="primary" variant="tonal" :loading="acting === row.id" @click="act(row, revealOnChain, 'Picks revealed')">Reveal now</v-btn>
@@ -118,7 +119,7 @@
             <CouponScore
               v-if="entry.scores?.length" class="mt-3"
               :best="entry.scores[0].correct" :games="entry.system.length"
-              :lines="entry.scores.filter(item => item.winningsLamports).map(item => ({ correct: item.correct, rows: item.combinations, each: item.winningsLamports / item.combinations }))"
+              :lines="entry.scores.filter(item => item.winningsLamports).map(item => scoreLine(entry, item))"
             />
             <div v-else-if="!shownResults(resultString(entry.event?.games), entry.eventId)" class="text-caption text-medium-emphasis mt-2">Waiting for results</div>
             <ProjectedPayout v-if="!entrySettled(entry)" :system="entry.system" :projection="projections[entry.eventId]" />
@@ -140,7 +141,7 @@
               <CouponScore
                 v-if="entry.results" class="mt-2"
                 :best="entry.results[i].correct" :games="coupon.length"
-                :lines="entry.results[i].winningsLamports ? [{ correct: entry.results[i].correct, rows: 1, each: entry.results[i].winningsLamports }] : []"
+                :lines="entry.results[i].winningsLamports ? [scoreLine(entry, { correct: entry.results[i].correct, combinations: 1, winningsLamports: entry.results[i].winningsLamports })] : []"
               />
               <div v-else-if="!shownResults(resultString(entry.event?.games), entry.eventId)" class="text-caption text-medium-emphasis mt-1">Waiting for results</div>
             </template>
@@ -205,6 +206,16 @@ function chipText (row) {
   if (concealed(row.id, hasOutcome(row))) return 'Settled'
   if (row.label !== 'Claimed') return row.label
   return row.payout ? `Claimed ${formatSol(row.payout)}` : 'Claimed · no win'
+}
+function scoreLine (entry, item) {
+  const rows = item.combinations || 1
+  const tier = entry.event?.settlement?.tiers?.find(band => band.correct === item.correct)
+  return {
+    correct: item.correct,
+    rows,
+    each: item.winningsLamports / rows,
+    total: tier?.winners || rows
+  }
 }
 function scorePayout (score) {
   if (!score?.lines.length) return 0
@@ -278,17 +289,23 @@ async function loadChain () {
   await loadConfig()
   const rpcUrl = auth.config.solanaRpcUrl
   await syncPublishedSlips(auth.wallet)
-  const saved = loadChainCoupons(auth.wallet)
+  let saved = loadChainCoupons(auth.wallet)
   let onChain = []
   const events = new Map()
+  let eventsLoaded = false
   try {
     const list = await eventApi.list()
+    eventsLoaded = true
     for (const event of list) {
       if (event.chain) events.set(event.chain.address || eventPda(event.chain.admin, event.chain.nonce), event)
     }
     onChain = await walletCoupons(rpcUrl, auth.wallet)
   } catch (error) {
     chainError.value = `Could not read your vault coupons from chain: ${error.message}`
+  }
+  if (eventsLoaded) {
+    onChain = onChain.filter(coupon => events.has(coupon.event))
+    saved = saved.filter(coupon => events.has(coupon.admin != null ? eventPda(coupon.admin, coupon.nonce) : ''))
   }
   const addresses = new Set([...onChain.map(coupon => coupon.event), ...saved.map(coupon => eventPda(coupon.admin, coupon.nonce))])
   const states = new Map()
@@ -347,7 +364,7 @@ async function loadChain () {
       score,
       payout,
       detail: described.label === 'Claimed'
-        ? (payout ? `Won ${formatSol(payout)} from the vault.` : 'No prize. The stake stayed in the pool.')
+        ? (payout ? '' : 'No prize. The stake stayed in the pool.')
         : described.detail
     })
   }
@@ -462,6 +479,10 @@ async function load () {
     try {
       const rounds = await eventApi.list()
       openEvent.value = rounds.find(round => round.status === 'open')?.id || ''
+      const ids = new Set(rounds.map(round => round.id))
+      for (const payment of pending.value.filter(payment => payment.eventId && !ids.has(payment.eventId))) {
+        removePending(auth.wallet, payment.signature)
+      }
     } catch {
       openEvent.value = ''
     }

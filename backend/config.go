@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
+	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -38,9 +41,9 @@ func loadConfig() Config {
 		SolanaRPCURL:   env("SOLANA_RPC_URL", "https://api.devnet.solana.com"),
 		ProgramID:      env("PROGRAM_ID", "AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX"),
 		ResultCosigner: env("RESULT_COSIGNER", "4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH"),
-		APIFootballKey: env("API_FOOTBALL_KEY", ""),
 		AdminWallets:   map[string]bool{},
 	}
+	cfg.APIFootballKey = chooseAPIFootballKey(footballAPIKeys())
 	if strings.Contains(env("ADMIN_WALLETS", defaultWallet), cfg.ResultCosigner) {
 		log.Fatal("RESULT_COSIGNER must not be an admin wallet: an admin would then hold both result keys")
 	}
@@ -72,6 +75,82 @@ func loadConfig() Config {
 	}
 
 	return cfg
+}
+
+// footballAPIKeys returns the API-Football keys from the environment, in order.
+// API_FOOTBALL_KEY is the first and API_FOOTBALL_KEY_2 is the second.
+func footballAPIKeys() []string {
+	var keys []string
+	for _, name := range []string{"API_FOOTBALL_KEY", "API_FOOTBALL_KEY_2"} {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			keys = append(keys, v)
+		}
+	}
+	return keys
+}
+
+// chooseAPIFootballKey asks which key to use when more than one is configured.
+// A single key is used as-is. Without a terminal, the first key is used.
+func chooseAPIFootballKey(keys []string) string {
+	return chooseAPIFootballKeyFrom(keys, os.Stdin, stdinIsTerminal())
+}
+
+func chooseAPIFootballKeyFrom(keys []string, in io.Reader, interactive bool) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	if len(keys) == 1 || !interactive {
+		if len(keys) > 1 && !interactive {
+			log.Printf("API-Football: no terminal, using key 1 of %d", len(keys))
+		}
+		return keys[0]
+	}
+	fmt.Println("API-Football keys:")
+	for i, key := range keys {
+		fmt.Printf("  %d) %s\n", i+1, maskAPIKey(key))
+	}
+	reader := bufio.NewReader(in)
+	for {
+		fmt.Printf("Choose a key [1]: ")
+		line, err := reader.ReadString('\n')
+		n, ok := parseKeyChoice(line, len(keys))
+		if ok {
+			log.Printf("API-Football key %d of %d", n, len(keys))
+			return keys[n-1]
+		}
+		if err != nil {
+			log.Printf("API-Football: no choice read, using key 1 of %d", len(keys))
+			return keys[0]
+		}
+		fmt.Printf("Enter a number from 1 to %d.\n", len(keys))
+	}
+}
+
+func parseKeyChoice(line string, n int) (int, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return 1, n >= 1
+	}
+	choice, err := strconv.Atoi(line)
+	if err != nil || choice < 1 || choice > n {
+		return 0, false
+	}
+	return choice, true
+}
+
+func maskAPIKey(key string) string {
+	if len(key) <= 4 {
+		return "…"
+	}
+	return "…" + key[len(key)-4:]
+}
+
+func stdinIsTerminal() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func env(key, fallback string) string {
