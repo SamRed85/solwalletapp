@@ -122,14 +122,10 @@ watch(() => auth.wallet, () => loadEvents())
 
 .event-link:not(.v-list-item--disabled):hover {
   transform: translateY(-2px);
-  box-shadow: 0 1px 2px rgba(13, 71, 161, 0.06), 0 8px 24px rgba(13, 71, 161, 0.08);
+  box-shadow: var(--shadow-surface);
 }
 
 .event-link:not(.v-list-item--disabled):active {
   transform: translateY(0);
-}
-
-.v-theme--dark .event-link:not(.v-list-item--disabled):hover {
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
 </style>

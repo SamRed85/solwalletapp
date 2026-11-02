@@ -1,35 +1,55 @@
 .v-application {
-  background-color: #f7f9fc !important;
-  background-image: linear-gradient(90deg, #d5e2f2 0%, #f7f9fc 50%, #d5e2f2 100%) !important;
+  --gradient-appbar: linear-gradient(90deg,
+    rgb(var(--v-theme-appbar)) 0%,
+    rgb(var(--v-theme-appbarMid)) 22%,
+    rgb(var(--v-theme-appbarCenter)) 50%,
+    rgb(var(--v-theme-appbarMid)) 78%,
+    rgb(var(--v-theme-appbar)) 100%);
+  --gradient-background: linear-gradient(90deg,
+    rgb(var(--v-theme-backgroundEdge)) 0%,
+    rgb(var(--v-theme-backgroundMid)) 22%,
+    rgb(var(--v-theme-backgroundCenter)) 50%,
+    rgb(var(--v-theme-backgroundMid)) 78%,
+    rgb(var(--v-theme-backgroundEdge)) 100%);
+  --gradient-surface: linear-gradient(90deg,
+    rgb(var(--v-theme-surfaceEdge)) 0%,
+    rgb(var(--v-theme-surfaceMid)) 22%,
+    rgb(var(--v-theme-surfaceCenter)) 50%,
+    rgb(var(--v-theme-surfaceMid)) 78%,
+    rgb(var(--v-theme-surfaceEdge)) 100%);
+  --gradient-panel: linear-gradient(90deg,
+    rgb(var(--v-theme-panel)) 0%,
+    rgb(var(--v-theme-panelMid)) 22%,
+    rgb(var(--v-theme-panelCenter)) 50%,
+    rgb(var(--v-theme-panelMid)) 78%,
+    rgb(var(--v-theme-panel)) 100%);
+  background-color: rgb(var(--v-theme-background)) !important;
+  background-image: var(--gradient-background) !important;
 }
 
-.v-application.v-theme--dark {
-  background-color: #0c1016 !important;
-  background-image: linear-gradient(90deg, #0c1016 0%, #1a2838 22%, #2a3d56 50%, #1a2838 78%, #0c1016 100%) !important;
+.v-theme--light {
+  --shadow-bar: 20px rgba(13, 71, 161, 0.22);
+  --shadow-surface: 0 1px 2px rgba(13, 71, 161, 0.06), 0 8px 24px rgba(13, 71, 161, 0.08);
+}
+
+.v-theme--dark {
+  --shadow-bar: 24px rgba(0, 0, 0, 0.45);
+  --shadow-surface: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
 
 .v-application .v-footer {
   background-color: transparent !important;
-  background-image: linear-gradient(90deg, #d5e2f2 0%, #f7f9fc 50%, #d5e2f2 100%) !important;
-}
-
-.v-application.v-theme--dark .v-footer {
-  background-image: linear-gradient(90deg, #0c1016 0%, #1a2838 22%, #2a3d56 50%, #1a2838 78%, #0c1016 100%) !important;
+  background-image: var(--gradient-background) !important;
 }
 
 .v-application .v-card {
-  background-color: #fff !important;
-  background-image: linear-gradient(90deg, #e7eef7 0%, #ffffff 50%, #e7eef7 100%) !important;
-}
-
-.v-theme--dark .v-card {
-  background-color: #151b24 !important;
-  background-image: linear-gradient(90deg, #151b24 0%, #243044 22%, #3d5270 50%, #243044 78%, #151b24 100%) !important;
+  background-color: rgb(var(--v-theme-surface)) !important;
+  background-image: var(--gradient-surface) !important;
 }
 
 .v-theme--dark .v-expansion-panel {
-  background-color: #1e1e1e !important;
-  background-image: linear-gradient(90deg, #1e1e1e 0%, #2a2a2a 22%, #3a4558 50%, #2a2a2a 78%, #1e1e1e 100%) !important;
+  background-color: rgb(var(--v-theme-panel)) !important;
+  background-image: var(--gradient-panel) !important;
 }
 
 .v-theme--dark .v-list {
@@ -53,33 +73,19 @@
 }
 
 .v-application .sol-bar.v-toolbar {
-  background-image: linear-gradient(90deg, #1565c0 0%, #1e88e5 22%, #42a5f5 50%, #1e88e5 78%, #1565c0 100%) !important;
-  box-shadow: 0 8px 20px rgba(13, 71, 161, 0.22) !important;
-}
-
-.v-theme--dark .sol-bar.v-toolbar {
-  background-image: linear-gradient(90deg, #0d47a1 0%, #1565c0 22%, #1e88e5 50%, #1565c0 78%, #0d47a1 100%) !important;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45) !important;
+  background-color: rgb(var(--v-theme-appbar)) !important;
+  background-image: var(--gradient-appbar) !important;
+  box-shadow: 0 8px var(--shadow-bar) !important;
 }
 
 .v-application .phone-nav.v-bottom-navigation {
-  background-color: #1565c0 !important;
-  background-image: linear-gradient(90deg, #1565c0 0%, #1e88e5 22%, #42a5f5 50%, #1e88e5 78%, #1565c0 100%) !important;
-  box-shadow: 0 -8px 20px rgba(13, 71, 161, 0.22) !important;
-}
-
-.v-theme--dark .phone-nav.v-bottom-navigation {
-  background-color: #0d47a1 !important;
-  background-image: linear-gradient(90deg, #0d47a1 0%, #1565c0 22%, #1e88e5 50%, #1565c0 78%, #0d47a1 100%) !important;
-  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.45) !important;
+  background-color: rgb(var(--v-theme-appbar)) !important;
+  background-image: var(--gradient-appbar) !important;
+  box-shadow: 0 -8px var(--shadow-bar) !important;
 }
 
 .v-application .v-main .v-card {
-  box-shadow: 0 1px 2px rgba(13, 71, 161, 0.06), 0 8px 24px rgba(13, 71, 161, 0.08);
-}
-
-.v-theme--dark .v-main .v-card {
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-surface);
 }
 
 .page-enter-active,

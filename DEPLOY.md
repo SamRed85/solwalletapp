@@ -14,8 +14,8 @@ Secrets stay in the files. This document does not repeat them.
 |---|---|---|---|
 | `sol-backend` from `.\build.ps1` | `backend\sol-backend` | `/opt/sol/backend/sol-backend` | The API |
 | `frontend\dist\` | `dist\` | `/var/www/sol/` | The pages |
-| `.env` | `.env` | `/opt/sol/.env` | Helius devnet RPC, both API-Football keys, session secret |
-| `docker-compose.yml` | `docker-compose.yml` | `/opt/sol/docker-compose.yml` | MongoDB, bound to localhost |
+| `.env` | `env` (no leading dot, so Linux shows it) | `/opt/sol/.env` | Helius devnet RPC, both API-Football keys, session secret |
+| `docker-compose.yml` | `docker-compose.yml` | `/opt/sol/docker-compose.yml` | MongoDB in Docker, bound to localhost |
 | `programs\predictions\keys\deployer-keypair.json` | `keys\` | `/opt/sol/programs/predictions/keys/` | Signs automatic result submission |
 | `council-signer.json` | `keys\` | same folder | Second result signer |
 | `reveal-keeper.json` | `keys\` | same folder | Publishes coupon reveals |
@@ -58,7 +58,7 @@ Plug the stick in. Replace `E:` with its drive letter.
 $usb = "E:\sol"
 New-Item -ItemType Directory -Force -Path "$usb\backend","$usb\keys","$usb\dist" | Out-Null
 Copy-Item C:\solwalletapp\sol-backend "$usb\backend\sol-backend" -Force
-Copy-Item C:\solwalletapp\.env "$usb\.env" -Force
+Copy-Item C:\solwalletapp\.env "$usb\env" -Force
 Copy-Item C:\solwalletapp\docker-compose.yml "$usb\docker-compose.yml" -Force
 Copy-Item C:\solwalletapp\programs\predictions\keys\deployer-keypair.json "$usb\keys\" -Force
 Copy-Item C:\solwalletapp\programs\predictions\keys\council-signer.json "$usb\keys\" -Force
@@ -66,7 +66,7 @@ Copy-Item C:\solwalletapp\programs\predictions\keys\reveal-keeper.json "$usb\key
 Copy-Item C:\solwalletapp\frontend\dist\* "$usb\dist\" -Recurse -Force
 ```
 
-Eject the stick from the laptop. It now holds the signing keys and `.env`. Keep it with you until those files are on the server, then delete `E:\sol` from the stick.
+Eject the stick from the laptop. It now holds the signing keys and `env`. Keep it with you until those files are on the server, then delete `E:\sol` from the stick. Linux hides names that start with a dot, which is why the stick carries `env` and the server renames it to `.env`.
 
 ## 3. Install at the server's keyboard
 
@@ -75,7 +75,7 @@ Plug the stick into the server. Find its mount with `lsblk` (often `/media/<you>
 ```bash
 sudo mkdir -p /opt/sol/backend /opt/sol/programs/predictions/keys /var/www/sol
 sudo cp /media/usb/sol/backend/sol-backend /opt/sol/backend/sol-backend
-sudo cp /media/usb/sol/.env /opt/sol/.env
+sudo cp /media/usb/sol/env /opt/sol/.env
 sudo cp /media/usb/sol/docker-compose.yml /opt/sol/docker-compose.yml
 sudo cp /media/usb/sol/keys/*.json /opt/sol/programs/predictions/keys/
 sudo cp -a /media/usb/sol/dist/. /var/www/sol/
@@ -86,14 +86,25 @@ sudo chown -R www-data:www-data /var/www/sol
 
 Unplug the stick when the copy finishes. Nginx must use `/var/www/sol` as the site root. Pointing it at `/opt/sol` would let visitors download the keys and `.env`.
 
-MongoDB, from `/opt/sol`:
+MongoDB runs in Docker. On Ubuntu or Debian, install Docker first. `docker compose` is missing until this finishes:
+
+```bash
+sudo apt update
+sudo apt install -y docker.io docker-compose-v2
+sudo systemctl enable --now docker
+docker --version
+docker compose version
+```
+
+Then start MongoDB from `/opt/sol`:
 
 ```bash
 cd /opt/sol
 sudo docker compose up -d
+sudo docker ps
 ```
 
-The database listens on `127.0.0.1:27017` only and starts empty. Copying the laptop events is optional and is at the bottom of this file.
+`docker ps` should show `sol-mongodb`. The compose file publishes it only on `127.0.0.1:27017`. The API uses that address and the database name `sol`. The database starts empty. Copying the laptop events is optional and is at the bottom of this file.
 
 Close port 8080 to every other device. Loopback stays open, which is how nginx reaches the API:
 
@@ -139,18 +150,13 @@ The log should name the reveal keeper and say automatic resolve is on. Health sh
 
 ## 5. Nginx and the router
 
-Create `/etc/nginx/sites-available/sol` on the server. HTTPS stays in nginx. The API stays plain HTTP on localhost.
+Create `/etc/nginx/sites-available/sol` on the server. This block is the default site, so an address or a hostname both reach the app. The stock nginx page stays up while `/etc/nginx/sites-enabled/default` is still enabled. Leave `listen 443 ssl` out until certbot adds the certificate lines. A `443 ssl` block with no certificate makes `nginx -t` fail, and nginx then keeps serving the old page.
 
 ```nginx
 server {
-    listen 80;
-    server_name sol.example.com;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    server_name sol.example.com;
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
 
     root /var/www/sol;
     index index.html;
@@ -175,14 +181,25 @@ server {
 ```
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/sol /etc/nginx/sites-enabled/sol
-sudo certbot --nginx -d sol.example.com
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo ln -sf /etc/nginx/sites-available/sol /etc/nginx/sites-enabled/sol
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-`try_files` is what makes `/events/...` and `/coupons` survive a refresh. Phantom only signs in on HTTPS.
+`try_files` is what makes `/events/...` and `/coupons` survive a refresh. The site is plain HTTP until the certificate below is in place. Phantom only signs in on HTTPS.
 
-On the router, forward TCP 443 and TCP 80 to this server's LAN address. Forward nothing else for this app. When the home's public address changes, update the DNS name friends use.
+On the router, forward TCP 443 and TCP 80 to this server's LAN address. Forward nothing else for this app. Point a hostname, such as `sol.example.com`, at the home's public address. Certbot cannot issue a certificate for a bare IP.
+
+Install certbot and let it edit the Sol site. Replace the name with the hostname that reaches this server:
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d sol.example.com
+```
+
+Certbot asks for an email and agreement to the terms, then writes the certificate into `/etc/letsencrypt/live/sol.example.com/` and adds a port 443 server to `/etc/nginx/sites-available/sol`. It reloads nginx when that succeeds. Open `https://sol.example.com` afterwards.
+
+Renewal is already scheduled by the certbot package. Check it with `sudo certbot renew --dry-run`. When the home address changes, update the DNS name. The certificate stays valid as long as that name still reaches this server on port 80.
 
 ## 6. What friends do
 
@@ -192,7 +209,7 @@ Sign-in is limited to 10 attempts per minute for the whole site, because every r
 
 ## Later updates
 
-On the laptop, run `.\build.ps1` again and copy the new `sol-backend` and `frontend\dist` onto the stick the same way as step 2. Leave `.env` and the keys off the stick unless they changed.
+On the laptop, run `.\build.ps1` again and copy the new `sol-backend` and `frontend\dist` onto the stick the same way as step 2. Leave `env` and the keys off the stick unless they changed.
 
 At the server:
 
@@ -219,12 +236,12 @@ docker cp sol-mongodb:/tmp/sol.archive C:\solwalletapp\sol.archive
 Copy-Item C:\solwalletapp\sol.archive E:\sol\sol.archive
 ```
 
-At the server, after MongoDB is up:
+At the server, after `sol-mongodb` is running:
 
 ```bash
 sudo docker cp /media/usb/sol/sol.archive sol-mongodb:/tmp/sol.archive
 sudo docker exec sol-mongodb mongorestore --archive=/tmp/sol.archive --drop
-sudo rm /tmp/sol.archive
+sudo docker exec sol-mongodb rm /tmp/sol.archive
 sudo systemctl restart sol
 ```
 
