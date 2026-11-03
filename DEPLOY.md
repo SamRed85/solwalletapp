@@ -1,3 +1,181 @@
+
+# STAGE 1 - WEBBSERVER
+# Home web server — samwebb.duckdns.org
+
+Ubuntu/Debian with Nginx, behind a Sagemcom router.
+
+## 1. Check the connection
+
+- Compare the router’s WAN IPv4 with your public IPv4.
+- They should match. If behind CGNAT, ask your ISP for a public IPv4.
+- Reserve the Linux server’s local IP in the router’s DHCP settings.
+
+Find the server’s local IP:
+
+```bash
+hostname -I
+```
+
+## 2. Install Nginx
+
+```bash
+sudo apt update
+sudo apt install nginx -y
+sudo systemctl enable --now nginx
+```
+
+From another home device, open:
+
+```text
+http://SERVER_LOCAL_IP
+```
+
+The default “Welcome to nginx!” page should appear.
+
+## 3. Configure the router
+
+Forward these ports to the Linux server:
+
+| Protocol | External port | Internal port |
+|----------|---------------|---------------|
+| TCP      | 80            | 80            |
+| TCP      | 443           | 443           |
+
+Keep the router firewall enabled. Disable DMZ host and administration from WAN.
+
+## 4. Configure the Linux firewall
+
+Check existing rules:
+
+```bash
+sudo ufw status verbose
+```
+
+If using SSH, allow your administration computer’s source IP first.
+Replace ADMIN_IP below; adjust port 22 if using a different SSH port.
+
+```bash
+sudo ufw allow from ADMIN_IP to any port 22 proto tcp
+```
+
+Allow the website and enable the firewall:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+sudo ufw status verbose
+```
+
+Existing allow rules remain—remove any unnecessary ones.
+Keep your SSH session open while testing a second connection.
+
+## 5. Configure DuckDNS
+
+1. Sign in at https://www.duckdns.org.
+2. Add samwebb.duckdns.org and set its IP to your public IPv4.
+3. Test from your phone using mobile data:
+
+http://samwebb.duckdns.org
+
+The default Nginx page should appear.
+
+## 6. Enable HTTPS
+
+Edit the existing default configuration:
+
+```bash
+sudo nano /etc/nginx/sites-available/default
+```
+
+Replace `server_name _;` with:
+
+```nginx
+server_name samwebb.duckdns.org;
+```
+
+Check and reload:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Install Certbot and request the certificate:
+
+```bash
+sudo apt install certbot python3-certbot-nginx -y
+sudo certbot --nginx -d samwebb.duckdns.org --redirect
+```
+
+Follow the prompts, then check renewal:
+
+```bash
+sudo certbot renew --dry-run
+systemctl list-timers --all | grep -i certbot
+```
+
+Confirm automatic renewal is scheduled. Keep port 80 open for renewal.
+
+Test: https://samwebb.duckdns.org
+
+## 7. Automatically update DuckDNS
+
+```bash
+sudo apt install curl cron -y
+sudo systemctl enable --now cron
+mkdir -p ~/duckdns
+chmod 700 ~/duckdns
+touch ~/duckdns/update.sh
+chmod 700 ~/duckdns/update.sh
+nano ~/duckdns/update.sh
+```
+
+Paste this, replacing YOUR_TOKEN with your private DuckDNS token:
+
+```sh
+#!/bin/sh
+curl -4 -fsS --max-time 30 \
+  'https://www.duckdns.org/update?domains=samwebb&token=YOUR_TOKEN&ip='
+```
+
+Test—it should return `OK`:
+
+```bash
+~/duckdns/update.sh
+```
+
+Run `crontab -e` and add once:
+
+```cron
+*/5 * * * * $HOME/duckdns/update.sh >/dev/null 2>&1
+```
+
+Do not store the real token in this README.
+
+## 8. Security and checks
+
+- Keep Linux, Nginx and the router updated.
+- Only forward TCP 80 and 443; keep SSH private.
+- Store only public files in /var/www/html.
+- This setup does not isolate the server from other home devices.
+- Check IPv6 firewall rules too if IPv6 is enabled.
+- Keep the server and router powered on.
+
+Useful checks:
+
+```bash
+sudo nginx -t
+sudo systemctl status nginx
+sudo ufw status verbose
+sudo ss -tulpn
+sudo certbot renew --dry-run
+```
+
+###################################################################################################################################################################################
+# STAGE 2 - APP
+
 # Put Sol on the home web server (devnet)
 
 Build on the laptop, carry the files over on a USB stick, and install them at the server's keyboard. There is no SSH step. This server is a machine on the home network. It is not the Qtagg server.
