@@ -22,11 +22,11 @@
 
     <v-card-text v-if="chain">
       <div class="sales-block mb-2">
-        <div class="sales-label">Pot</div>
-        <div class="sales-amount">{{ sol(chain.sales) }}</div>
+        <div class="sales-label">Total pot</div>
+        <div class="sales-amount">{{ sol(chain.sales + chain.rolloverIn) }}</div>
       </div>
       <p class="text-caption text-medium-emphasis mb-3">
-        {{ chain.couponCount }} coupon(s) · rollover in {{ sol(chain.rolloverIn) }}
+        {{ sol(chain.sales) }} from {{ chain.couponCount }} coupon(s)<template v-if="chain.rolloverIn > 0n"> + {{ sol(chain.rolloverIn) }} jackpot</template>
       </p>
       <p class="text-caption text-medium-emphasis">
         Entries close {{ when(chain.deadline) }} · reveals and results from {{ when(chain.endTime) }} ·

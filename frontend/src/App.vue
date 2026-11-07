@@ -1,6 +1,6 @@
 <template>
   <v-app>
-    <v-app-bar class="sol-bar" :class="{ 'is-phone': mobile }" color="primary" elevation="0">
+    <v-app-bar class="sol-bar" :class="{ 'is-phone': mobile }" color="primary" elevation="0" :height="mobile ? 48 : 64">
       <v-app-bar-title class="wordmark">
         Sol
         <v-icon
@@ -26,25 +26,29 @@
 
       <div class="bar-end">
         <v-btn
-          v-if="mobile" icon variant="text"
+          v-if="mobile" icon variant="text" size="small"
           :aria-label="isDark ? 'Switch to light' : 'Switch to dark'"
           @click="toggleTheme"
         >
           <v-icon>{{ isDark ? 'mdi-weather-night' : 'mdi-weather-sunny' }}</v-icon>
         </v-btn>
         <template v-if="auth.wallet">
-          <v-chip v-if="!mobile && auth.balance !== null" class="mr-2" size="small" prepend-icon="mdi-wallet" variant="flat" color="secondary">
+          <v-chip
+            v-if="auth.balance !== null" class="balance-chip" :class="mobile ? 'mr-1' : 'mr-2'"
+            :size="mobile ? 'x-small' : 'small'" :prepend-icon="mobile ? undefined : 'mdi-wallet'" variant="flat" color="secondary"
+            title="Wallet balance"
+          >
             <SolAmount :lamports="Math.round(auth.balance * 1e9)" />
           </v-chip>
           <v-chip
             to="/profile"
-            class="name-chip mr-2" size="small" variant="flat" :color="auth.isAdmin ? 'warning' : 'success'"
+            class="name-chip" :class="mobile ? 'mr-1' : 'mr-2'" :size="mobile ? 'x-small' : 'small'" variant="flat" :color="auth.isAdmin ? 'warning' : 'success'"
             :prepend-icon="auth.isAdmin ? 'mdi-shield-crown' : 'mdi-account'"
             title="Profile"
           >
             {{ auth.displayName || shortAddress(auth.wallet) }}
           </v-chip>
-          <v-btn v-if="mobile" icon="mdi-logout" aria-label="Logout" @click="onLogout" />
+          <v-btn v-if="mobile" icon="mdi-logout" size="small" aria-label="Logout" @click="onLogout" />
           <v-btn v-else prepend-icon="mdi-logout" @click="onLogout">Logout</v-btn>
         </template>
         <v-btn v-else variant="outlined" prepend-icon="mdi-wallet" :loading="auth.busy" @click="onLogin">
@@ -61,7 +65,7 @@
       </router-view>
     </v-main>
 
-    <v-bottom-navigation v-if="mobile && menuItems.length > 1" :model-value="navValue" class="phone-nav" grow color="white">
+    <v-bottom-navigation v-if="mobile && menuItems.length > 1" :model-value="navValue" class="phone-nav" grow color="white" :height="52">
       <v-btn v-for="item in menuItems" :key="item.to" :value="item.to" :to="item.to">
         <v-icon :icon="item.icon" />
         <span>{{ navLabel(item.title) }}</span>
@@ -297,6 +301,14 @@ onBeforeUnmount(() => {
   max-width: 42vw;
 }
 
+.sol-bar.is-phone .name-chip {
+  max-width: 30vw;
+}
+
+.balance-chip {
+  flex: none;
+}
+
 .name-chip :deep(.v-chip__content) {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -312,8 +324,8 @@ onBeforeUnmount(() => {
 }
 
 .phone-nav {
-  padding-bottom: env(safe-area-inset-bottom);
-  height: calc(56px + env(safe-area-inset-bottom)) !important;
+  padding-bottom: var(--sol-inset-bottom);
+  height: calc(52px + var(--sol-inset-bottom)) !important;
 }
 
 .phone-nav :deep(.v-btn) {
@@ -331,6 +343,6 @@ onBeforeUnmount(() => {
 }
 
 .phone-nav :deep(.v-icon) {
-  font-size: 24px;
+  font-size: 22px;
 }
 </style>

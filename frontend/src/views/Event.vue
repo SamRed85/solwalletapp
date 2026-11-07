@@ -7,9 +7,10 @@
       <v-card class="mb-4">
         <v-card-title class="d-flex align-center flex-wrap ga-2">
           <span class="event-title">{{ event.title }}</span>
+          <v-icon v-if="jackpotLamports" color="amber" :size="28" title="Jackpot event">mdi-trophy</v-icon>
           <v-chip :color="statusColors[event.status]" size="small" variant="flat">{{ event.status }}</v-chip>
-          <v-chip v-if="event.rolloverInLamports" color="amber" size="small" variant="flat" prepend-icon="mdi-trophy">
-            Jackpot +{{ formatSol(event.rolloverInLamports) }}
+          <v-chip v-if="jackpotLamports" color="amber" size="small" variant="flat" prepend-icon="mdi-trophy">
+            Jackpot {{ formatSol(jackpotLamports) }}
           </v-chip>
         </v-card-title>
         <v-card-subtitle class="text-wrap">
@@ -40,11 +41,12 @@
           </p>
           <template v-if="!event.chain">
             <div class="sales-block mb-2">
-              <div class="sales-label">Pot</div>
-              <div class="sales-amount">{{ formatSol(salesLamports) }}</div>
+              <div class="sales-label">Total pot</div>
+              <div class="sales-amount">{{ formatSol(salesLamports + jackpotLamports) }}</div>
             </div>
             <p class="text-caption text-medium-emphasis mb-3">
-              {{ event.couponsSold }} coupon{{ event.couponsSold === 1 ? '' : 's' }} sold. The house keeps {{ houseCut }}% and the league vault keeps {{ leagueCut }}% of ticket sales.
+              {{ formatSol(salesLamports) }} from {{ event.couponsSold }} coupon{{ event.couponsSold === 1 ? '' : 's' }}<template v-if="jackpotLamports"> + {{ formatSol(jackpotLamports) }} jackpot</template>.
+              The house keeps {{ houseCut }}% and the league vault keeps {{ leagueCut }}% of ticket sales.
             </p>
             <v-expansion-panels>
               <v-expansion-panel>
@@ -93,7 +95,12 @@
         <div v-for="(game, index) in event.games" :key="index" class="game-row">
           <div class="game-top">
             <div class="game-name-line">
-              <div class="font-weight-medium"><span class="game-no">{{ index + 1 }}.</span>{{ game.homeTeam }} vs {{ game.awayTeam }}</div>
+              <div
+                class="font-weight-medium team-names" :class="{ expanded: expandedNames.has(`r${index}`) }"
+                :title="`${game.homeTeam} vs ${game.awayTeam}`" @click="toggleName(`r${index}`)"
+              >
+                <span class="game-no">{{ index + 1 }}.</span>{{ game.homeTeam }} vs {{ game.awayTeam }}
+              </div>
               <MatchScore
                 v-if="liveGame(index)?.linked"
                 :game="liveGame(index)"
@@ -205,7 +212,12 @@
           <div v-for="(game, g) in event.games" :key="g" class="game-row">
             <div class="game-top">
               <div class="game-name-line">
-                <div class="font-weight-medium"><span class="game-no">{{ g + 1 }}.</span>{{ game.homeTeam }} vs {{ game.awayTeam }}</div>
+                <div
+                  class="font-weight-medium team-names" :class="{ expanded: expandedNames.has(`p${g}`) }"
+                  :title="`${game.homeTeam} vs ${game.awayTeam}`" @click="toggleName(`p${g}`)"
+                >
+                  <span class="game-no">{{ g + 1 }}.</span>{{ game.homeTeam }} vs {{ game.awayTeam }}
+                </div>
                 <MatchScore v-if="projection?.games?.[g]?.linked" :game="projection.games[g]" :kickoff="game.kickoff" />
               </div>
               <v-btn
@@ -320,6 +332,14 @@ const colorLimits = ref({
 })
 const activeColor = ref('')
 const pendingGroup = ref(null)
+const expandedNames = ref(new Set())
+
+function toggleName (key) {
+  const next = new Set(expandedNames.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedNames.value = next
+}
 
 const stepLabels = computed(() => event.value?.chain ? {
   sign: signProgress.value.total > 1
@@ -346,6 +366,7 @@ const usedColorIds = computed(() => colorIds.filter(id => colorMarks.value[id].l
 const reductionState = computed(() => {
   if (!usedColorIds.value.length || missingGames.value) return null
   const colors = usedColorIds.value.map(id => ({
+    id,
     min: colorLimits.value[id].min,
     max: colorLimits.value[id].max,
     signs: colorMarks.value[id].map(key => {
@@ -409,6 +430,13 @@ const salesLamports = computed(() => {
   const e = event.value
   if (!e) return 0
   return e.couponsSold * e.couponPriceLamports
+})
+
+// A vault event's carried-over jackpot is only on chain. The database copy is returned to the
+// treasury when the vault is attached.
+const jackpotLamports = computed(() => {
+  if (event.value?.chain) return Number(chainCapacity.value?.rolloverIn ?? 0n)
+  return event.value?.rolloverInLamports || 0
 })
 
 const tierRows = computed(() => {
@@ -793,6 +821,13 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+.team-names { cursor: pointer; }
+.game-name-line .team-names.expanded {
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
 }
 .game-name-line :deep(.when) { display: none; }
 .game-name-line :deep(.match-score) { flex: none; gap: 4px; }

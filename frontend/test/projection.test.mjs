@@ -95,9 +95,11 @@ test('the standing payout shows while matches are still being played', () => {
   const live = { revealClosed: false, games: [{ projected: '1', final: false }, { projected: 'X', final: true }] }
   const finished = { revealClosed: false, games: [{ projected: '1', final: true }, { projected: 'X', final: true }] }
   const beforeKickoff = { revealClosed: false, games: [{ projected: 'X', final: false }, { projected: 'X', final: false }] }
+  const firstUnderway = { revealClosed: false, games: [{ projected: '1', final: false, status: '1H', elapsed: 12 }, { projected: 'X', final: false, status: 'NS' }] }
   assert.equal(showStandingPayout(live), true)
   assert.equal(showStandingPayout(finished), true)
-  assert.equal(showStandingPayout(beforeKickoff), true)
+  assert.equal(showStandingPayout(firstUnderway), true)
+  assert.equal(showStandingPayout(beforeKickoff), false)
   assert.equal(showStandingPayout(null), false)
 })
 

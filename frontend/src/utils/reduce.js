@@ -6,7 +6,8 @@ export const COLOR_IDS = ['purple', 'yellow', 'red', 'green']
 export const COLOR_LABELS = { purple: 'Purple', yellow: 'Yellow', red: 'Red', green: 'Green' }
 
 // The colors saved on a coupon, in display order. `signs` is the program's bitset:
-// game g outcome k (1, X, 2) is bit 3g+k.
+// game g outcome k (1, X, 2) is bit 3g+k. The program does not store which color the
+// player chose, so a coupon saved without `id` falls back to the order of the colors.
 export function colorView (colors = []) {
   return colors.map((color, index) => {
     const signs = BigInt(color.signs)
@@ -15,7 +16,8 @@ export function colorView (colors = []) {
       if ((signs & (1n << bit)) === 0n) continue
       marks.push({ game: Number(bit / 3n), outcome: OUTCOMES[Number(bit % 3n)] })
     }
-    return { id: COLOR_IDS[index] || COLOR_IDS[COLOR_IDS.length - 1], label: COLOR_LABELS[COLOR_IDS[index]] || 'Color', min: color.min, max: color.max, marks }
+    const id = COLOR_IDS.includes(color.id) ? color.id : (COLOR_IDS[index] || COLOR_IDS[COLOR_IDS.length - 1])
+    return { id, label: COLOR_LABELS[id] || 'Color', min: color.min, max: color.max, marks }
   }).filter(color => color.marks.length)
 }
 
@@ -70,7 +72,7 @@ function activeColors (frame, colors) {
       }
       if (frame[sign.game].includes(sign.outcome)) signs.add(signKey(sign.game, sign.outcome))
     }
-    return { min: color.min, max: color.max, signs }
+    return { id: color.id, min: color.min, max: color.max, signs }
   }).filter(color => color.signs.size > 0 || color.min > 0)
 }
 
@@ -148,7 +150,7 @@ export function colorReduction (picks, colors, { maxCombinations = MAX_COMBINATI
     if (states > MAX_COLOR_STATES) {
       throw new ReductionError('These colors are too detailed for one coupon. Narrow a min and max, or use fewer colors.')
     }
-    counted.push({ signs: signBits(color.signs), min: color.min, max: color.max })
+    counted.push({ signs: signBits(color.signs), min: color.min, max: color.max, ...(COLOR_IDS.includes(color.id) ? { id: color.id } : {}) })
   }
   const rows = keptCounts(frame.map(maskOf), counted)[0]
   if (!rows) throw new ReductionError('This reduction leaves no rows')

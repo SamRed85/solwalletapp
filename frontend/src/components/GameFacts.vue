@@ -67,6 +67,7 @@ function percentCell (row, key) {
   font-size: 9px;
   line-height: 1.2;
   font-weight: 600;
+  white-space: nowrap;
   text-align: right;
   color: rgba(var(--v-theme-on-surface), 0.45);
 }

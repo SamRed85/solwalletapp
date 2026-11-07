@@ -407,7 +407,9 @@ export async function couponCapacity (rpcUrl, eventAddress) {
   return {
     count: event.couponCount,
     minRows: event.minRows || DEFAULT_MIN_ROWS,
-    maxCoupons: event.maxCoupons || (1 << 20)
+    maxCoupons: event.maxCoupons || (1 << 20),
+    sales: event.sales,
+    rolloverIn: event.rolloverIn
   }
 }
 

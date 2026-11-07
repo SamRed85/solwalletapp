@@ -86,7 +86,7 @@
     </v-card>
 
     <v-progress-linear v-if="loading" indeterminate class="mb-4" />
-    <v-card v-if="!loading && entries.length === 0" variant="outlined" class="pa-6 text-center">
+    <v-card v-if="!loading && entries.length === 0 && chainRows.length === 0" variant="outlined" class="pa-6 text-center">
       <p class="text-medium-emphasis mb-4">You have not placed any coupons yet.</p>
       <v-btn color="primary" to="/">Browse events</v-btn>
     </v-card>
@@ -160,7 +160,7 @@ import ProjectedPayout from '@/components/ProjectedPayout.vue'
 import { entryApi, eventApi } from '@/services/api'
 import {
   COUPONS_REVEALED, PAYMENT_MAX_AGE_MS, armCouponReveal, backupMatches, claimOnChain, couponId, exportCouponBackup,
-  importCouponBackup, loadArmed, loadChainCoupons, syncPublishedSlips,
+  adoptArchiveSlips, importCouponBackup, loadArmed, loadChainCoupons, syncPublishedSlips,
   loadPending, recoverFromChain, refundOnChain, removePending, revealOnChain, submitPending
 } from '@/services/entry'
 import { couponPayout, couponScore, eventPda, fetchEvent, picksFromSystem, systemFromPicks, walletCoupons } from '@/services/program'
@@ -235,7 +235,7 @@ function describeSlip (saved, state, now) {
   if (!state) return { label: 'Entered', color: 'primary', detail: 'This coupon is in the archive.' }
   if (state.status === 'cancelled') return { label: 'Cancelled', color: 'warning', action: 'refund', detail: 'The event was cancelled. Refund the entry price to your wallet.' }
   if (state.status === 'resolved') {
-    if (!saved.revealed) return { label: 'Not revealed', color: 'error', detail: 'The picks were not revealed in time, so the stake stayed in the prize pool.' }
+    if (!saved.revealed || !saved.system?.length) return { label: 'Not revealed', color: 'error', detail: 'The picks were not revealed in time, so the stake stayed in the prize pool.' }
     const score = couponScore({ revealed: true, picks: picksFromSystem(saved.system), colors: saved.colors, gameCount: state.gameCount }, state)
     const payout = scorePayout(score)
     return {
@@ -245,6 +245,9 @@ function describeSlip (saved, state, now) {
     }
   }
   if (state.status === 'tallying') return { label: 'Counting', color: 'primary', detail: 'Results are locked and coupons are being counted.' }
+  if (!saved.system?.length && !saved.revealed) {
+    return { label: 'Entered', color: 'primary', detail: 'This coupon is in the pool. The rows stay on the device that placed it until they are published. Import a backup from that device to see them here.' }
+  }
   if (now < state.deadline) return { label: 'Entered', color: 'primary', detail: `Your picks are published automatically when entries close (${formatDate(state.deadline * 1000)}).` }
   if (saved.revealed) return { label: 'Revealed', color: 'primary', detail: 'Waiting for both result signers.' }
   if (now >= state.revealDeadline) return { label: 'Not revealed', color: 'error', detail: 'The reveal window has closed; this coupon cannot win.' }
@@ -288,7 +291,6 @@ async function loadChain () {
   chainError.value = ''
   await loadConfig()
   const rpcUrl = auth.config.solanaRpcUrl
-  await syncPublishedSlips(auth.wallet)
   let saved = loadChainCoupons(auth.wallet)
   let onChain = []
   const events = new Map()
@@ -299,9 +301,16 @@ async function loadChain () {
     for (const event of list) {
       if (event.chain) events.set(event.chain.address || eventPda(event.chain.admin, event.chain.nonce), event)
     }
+    await adoptArchiveSlips(auth.wallet, list)
+    await syncPublishedSlips(auth.wallet)
+    saved = loadChainCoupons(auth.wallet)
+  } catch (error) {
+    chainError.value = `Could not read your coupons from the server: ${error.message}`
+  }
+  try {
     onChain = await walletCoupons(rpcUrl, auth.wallet)
   } catch (error) {
-    chainError.value = `Could not read your vault coupons from chain: ${error.message}`
+    if (!chainError.value) chainError.value = `Could not read your vault coupons from chain: ${error.message}`
   }
   if (eventsLoaded) {
     onChain = onChain.filter(coupon => events.has(coupon.event))
@@ -472,9 +481,9 @@ const expired = p => Date.now() - p.paidAt > PAYMENT_MAX_AGE_MS
 async function load () {
   armed.value = loadArmed(auth.wallet)
   pending.value = loadPending(auth.wallet)
-  loadChain().catch(notifyError)
   loading.value = true
   try {
+    await loadChain()
     entries.value = (await entryApi.mine()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
     try {
       const rounds = await eventApi.list()

@@ -9,7 +9,9 @@
     <div v-for="(selected, index) in picks" :key="index" class="game-row">
       <div class="game-top">
         <span class="game-line">
-          <span class="game-index">{{ index + 1 }}.</span><span class="game-name">{{ label(index) }}</span>
+          <span class="game-index">{{ index + 1 }}.</span><span
+            class="game-name" :class="{ expanded: expanded.has(index) }" :title="label(index)" @click="toggleName(index)"
+          >{{ label(index) }}</span>
           <MatchScore v-if="settled && live[index]" :game="live[index]" :kickoff="games[index].kickoff" />
         </span>
         <span class="picks">
@@ -28,7 +30,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import MatchScore from '@/components/MatchScore.vue'
 import { kickoffStamp } from '@/services/projection'
 import { outcomes } from '@/utils/format'
@@ -45,6 +47,14 @@ const props = defineProps({
 })
 
 const painted = computed(() => colorView(props.colors))
+const expanded = ref(new Set())
+
+function toggleName (index) {
+  const next = new Set(expanded.value)
+  if (next.has(index)) next.delete(index)
+  else next.add(index)
+  expanded.value = next
+}
 
 const settled = computed(() => props.results.length > 0 && [...props.results].every(mark => '1X2C'.includes(mark)))
 const missedGames = computed(() => (settled.value ? missedColorGames(props.colors, props.results) : new Set()))
@@ -125,6 +135,13 @@ function pickClass (selected, outcome, result, game) {
   text-overflow: ellipsis;
   font-weight: 600;
   font-size: 13px;
+  cursor: pointer;
+}
+.game-name.expanded {
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
 }
 .result-pill {
   display: inline-flex;

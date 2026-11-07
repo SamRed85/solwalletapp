@@ -1,7 +1,7 @@
 import { reactive } from 'vue'
 import { authApi, configApi, setUnauthorizedHandler } from '@/services/api'
 import { SESSION_KEY, clearSession, loadSession, saveSession } from '@/services/session'
-import { connectWallet, disconnectWallet, getBalance, getProvider, onPhantomAccount, signMessage, trustedAccount } from '@/services/solana'
+import { connectWallet, disconnectWallet, getBalance, onPhantomAccount, selectedAccount, signMessage } from '@/services/solana'
 import { notify } from '@/stores/notify'
 
 export const auth = reactive({
@@ -12,6 +12,12 @@ export const auth = reactive({
   busy: false,
   config: null
 })
+
+// A request sent before this moment carried no cookie for the current session, so its 401
+// says nothing about that session. Phantom's in-app browser also reports an empty account
+// for a few seconds after the first approval. That report is not a disconnect.
+let signedInAt = 0
+const SIGN_IN_GRACE_MS = 5000
 
 function apply (session) {
   auth.wallet = session?.wallet ?? null
@@ -52,6 +58,7 @@ export async function login () {
     const signature = await signMessage(message)
     const { expiresAt, user } = await authApi.login(wallet, nonce, signature)
     const session = { expiresAt, wallet: user.walletAddress, displayName: user.displayName || '', isAdmin: user.isAdmin }
+    signedInAt = Date.now()
     saveSession(session)
     apply(session)
     refreshBalance()
@@ -87,7 +94,8 @@ async function restore () {
   }
 }
 
-setUnauthorizedHandler(() => {
+setUnauthorizedHandler(sentAt => {
+  if (sentAt < signedInAt) return
   clearSession()
   apply(null)
 })
@@ -98,9 +106,12 @@ window.addEventListener('storage', event => {
 
 let leaving = false
 
-// The session belongs to one wallet. A different Phantom account, or a disconnect, ends it.
+// The session belongs to one wallet. An empty account does not end it: the in-app browser
+// clears publicKey while the connection made a moment ago is still the approved one.
+// A real switch arrives as a different address.
 async function leaveIfWalletChanged (next) {
-  if (leaving || !auth.wallet || next === auth.wallet) return
+  if (leaving || !auth.wallet || !next || next === auth.wallet) return
+  if (Date.now() - signedInAt < SIGN_IN_GRACE_MS) return
   leaving = true
   try {
     await logout()
@@ -110,10 +121,10 @@ async function leaveIfWalletChanged (next) {
   }
 }
 
-async function syncPhantomAccount () {
+function syncPhantomAccount () {
   if (!auth.wallet) return
-  const next = await trustedAccount()
-  if (next) await leaveIfWalletChanged(next)
+  const next = selectedAccount()
+  if (next) void leaveIfWalletChanged(next)
 }
 
 onPhantomAccount(next => { void leaveIfWalletChanged(next) })
@@ -124,7 +135,7 @@ document.addEventListener('visibilitychange', () => {
 })
 
 setInterval(() => {
-  const next = getProvider()?.publicKey?.toBase58?.()
+  const next = selectedAccount()
   if (next) void leaveIfWalletChanged(next)
 }, 1000)
 

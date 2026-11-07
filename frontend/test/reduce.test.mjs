@@ -140,6 +140,15 @@ test('a saved color bitset names the same signs the player marked', () => {
   assert.deepEqual(view[1].marks, [{ game: 1, outcome: 'X' }, { game: 2, outcome: '2' }])
 })
 
+test('a coupon reduced with yellow only stays yellow', () => {
+  const frame = full(3)
+  const reduced = colorReduction(frame, [{ id: 'yellow', signs: [{ game: 0, outcome: '1' }, { game: 1, outcome: '1' }], min: 1, max: 1 }])
+  assert.equal(reduced.colors[0].id, 'yellow')
+  const view = colorView(reduced.colors.map(color => ({ ...color, signs: color.signs.toString() })))
+  assert.equal(view[0].id, 'yellow')
+  assert.equal(view[0].label, 'Yellow')
+})
+
 test('a color that keeps every row is left off the coupon', () => {
   const reduced = colorReduction([['1', 'X'], ['2'], ['1']], [{ signs: [{ game: 0, outcome: '1' }], min: 0, max: 1 }])
   assert.deepEqual(reduced, { rows: 2, frameRows: 2, system: ['1X', '2', '1'], colors: [] })

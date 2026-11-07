@@ -5,7 +5,7 @@
       <v-checkbox v-model="cardDetails.odds" label="Odds" density="compact" hide-details class="card-check" />
       <v-checkbox v-model="cardDetails.probability" label="Probability" density="compact" hide-details class="card-check" />
       <v-checkbox v-model="cardDetails.startTime" label="Start time" density="compact" hide-details class="card-check" />
-      <v-checkbox v-model="cardDetails.pickShare" label="Pick share (after start)" density="compact" hide-details class="card-check" />
+      <v-checkbox v-model="cardDetails.pickShare" label="Pick share" title="Shown after the first game starts" density="compact" hide-details class="card-check" />
     </div>
     <div v-if="cardDetails.pickShare && started && event?.chain && event.pickShare" class="share-note">
       from {{ event.pickShare.revealed }} of {{ event.pickShare.coupons }} coupons revealed
@@ -38,13 +38,13 @@ const started = computed(() => eventStarted(props.event))
 }
 .option-grid {
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   justify-content: center;
   align-items: center;
   column-gap: 8px;
   max-width: 100%;
 }
-.card-check { margin: 0; }
+.card-check { margin: 0; flex: none; }
 .card-check :deep(.v-selection-control) {
   min-height: 18px;
 }
@@ -60,6 +60,7 @@ const started = computed(() => eventStarted(props.event))
   font-size: 11px;
   margin-inline-start: 2px;
   opacity: 0.85;
+  white-space: nowrap;
 }
 .share-note {
   font-size: 10px;

@@ -6,7 +6,7 @@ import {
   sendProgramTransaction, slipCommitment, systemFromPicks, unsealCoupon, vaultSchedule, walletCoupons
 } from './program'
 import { combinationCount } from '../utils/coupons.js'
-import { publishedSlipPatch } from './slipStatus'
+import { publishedSlipPatch, slipFromArchive } from './slipStatus'
 import { hexToBytes, slipLeaf, slipMark, slipRevealLeaf, sparseProof } from './slipTree'
 import { sendPayment, signMessageBytes, waitForConfirmation } from './solana'
 
@@ -142,7 +142,7 @@ export async function couponKey (wallet) {
 }
 
 // Stored with the coupon and in the time lock. Sign bits are a decimal string so JSON keeps them exact.
-const savedColors = colors => colors.map(color => ({ signs: color.signs.toString(), min: color.min, max: color.max }))
+const savedColors = colors => colors.map(color => ({ signs: color.signs.toString(), min: color.min, max: color.max, ...(color.id ? { id: color.id } : {}) }))
 
 function assertCouponAllowed ({ minRows, maxCoupons, count }, combinations) {
   if (combinations < minRows) {
@@ -434,6 +434,82 @@ export async function autoRevealCoupons ({ config, wallet, events, skip = new Se
 function patchCoupon (wallet, coupon, patch) {
   const id = couponId(coupon)
   saveChainCoupons(wallet, loadChainCoupons(wallet).map(saved => couponId(saved) === id ? { ...saved, ...patch } : saved))
+}
+
+function colorsFromHex (hex) {
+  const raw = hexToBytes(hex)
+  if (!raw.length || raw.length % 10 !== 0 || raw.length / 10 > 4) return []
+  const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength)
+  const colors = []
+  for (let at = 0; at < raw.length; at += 10) {
+    colors.push({ signs: view.getBigUint64(at, true).toString(), min: raw[at + 8], max: raw[at + 9] })
+  }
+  return colors
+}
+
+function withPublishedPicks (coupon) {
+  if (!coupon?.picksHex) return coupon
+  const picks = hexToBytes(coupon.picksHex)
+  const next = { ...coupon, system: systemFromPicks(picks, picks.length), revealed: true }
+  delete next.picksHex
+  if (coupon.colorsHex) {
+    const colors = colorsFromHex(coupon.colorsHex)
+    if (colors.length) next.colors = colors
+  }
+  delete next.colorsHex
+  return next
+}
+
+// Pulls this wallet's slips out of the server archive. The placing browser is the only
+// one that stored the rows locally, so another device would otherwise show an empty list.
+export async function adoptArchiveSlips (wallet, events) {
+  let adopted = 0
+  for (const event of events || []) {
+    if (!event?.chain?.admin || event.chain.nonce == null) continue
+    const address = event.chain.address || eventPda(event.chain.admin, event.chain.nonce)
+    let archive
+    try {
+      archive = await slipApi.get(address)
+    } catch {
+      continue
+    }
+    const claimed = new Set((archive.claims || []).map(row => Number(row.index)))
+    const refunded = new Set((archive.refunds || []).map(row => Number(row.index)))
+    const reveals = new Map((archive.reveals || []).filter(row => row.owner === wallet).map(row => [Number(row.index), row]))
+    const known = new Set(loadChainCoupons(wallet).map(couponId))
+    for (const row of archive.entries || []) {
+      const built = slipFromArchive({
+        wallet,
+        event: { id: event.id, title: event.title, admin: event.chain.admin, nonce: event.chain.nonce },
+        address,
+        row,
+        reveal: reveals.get(Number(row.index)),
+        claimed: claimed.has(Number(row.index)),
+        refunded: refunded.has(Number(row.index))
+      })
+      if (!built) continue
+      const coupon = { programId: PROGRAM_ID, placedAt: 0, lamports: Number(event.couponPriceLamports || 0) * built.combinations, ...withPublishedPicks(built) }
+      const existing = loadChainCoupons(wallet).find(saved => couponId(saved) === coupon.address)
+      if (!existing) {
+        if (known.has(coupon.address)) continue
+        rememberCoupon(wallet, coupon)
+        adopted += 1
+        continue
+      }
+      const patch = {}
+      if (coupon.revealed && !existing.system?.length && coupon.system) {
+        patch.system = coupon.system
+        patch.revealed = true
+        if (coupon.colors) patch.colors = coupon.colors
+      }
+      if (coupon.claimed && !existing.claimed) patch.claimed = true
+      if (coupon.refunded && !existing.refunded) patch.refunded = true
+      if (!Object.keys(patch).length) continue
+      patchCoupon(wallet, existing, patch)
+      adopted += 1
+    }
+  }
+  return adopted
 }
 
 // Copies keeper publishes into this browser so a slip is not offered for reveal again.

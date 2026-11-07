@@ -12,12 +12,17 @@ export function setUnauthorizedHandler (fn) {
   onUnauthorized = fn
 }
 
+api.interceptors.request.use(config => {
+  config.sentAt = Date.now()
+  return config
+})
+
 api.interceptors.response.use(
   response => response,
   error => {
     const url = error.config?.url || ''
     if (error.response?.status === 401 && !url.includes('/api/auth/')) {
-      onUnauthorized()
+      onUnauthorized(error.config?.sentAt ?? 0)
     }
     return Promise.reject(new Error(error.response?.data?.error || error.message))
   }

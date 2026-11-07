@@ -24,13 +24,16 @@
             v-for="event in events" :key="event.id" class="event-link" :to="`/events/${event.id}`"
             :disabled="event.status === 'draft' && !auth.isAdmin"
           >
-            <v-list-item-title>{{ event.title }}</v-list-item-title>
+            <v-list-item-title class="d-flex align-center ga-1">
+              <span class="event-name">{{ event.title }}</span>
+              <v-icon v-if="jackpotOf(event)" color="amber" size="small" title="Jackpot event">mdi-trophy</v-icon>
+            </v-list-item-title>
             <v-list-item-subtitle>
               {{ event.gameCount }} games · {{ formatSol(event.couponPriceLamports) }} per coupon · entries close {{ formatDate(event.startTime) }}
             </v-list-item-subtitle>
             <div class="d-flex flex-wrap ga-2 mt-2">
-              <v-chip v-if="event.rolloverInLamports" color="amber" size="small" variant="flat" prepend-icon="mdi-trophy">
-                +{{ formatSol(event.rolloverInLamports) }}
+              <v-chip v-if="jackpotOf(event)" color="amber" size="small" variant="flat" prepend-icon="mdi-trophy">
+                Jackpot {{ formatSol(jackpotOf(event)) }}
               </v-chip>
               <v-chip :color="statusColors[event.status]" size="small" variant="flat">
                 {{ event.status === 'open' ? 'play' : event.status }}
@@ -71,8 +74,9 @@
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { eventApi } from '@/services/api'
+import { eventPda, fetchEvent } from '@/services/program'
 import { isPhantomInstalled } from '@/services/solana'
-import { auth, login } from '@/stores/auth'
+import { auth, loadConfig, login } from '@/stores/auth'
 import { notifyError } from '@/stores/notify'
 import { formatDate, formatSol, statusColors } from '@/utils/format'
 
@@ -80,6 +84,33 @@ const { smAndDown: mobile } = useDisplay()
 const phantomInstalled = ref(isPhantomInstalled())
 const events = ref([])
 const loading = ref(false)
+const chainJackpots = ref({})
+
+// A vault event keeps its carried-over jackpot on chain only.
+function jackpotOf (event) {
+  if (event.chain) return chainJackpots.value[event.id] || 0
+  return event.rolloverInLamports || 0
+}
+
+async function loadChainJackpots (list) {
+  const vaults = list.filter(event => event.chain && event.status !== 'draft')
+  if (!vaults.length) return
+  try {
+    const config = await loadConfig()
+    const found = {}
+    await Promise.all(vaults.map(async event => {
+      try {
+        const state = await fetchEvent(config.solanaRpcUrl, event.chain.address || eventPda(event.chain.admin, event.chain.nonce))
+        if (state.rolloverIn > 0n) found[event.id] = Number(state.rolloverIn)
+      } catch {
+        // An unreadable vault shows no jackpot badge.
+      }
+    }))
+    chainJackpots.value = found
+  } catch {
+    chainJackpots.value = {}
+  }
+}
 
 const newestFirst = (a, b) => new Date(b.createdAt || b.startTime) - new Date(a.createdAt || a.startTime)
 let phantomTimer
@@ -97,6 +128,7 @@ async function loadEvents () {
   loading.value = true
   try {
     events.value = (await eventApi.list()).sort(newestFirst)
+    loadChainJackpots(events.value)
   } catch (error) {
     notifyError(error)
   } finally {
@@ -116,6 +148,12 @@ watch(() => auth.wallet, () => loadEvents())
 </script>
 
 <style scoped>
+.event-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .event-link {
   transition: transform 180ms ease, box-shadow 180ms ease;
 }

@@ -17,17 +17,12 @@ export async function connectWallet () {
   return publicKey.toBase58()
 }
 
-// The account Phantom has selected, without opening an approval popup.
-// Undefined means Phantom is not available. Null means it is not connected.
-export async function trustedAccount () {
-  const provider = getProvider()
-  if (!provider) return undefined
-  try {
-    const { publicKey } = await provider.connect({ onlyIfTrusted: true })
-    return publicKey?.toBase58?.() ?? null
-  } catch {
-    return provider.publicKey?.toBase58?.() ?? null
-  }
+// The account Phantom has already shared with this page.
+// This only reads the provider. Calling connect() again, even with onlyIfTrusted,
+// makes Phantom's in-app browser show the connect sheet a second time after the
+// first approval. The desktop extension answers that call without a prompt.
+export function selectedAccount () {
+  return getProvider()?.publicKey?.toBase58?.() || null
 }
 
 export function onPhantomAccount (handler) {

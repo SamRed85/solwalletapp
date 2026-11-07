@@ -110,13 +110,25 @@
 
 .cell-label { display: none; }
 
+:root {
+  --sol-inset-top: env(safe-area-inset-top, 0px);
+  --sol-inset-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* A wallet's in-app browser draws its own bars around the page, and still reports the
+   phone's safe area. Padding for it there doubles the bar height. */
+:root.in-wallet {
+  --sol-inset-top: 0px;
+  --sol-inset-bottom: 0px;
+}
+
 @media (max-width: 959px) {
   .v-application .v-main.has-phone-nav {
-    padding-bottom: calc(64px + env(safe-area-inset-bottom)) !important;
+    padding-bottom: calc(60px + var(--sol-inset-bottom)) !important;
   }
 
   .v-application .sol-bar.v-toolbar {
-    padding-top: env(safe-area-inset-top);
+    padding-top: var(--sol-inset-top);
   }
 
   .v-application .v-card-title,

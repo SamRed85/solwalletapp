@@ -31,10 +31,17 @@ export function kickoffLabel (kickoff, now = new Date()) {
   return `${day} ${time}`
 }
 
-// The expected payout is shown while matches are being played, after they finish,
+const NOT_STARTED = new Set(['', 'NS', 'TBD', 'PST', 'CANC', 'ABD', 'AWD', 'WO'])
+
+// True once any game in the projection has kicked off.
+export function projectionStarted (projection) {
+  return (projection?.games || []).some(game => game.final || game.elapsed != null || game.homeGoals != null || !NOT_STARTED.has(game.status || ''))
+}
+
+// The expected payout is shown from the first kickoff, after the matches finish,
 // and until the result signers approve. A match that has not started counts as X.
 export function showStandingPayout (projection) {
-  return !!projection
+  return !!projection && projectionStarted(projection)
 }
 
 // Standing results are the live 1, X, 2 for each game. A match that has not started is X.
