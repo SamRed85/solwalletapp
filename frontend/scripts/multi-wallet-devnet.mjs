@@ -246,7 +246,7 @@ async function treasuryRun (admin, deployer) {
     description: 'Automated two-wallet treasury run',
     gameCount: 7,
     couponPriceLamports: TICKET,
-    tiers: [{ correct: 7, percent: 95 }],
+    tiers: [{ correct: 7, percent: 90 }],
     startTime: start.toISOString(),
     endTime: end.toISOString()
   })

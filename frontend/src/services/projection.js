@@ -1,4 +1,5 @@
 import { correctCounts, picksFromSystem } from './program.js'
+import { keptCounts } from '../utils/reduce.js'
 
 // A winning row paid less than this rolls its whole tier into the next event.
 export const MIN_ROW_PAYOUT_LAMPORTS = 10_000_000n
@@ -30,6 +31,12 @@ export function kickoffLabel (kickoff, now = new Date()) {
   return `${day} ${time}`
 }
 
+// The expected payout is shown while matches are being played, after they finish,
+// and until the result signers approve. A match that has not started counts as X.
+export function showStandingPayout (projection) {
+  return !!projection
+}
+
 // Standing results are the live 1, X, 2 for each game. A match that has not started is X.
 export function standingResults (projection) {
   const games = projection?.games
@@ -40,11 +47,12 @@ export function standingResults (projection) {
 // The figure is what this coupon would pay if the current scores do not change.
 // Each tier pot is split equally across every revealed row in that tier. Until those
 // rows are known, the figure is the maximum for this coupon alone.
-export function projectCoupon (system, projection) {
+export function projectCoupon (system, projection, colors = []) {
   if (!projection?.complete || !system?.length || system.some(game => !game)) return null
   if (projection.games.length !== system.length) return null
   const results = projection.games.map(game => game.projected).join('')
-  const counts = correctCounts(picksFromSystem(system), results)
+  const picks = picksFromSystem(system)
+  const counts = colors.length ? keptCounts(picks, colors, results) : correctCounts(picks, results)
   let best = 0
   for (let score = counts.length - 1; score > 0; score--) {
     if (counts[score]) {

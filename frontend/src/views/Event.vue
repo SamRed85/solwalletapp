@@ -13,15 +13,23 @@
           </v-chip>
         </v-card-title>
         <v-card-subtitle class="text-wrap">
-          {{ event.gameCount }} games · {{ formatSol(event.couponPriceLamports) }} per coupon ·
+          {{ event.gameCount }} games · {{ event.league ? `${event.couponPriceLamports} RAD` : formatSol(event.couponPriceLamports) }} per coupon ·
+          at least {{ limits.minRows.toLocaleString() }} row{{ limits.minRows === 1 ? '' : 's' }} ·
+          {{ limits.count.toLocaleString() }} of {{ limits.maxCoupons.toLocaleString() }} coupons ·
           entries close {{ formatDate(event.startTime) }}
         </v-card-subtitle>
         <v-card-text v-if="auth.isAdmin && event.status !== 'completed'" class="pt-2 pb-0">
-          <v-btn size="small" variant="tonal" prepend-icon="mdi-refresh" :loading="refreshingScores" @click="refreshScores">
-            Refresh scores
-          </v-btn>
+          <div class="d-flex flex-wrap ga-2">
+            <v-btn size="small" variant="tonal" prepend-icon="mdi-refresh" :loading="refreshingScores" @click="refreshScores">
+              Refresh scores
+            </v-btn>
+            <v-btn size="small" variant="tonal" prepend-icon="mdi-percent" :loading="fetchingOdds" @click="fetchOdds">
+              Fetch odds
+            </v-btn>
+          </div>
           <div class="text-caption text-medium-emphasis mt-1">
             Scores refresh on their own 45 and 90 minutes after entries close. This button reads them now.
+            Fetch odds reads the Match Winner line once and saves it.
           </div>
         </v-card-text>
         <v-card-text>
@@ -36,7 +44,7 @@
               <div class="sales-amount">{{ formatSol(salesLamports) }}</div>
             </div>
             <p class="text-caption text-medium-emphasis mb-3">
-              {{ event.couponsSold }} coupon{{ event.couponsSold === 1 ? '' : 's' }} sold. The house keeps {{ houseCut }}% of ticket sales.
+              {{ event.couponsSold }} coupon{{ event.couponsSold === 1 ? '' : 's' }} sold. The house keeps {{ houseCut }}% and the league vault keeps {{ leagueCut }}% of ticket sales.
             </p>
             <v-expansion-panels>
               <v-expansion-panel>
@@ -81,6 +89,7 @@
         <v-card-subtitle v-if="event.status !== 'completed'" class="text-wrap">
           A live score is what the match shows now. It is not the settled result.
         </v-card-subtitle>
+        <GameCardOptions :event="event" class="games-options" />
         <div v-for="(game, index) in event.games" :key="index" class="game-row">
           <div class="game-top">
             <div class="game-name-line">
@@ -93,17 +102,17 @@
                 :finished="game.result === '1' || game.result === 'X' || game.result === '2'"
               />
             </div>
-            <span class="marks">
+            <span class="marks" :class="{ solo: marksFor(game).length === 1 }">
               <span v-for="mark in marksFor(game)" :key="mark" class="mark" :class="{ on: mark === outcomeAt(index) }">{{ mark }}</span>
             </span>
           </div>
-          <div class="game-when">{{ kickoffStamp(game.kickoff) }}</div>
-          <div v-if="game.draw" class="text-caption text-medium-emphasis">
+          <GameFacts :game="game" :share="shareAt(index)" :started="started" />
+          <div v-if="game.draw" class="draw-note text-caption text-medium-emphasis">
             Weights 1/X/2: {{ game.draw.weights.join(' / ') }} ·
             <a :href="explorerBlock(game.draw.slot)" target="_blank" rel="noopener">block {{ game.draw.slot }}</a>
           </div>
         </div>
-        <v-card-text v-if="officialResults || projection?.revealClosed">
+        <v-card-text v-if="officialResults || showStanding">
           <div class="text-subtitle-2">All rows</div>
           <div v-if="!allRows.length" class="text-caption text-medium-emphasis">
             The totals appear once every match has a score.
@@ -111,7 +120,8 @@
           <template v-else>
             <div class="text-caption text-medium-emphasis mb-1">
               <template v-if="officialResults">Every revealed row in this event.</template>
-              <template v-else>If these scores stand. Counted from revealed coupons.</template>
+              <template v-else-if="projection?.maximum">If these scores stand. Other coupons are still hidden, so this is the most one row could win.</template>
+              <template v-else>If these scores stand. Counted from revealed coupons. This is not the settled payout.</template>
             </div>
             <v-table>
               <thead><tr><th>Correct picks</th><th>Rows</th><th>Payout</th></tr></thead>
@@ -144,6 +154,39 @@
           <v-alert v-if="isTreasury" type="warning" variant="tonal" class="mb-4">
             This wallet is the treasury wallet and cannot pay itself. Sign in with another wallet to play.
           </v-alert>
+          <v-alert v-if="pendingGroup" type="warning" variant="tonal" class="mb-4">
+            {{ signedPieceCount }} of {{ pendingGroup.pieces.length }} coupons from your reduction are signed.
+            The rest are saved. Resume signs only the ones that are not paid yet.
+            <div class="mt-2 d-flex flex-wrap ga-2">
+              <v-btn size="small" variant="text" :disabled="paying" @click="discardReduction">
+                Drop the unsigned coupons
+              </v-btn>
+            </div>
+          </v-alert>
+          <div v-if="event.chain && !pendingGroup" class="reduce-panel mb-4">
+            <div class="text-subtitle-2 mb-1">Reduce with colors</div>
+            <p class="text-caption text-medium-emphasis mb-2">
+              Choose a color, then tap signs to group them. A row is kept only when every color lands between its min and max.
+              The reduction is one coupon with one signature, and you pay only for the rows it keeps.
+            </p>
+            <div class="d-flex flex-wrap ga-2 mb-2">
+              <v-btn
+                v-for="id in colorIds" :key="id" size="small" class="color-choice" :class="id"
+                :variant="activeColor === id ? 'flat' : 'outlined'"
+                @click="activeColor = activeColor === id ? '' : id"
+              >
+                {{ colorLabels[id] }}
+                <span v-if="colorMarks[id].length" class="ml-1">{{ colorMarks[id].length }}</span>
+              </v-btn>
+            </div>
+            <div v-for="id in usedColorIds" :key="id" class="color-limit">
+              <span class="swatch" :class="id" />
+              <span class="color-name">{{ colorLabels[id] }}</span>
+              <label>Min <input type="number" min="0" :max="colorMarks[id].length" :value="colorLimits[id].min" :disabled="paying" @change="setLimit(id, 'min', $event)"></label>
+              <label>Max <input type="number" min="0" :max="event.gameCount" :value="colorLimits[id].max" :disabled="paying" @change="setLimit(id, 'max', $event)"></label>
+            </div>
+          </div>
+          <GameCardOptions :event="event" />
           <div v-if="event.games.length" class="game-row fill-row">
             <div class="game-top">
               <div class="fill-spacer">
@@ -167,14 +210,16 @@
               </div>
               <v-btn
                 v-for="o in outcomes" :key="o.value" class="pick-btn" :title="o.label" :disabled="paying"
-                :color="isSelected(g, o.value) ? 'primary' : undefined"
+                :color="isSelected(g, o.value) && !signColors(g, o.value).length ? 'primary' : undefined"
                 :variant="isSelected(g, o.value) ? 'flat' : 'outlined'"
-                @click="togglePick(g, o.value)"
+                :class="signColors(g, o.value)"
+                :style="signStyle(g, o.value)"
+                @click="onPick(g, o.value)"
               >
                 {{ o.value }}
               </v-btn>
             </div>
-            <div class="game-when">{{ kickoffStamp(game.kickoff) }}</div>
+            <GameFacts :game="game" :share="shareAt(g)" :started="started" />
           </div>
           <div v-if="preview.length" class="mt-4">
             <div class="text-subtitle-2 mb-2">Combinations</div>
@@ -187,16 +232,31 @@
         <v-card-actions class="pay-bar flex-wrap ga-2 pa-4">
           <div>
             <div class="text-subtitle-1">
-              {{ combinationTotal.toLocaleString() }} combination{{ combinationTotal === 1 ? '' : 's' }} × {{ formatSol(event.couponPriceLamports) }} =
-              <strong>{{ formatSol(totalLamports) }}</strong>
+              <template v-if="reductionState?.ok && reductionState.rows !== combinationTotal">
+                {{ combinationTotal.toLocaleString() }} reduced to {{ reductionState.rows.toLocaleString() }}
+                ({{ removedPercent }}% removed) · 1 coupon ·
+              </template>
+              <template v-else-if="overRows">
+                <span class="text-error">
+                  {{ combinationTotal.toLocaleString() }} reduced to {{ overRows.toLocaleString() }}, over the
+                  {{ maxCombinations.toLocaleString() }} limit
+                </span>
+                ·
+              </template>
+              <template v-else>
+                {{ paidRows.toLocaleString() }} combination{{ paidRows === 1 ? '' : 's' }} ×
+              </template>
+              {{ event.league ? `${event.couponPriceLamports} RAD` : formatSol(event.couponPriceLamports) }} =
+              <strong>{{ event.league ? `${totalLamports} RAD` : formatSol(totalLamports) }}</strong>
             </div>
             <div class="text-caption text-medium-emphasis">
               {{ statusText }}
             </div>
             <div class="text-caption text-medium-emphasis mt-1">
-              You pay the coupon price only. A losing coupon keeps its stake in the pool. There is no account deposit and no monthly draw.
+              <template v-if="event.league">This round is paid in RAD. You earn 1 RAD for every row on a SOL event. <span v-if="radBalance !== null">You have {{ radBalance }} RAD.</span></template>
+              <template v-else>You pay the coupon price only, and this row earns 1 RAD toward the league event. A losing coupon keeps its stake in the pool. There is no account deposit and no monthly draw.</template>
             </div>
-            <ProjectedPayout :system="systemRows(picks)" :projection="projection" />
+            <ProjectedPayout :system="systemRows(picks)" :colors="reductionState?.ok ? reductionState.colors : []" :projection="projection" />
             <div v-if="lowBalance" class="text-caption text-error">Your devnet balance looks too low for this payment.</div>
           </div>
           <v-spacer />
@@ -210,9 +270,9 @@
           <v-btn
             v-else
             color="primary" variant="flat" size="large" prepend-icon="mdi-wallet"
-            :disabled="!complete || isTreasury" :loading="paying" @click="pay"
+            :disabled="!canSubmit || isTreasury" :loading="paying" @click="pay"
           >
-            Pay with Phantom
+            {{ payLabel }}
           </v-btn>
         </v-card-actions>
         <v-alert v-if="paying" type="info" variant="tonal" class="ma-4 mt-0">{{ stepLabels[step] }}</v-alert>
@@ -225,15 +285,20 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import CouponPicks from '@/components/CouponPicks.vue'
+import GameCardOptions from '@/components/GameCardOptions.vue'
+import GameFacts from '@/components/GameFacts.vue'
 import MatchScore from '@/components/MatchScore.vue'
 import ProjectedPayout from '@/components/ProjectedPayout.vue'
 import VaultPanel from '@/components/VaultPanel.vue'
-import { eventApi } from '@/services/api'
-import { payAndEnter, placeOnChain } from '@/services/entry'
+import { eventApi, reductionApi } from '@/services/api'
+import { couponCapacity, fetchRad } from '@/services/program'
+import { payAndEnter, placeOnChain, placeReduction } from '@/services/entry'
 import { auth, loadConfig, login, refreshBalance } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { combinationCount, expandCombinations, systemRows } from '@/utils/coupons'
-import { kickoffStamp } from '@/services/projection'
+import { COLOR_IDS, colorReduction } from '@/utils/reduce'
+import { eventStarted } from '@/services/gameCards'
+import { showStandingPayout } from '@/services/projection'
 import { explorerBlock, formatDate, formatSol, outcomes, statusColors } from '@/utils/format'
 
 const route = useRoute()
@@ -242,12 +307,24 @@ const event = ref(null)
 const projection = ref(null)
 const loading = ref(false)
 const refreshingScores = ref(false)
+const fetchingOdds = ref(false)
 const picks = ref([])
 const paying = ref(false)
 const step = ref('sign')
+const signProgress = ref({ done: 0, total: 0 })
+const colorIds = COLOR_IDS
+const colorLabels = { purple: 'Purple', yellow: 'Yellow', red: 'Red', green: 'Green' }
+const colorMarks = ref({ purple: [], yellow: [], red: [], green: [] })
+const colorLimits = ref({
+  purple: { min: 0, max: 0 }, yellow: { min: 0, max: 0 }, red: { min: 0, max: 0 }, green: { min: 0, max: 0 }
+})
+const activeColor = ref('')
+const pendingGroup = ref(null)
 
 const stepLabels = computed(() => event.value?.chain ? {
-  sign: 'Approve the entry in Phantom.',
+  sign: signProgress.value.total > 1
+    ? `Approve coupon ${Math.min(signProgress.value.done + 1, signProgress.value.total)} of ${signProgress.value.total} in Phantom.`
+    : 'Approve the entry in Phantom.',
   confirm: 'Waiting for the entry to be finalized on devnet...',
   schedule: 'Saving the time-locked picks. They are published when entries close.'
 } : {
@@ -258,18 +335,73 @@ const stepLabels = computed(() => event.value?.chain ? {
 
 const maxCombinations = computed(() => auth.config?.maxCombinations ?? auth.config?.maxCouponsPerEntry ?? 44000)
 const houseCut = computed(() => auth.config?.houseCutPercent ?? 5)
+const leagueCut = computed(() => auth.config?.leagueCutPercent ?? 5)
+const radBalance = ref(null)
 const isTreasury = computed(() => auth.config && auth.wallet === auth.config.treasuryWallet)
 const settlement = computed(() => event.value?.settlement)
 const combinationTotal = computed(() => combinationCount(picks.value))
 const preview = computed(() => expandCombinations(picks.value))
 const missingGames = computed(() => picks.value.filter(game => game.length === 0).length)
-const tooMany = computed(() => combinationTotal.value > maxCombinations.value)
-const totalLamports = computed(() => combinationTotal.value * (event.value?.couponPriceLamports ?? 0))
-const complete = computed(() => missingGames.value === 0 && combinationTotal.value > 0 && !tooMany.value)
-const lowBalance = computed(() => auth.balance !== null && auth.balance * 1e9 < totalLamports.value + 10000)
+const usedColorIds = computed(() => colorIds.filter(id => colorMarks.value[id].length))
+const reductionState = computed(() => {
+  if (!usedColorIds.value.length || missingGames.value) return null
+  const colors = usedColorIds.value.map(id => ({
+    min: colorLimits.value[id].min,
+    max: colorLimits.value[id].max,
+    signs: colorMarks.value[id].map(key => {
+      const [game, outcome] = key.split(':')
+      return { game: Number(game), outcome }
+    })
+  }))
+  try {
+    return { ok: true, ...colorReduction(picks.value, colors, { maxCombinations: maxCombinations.value }) }
+  } catch (error) {
+    return { ok: false, error: error.message, rows: error.rows || 0 }
+  }
+})
+const overRows = computed(() => reductionState.value?.ok === false ? reductionState.value.rows : 0)
+const paidRows = computed(() => reductionState.value?.ok ? reductionState.value.rows : (overRows.value || combinationTotal.value))
+const removedPercent = computed(() => {
+  if (!reductionState.value?.ok || !combinationTotal.value) return 0
+  return Math.round((1 - reductionState.value.rows / combinationTotal.value) * 100)
+})
+const signedPieceCount = computed(() => pendingGroup.value?.pieces.filter(piece => piece.status === 'signed').length || 0)
+const tooMany = computed(() => !reductionState.value && combinationTotal.value > maxCombinations.value)
+const chainCapacity = ref(null)
+const limits = computed(() => {
+  if (chainCapacity.value) return chainCapacity.value
+  const current = event.value
+  return {
+    minRows: current?.minRows > 0 ? current.minRows : 1,
+    maxCoupons: current?.maxCoupons > 0 ? current.maxCoupons : (1 << 20),
+    count: current?.entryCount || 0
+  }
+})
+const belowMin = computed(() => paidRows.value > 0 && paidRows.value < limits.value.minRows)
+const eventFull = computed(() => limits.value.count >= limits.value.maxCoupons)
+const totalLamports = computed(() => paidRows.value * (event.value?.couponPriceLamports ?? 0))
+const complete = computed(() => missingGames.value === 0 && paidRows.value > 0 && !tooMany.value && !belowMin.value && !eventFull.value && reductionState.value?.ok !== false)
+const canSubmit = computed(() => {
+  if (eventFull.value) return false
+  return pendingGroup.value ? signedPieceCount.value < pendingGroup.value.pieces.length : complete.value
+})
+const payLabel = computed(() => {
+  if (pendingGroup.value) {
+    const left = pendingGroup.value.pieces.length - signedPieceCount.value
+    return `Resume ${left} coupon${left === 1 ? '' : 's'}`
+  }
+  return event.value?.league ? 'Enter with RAD' : 'Pay with Phantom'
+})
+const lowBalance = computed(() => !event.value?.league && auth.balance !== null && auth.balance * 1e9 < totalLamports.value + 10000)
 const statusText = computed(() => {
+  if (eventFull.value) return `This event is full at ${limits.value.maxCoupons.toLocaleString()} coupons.`
+  if (pendingGroup.value) return 'The coupons already signed stay in the pool. Resume continues with the next one.'
   if (missingGames.value) return `${missingGames.value} game${missingGames.value === 1 ? '' : 's'} still need a pick`
-  if (tooMany.value) return `At most ${maxCombinations.value.toLocaleString()} combinations per payment. Remove some extra picks.`
+  if (belowMin.value) return `This event requires at least ${limits.value.minRows.toLocaleString()} rows on a coupon. Add picks or loosen the colors.`
+  if (reductionState.value?.ok === false) return reductionState.value.error
+  if (tooMany.value) return `${combinationTotal.value.toLocaleString()} rows. A coupon can hold at most ${maxCombinations.value.toLocaleString()} kept rows. Use the colors to reduce it, or remove some picks.`
+  if (reductionState.value?.ok && removedPercent.value === 0) return 'Min 0 and a max that covers every sign keeps every row. Lower the max or raise the min to remove rows.'
+  if (activeColor.value) return `${colorLabels[activeColor.value]} is on. Tap a sign to add or remove it from that color.`
   return 'Plus a small Solana network fee, paid from your wallet.'
 })
 
@@ -288,6 +420,26 @@ const tierRows = computed(() => {
     potLamports: Math.floor(sales * t.percent / 100) + (t.correct === e.gameCount ? e.rolloverInLamports : 0)
   }))
 })
+
+const started = computed(() => eventStarted(event.value))
+
+function shareAt (index) {
+  return event.value?.pickShare?.games?.[index] || null
+}
+
+async function fetchOdds () {
+  fetchingOdds.value = true
+  try {
+    const saved = await eventApi.refreshOdds(event.value.id)
+    event.value = saved.event
+    if (saved.missing?.length) notify(`Odds saved. No line for ${saved.missing.join(', ')}.`, 'warning')
+    else notify('Odds saved')
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    fetchingOdds.value = false
+  }
+}
 
 async function refreshScores () {
   refreshingScores.value = true
@@ -321,11 +473,19 @@ const officialResults = computed(() => {
   return games.map(game => game.result).join('')
 })
 
+const showStanding = computed(() => showStandingPayout(projection.value))
+
 const allRows = computed(() => {
-  const rows = projection.value?.rows || []
+  const source = projection.value?.maximum && !officialResults.value
+    ? (projection.value.tiers || []).map(tier => ({
+      correct: tier.correct,
+      rows: tier.winners || 1,
+      each: tier.perWinnerLamports || 0
+    }))
+    : (projection.value?.rows || [])
   const paying = new Set((event.value?.tiers || []).map(tier => tier.correct))
-  if (!paying.size) return rows
-  return rows.filter(row => paying.has(row.correct))
+  if (!paying.size) return source
+  return source.filter(row => paying.has(row.correct))
 })
 
 async function onLogin () {
@@ -350,17 +510,83 @@ async function loadProjection () {
 
 function resetPicks () {
   picks.value = event.value.games.map(() => [])
+  colorMarks.value = { purple: [], yellow: [], red: [], green: [] }
+  colorLimits.value = {
+    purple: { min: 0, max: 0 }, yellow: { min: 0, max: 0 }, red: { min: 0, max: 0 }, green: { min: 0, max: 0 }
+  }
+  activeColor.value = ''
 }
 
 function isSelected (game, outcome) {
   return picks.value[game]?.includes(outcome)
 }
 
+function signKey (game, outcome) {
+  return `${game}:${outcome}`
+}
+
+function signColors (game, outcome) {
+  const key = signKey(game, outcome)
+  return colorIds.filter(id => colorMarks.value[id].includes(key))
+}
+
+function signStyle (game, outcome) {
+  const marks = signColors(game, outcome)
+  if (!marks.length) return undefined
+  const ink = { purple: '#6A1B9A', yellow: '#F9A825', red: '#C62828', green: '#2E7D32' }
+  return { background: ink[marks[0]], color: marks[0] === 'yellow' ? '#1a1a1a' : '#fff', borderColor: 'transparent' }
+}
+
+function setLimit (id, field, input) {
+  const raw = Number.parseInt(input.target.value, 10)
+  const value = Number.isInteger(raw) && raw >= 0 ? raw : 0
+  const limits = colorLimits.value[id]
+  limits[field] = value
+  if (limits.min > limits.max) {
+    if (field === 'min') limits.max = limits.min
+    else limits.min = limits.max
+  }
+}
+
+function stripSign (game, outcome) {
+  const key = signKey(game, outcome)
+  for (const id of colorIds) {
+    colorMarks.value[id] = colorMarks.value[id].filter(mark => mark !== key)
+    const limits = colorLimits.value[id]
+    if (limits.max > colorMarks.value[id].length) limits.max = colorMarks.value[id].length
+    if (limits.min > limits.max) limits.min = limits.max
+  }
+}
+
 function togglePick (game, outcome) {
   const selected = picks.value[game]
-  picks.value[game] = selected.includes(outcome)
+  const removing = selected.includes(outcome)
+  picks.value[game] = removing
     ? selected.filter(value => value !== outcome)
     : [...selected, outcome]
+  if (removing) stripSign(game, outcome)
+}
+
+function toggleColorSign (game, outcome) {
+  const id = activeColor.value
+  if (!id) return
+  if (!isSelected(game, outcome)) togglePick(game, outcome)
+  const key = signKey(game, outcome)
+  const marks = colorMarks.value[id]
+  if (marks.includes(key)) {
+    colorMarks.value[id] = marks.filter(mark => mark !== key)
+  } else {
+    const tracking = colorLimits.value[id].max === marks.length
+    colorMarks.value[id] = [...marks, key]
+    if (tracking) colorLimits.value[id].max = colorMarks.value[id].length
+  }
+  const limits = colorLimits.value[id]
+  if (limits.min > limits.max) limits.min = limits.max
+}
+
+function onPick (game, outcome) {
+  if (activeColor.value) toggleColorSign(game, outcome)
+  else togglePick(game, outcome)
 }
 
 function selectAll (outcome) {
@@ -371,12 +597,52 @@ function clearPicks () {
   resetPicks()
 }
 
+async function loadRad () {
+  radBalance.value = null
+  if (!auth.wallet || !auth.config?.solanaRpcUrl) return
+  try {
+    const rad = await fetchRad(auth.config.solanaRpcUrl, auth.wallet)
+    radBalance.value = rad.balance.toString()
+  } catch {
+    radBalance.value = '0'
+  }
+}
+
+async function loadReduction () {
+  pendingGroup.value = null
+  if (!auth.wallet || !event.value?.chain || event.value.status !== 'open') return
+  try {
+    const { reductions } = await reductionApi.list(event.value.id)
+    pendingGroup.value = (reductions || []).find(group => group.pieces.some(piece => piece.status !== 'signed')) || null
+  } catch {
+    pendingGroup.value = null
+  }
+}
+
+async function discardReduction () {
+  const group = pendingGroup.value
+  if (!group || paying.value) return
+  paying.value = true
+  try {
+    await reductionApi.remove(group.id)
+    pendingGroup.value = null
+    notify('The unsigned coupons were dropped. Coupons already signed stay in the pool.')
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    paying.value = false
+  }
+}
+
 async function load () {
   loading.value = true
   try {
     await loadConfig()
     event.value = await eventApi.get(route.params.id)
+    await loadCapacity()
     if (event.value.status === 'open') resetPicks()
+    loadRad()
+    loadReduction()
   } catch (error) {
     notifyError(error)
     router.push('/')
@@ -385,11 +651,23 @@ async function load () {
   }
 }
 
+async function loadCapacity () {
+  chainCapacity.value = null
+  const address = event.value?.chain?.address
+  if (!address) return
+  try {
+    chainCapacity.value = await couponCapacity(auth.config?.solanaRpcUrl, address)
+  } catch {
+    chainCapacity.value = null
+  }
+}
+
 async function refreshEvent () {
   try {
     const fresh = await eventApi.get(route.params.id)
     const wasOpen = event.value?.status === 'open'
     event.value = fresh
+    await loadCapacity()
     if (!wasOpen && fresh.status === 'open') resetPicks()
   } catch (error) {
     notifyError(error)
@@ -398,28 +676,52 @@ async function refreshEvent () {
 
 async function pay () {
   paying.value = true
+  signProgress.value = { done: 0, total: 0 }
   try {
-    const entry = {
-      config: auth.config,
-      wallet: auth.wallet,
-      event: event.value,
-      system: systemRows(picks.value),
-      combinations: combinationTotal.value,
-      onStep: s => { step.value = s }
-    }
-    if (event.value.chain) {
-      const placed = await placeOnChain(entry)
+    const reduced = !pendingGroup.value && reductionState.value?.ok && usedColorIds.value.length
+      ? reductionState.value
+      : null
+    if (event.value.chain && pendingGroup.value) {
+      const group = await placeReduction({
+        config: auth.config,
+        wallet: auth.wallet,
+        event: event.value,
+        group: pendingGroup.value,
+        onStep: s => { step.value = s },
+        onProgress: (done, total) => { signProgress.value = { done, total } }
+      })
+      notify(`All ${group.pieces.length} coupon${group.pieces.length === 1 ? '' : 's'} are signed. Your picks are published automatically when entries close.`)
+      pendingGroup.value = null
+    } else if (event.value.chain) {
+      const placed = await placeOnChain({
+        config: auth.config,
+        wallet: auth.wallet,
+        event: event.value,
+        system: reduced ? reduced.system : systemRows(picks.value),
+        combinations: reduced ? reduced.rows : combinationTotal.value,
+        colors: reduced ? reduced.colors : [],
+        onStep: s => { step.value = s }
+      })
       notify(placed.armError
         ? `Coupon entered. The automatic reveal was not saved (${placed.armError}). Arm it from My Coupons.`
         : 'Coupon entered. Your picks are published automatically when entries close.')
     } else {
-      await payAndEnter(entry)
+      await payAndEnter({
+        config: auth.config,
+        wallet: auth.wallet,
+        event: event.value,
+        system: systemRows(picks.value),
+        combinations: combinationTotal.value,
+        onStep: s => { step.value = s }
+      })
       notify('Coupons placed. Good luck!')
     }
     refreshBalance()
     router.push('/coupons')
   } catch (error) {
-    if (step.value === 'sign' || /No SOL was sent|failed on chain/.test(error.message)) notifyError(error)
+    await loadReduction()
+    if (error.placed) notify(`${error.message} ${error.placed} coupon${error.placed === 1 ? '' : 's'} already in the pool. Resume signs the rest.`, 'warning')
+    else if (step.value === 'sign' || /No SOL was sent|failed on chain/.test(error.message)) notifyError(error)
     else notify(`${error.message} Your payment is saved; retry it from My Coupons.`, 'warning')
   } finally {
     paying.value = false
@@ -433,10 +735,19 @@ watch(() => route.params.id, id => {
 }, { immediate: true })
 
 watch(() => auth.wallet, wallet => {
-  if (wallet && event.value) loadProjection()
+  if (wallet && event.value) {
+    loadProjection()
+    loadRad()
+    loadReduction()
+  }
 })
 
-const projectionTimer = setInterval(loadProjection, 60000)
+const projectionTimer = setInterval(() => {
+  loadProjection()
+  if (event.value && started.value && !event.value.pickShare) {
+    eventApi.get(route.params.id).then(loaded => { event.value = loaded }).catch(() => {})
+  }
+}, 60000)
 onBeforeUnmount(() => clearInterval(projectionTimer))
 </script>
 
@@ -448,28 +759,25 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
   letter-spacing: -0.02em;
 }
 .game-row {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 1px;
+  --sign: 25px;
+  --sign-gap: 8px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(3, var(--sign));
+  column-gap: var(--sign-gap);
+  align-items: center;
+  row-gap: 1px;
   padding: 8px 0;
   border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 .game-top {
-  display: flex;
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
   align-items: center;
-  gap: 8px;
-  width: 100%;
   min-width: 0;
 }
 .fill-row { border-bottom: 0; padding-bottom: 0; }
 .fill-spacer { display: flex; justify-content: flex-end; min-width: 0; }
-.coupon-entry .game-top {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(3, 25px);
-  column-gap: 8px;
-  align-items: center;
-}
 .game-no { margin-right: 3px; }
 .game-name-line {
   display: flex;
@@ -513,7 +821,42 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
 .pick-btn:active {
   transform: scale(0.98);
 }
-.marks { display: inline-flex; gap: 8px; flex: none; }
+.reduce-panel {
+  padding: 12px;
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  border-radius: 8px;
+}
+.color-choice.purple { color: #6A1B9A; }
+.color-choice.yellow { color: #F9A825; }
+.color-choice.red { color: #C62828; }
+.color-choice.green { color: #2E7D32; }
+.color-limit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 13px;
+}
+.color-limit input {
+  width: 64px;
+  margin-left: 4px;
+}
+.swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+}
+.swatch.purple { background: #6A1B9A; }
+.swatch.yellow { background: #F9A825; }
+.swatch.red { background: #C62828; }
+.swatch.green { background: #2E7D32; }
+.marks {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 2 / -1;
+}
+.marks.solo { grid-template-columns: var(--sign); justify-self: end; }
+.draw-note { grid-column: 1 / -1; }
 .mark {
   display: inline-flex;
   align-items: center;

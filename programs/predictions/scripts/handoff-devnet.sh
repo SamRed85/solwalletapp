@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
-# The program is already deployed. Move its upgrade authority to the council PDA.
-# The council account itself is created by finish-devnet.mjs --council. This script
-# does not write program bytes and does not request an airdrop.
-set -euo pipefail
-export PATH="/root/.local/share/solana/install/active_release/bin:${PATH}"
-url="https://api.devnet.solana.com"
-program="$(solana-keygen pubkey /app/keys/program-keypair.json)"
-echo "program ${program}"
-
-solana program set-upgrade-authority "${program}" \
-  --new-upgrade-authority D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt \
-  --skip-new-upgrade-authority-signer-check \
-  --keypair /app/keys/deployer-keypair.json \
-  --url "${url}" \
-  --commitment confirmed
-
-solana program show "${program}" --url "${url}"
+# Disabled on purpose. Do not move the upgrade authority to the council PDA.
+#
+# The council PDA can only sign through the predictions program, and a program cannot
+# upgrade itself: the loader needs the program account writable and the runtime keeps the
+# running program read-only (PrivilegeEscalation). Handing the authority to the council
+# would freeze the program for good. The authority stays with the deployer key until it is
+# moved to a real multisig (see "Upgrade authority" in .cursor/plans/master_plan.md).
+echo "handoff-devnet.sh is disabled: the council cannot upgrade this program, so a handoff would lock it forever." >&2
+exit 1

@@ -67,19 +67,23 @@ export function slipMark () {
   return hashv([new TextEncoder().encode('slip-marked')])
 }
 
-export function slipRevealLeaf (index, owner, combinations, commitment, picks) {
+/** A slip with no colors keeps the leaf it had before colors. `colors` is the program's byte layout or its hex. */
+export function slipRevealLeaf (index, owner, combinations, commitment, picks, colors = '') {
   const ownerBytes = typeof owner === 'string' ? decodeBase58(owner) : owner
   const commitmentBytes = typeof commitment === 'string' ? hexToBytes(commitment) : commitment
+  const colorBytes = typeof colors === 'string' ? hexToBytes(colors) : colors
   const padded = new Uint8Array(13)
   padded.set(picks instanceof Uint8Array ? picks.subarray(0, 13) : Uint8Array.from(picks).subarray(0, 13))
-  return hashv([
+  const parts = [
     new TextEncoder().encode('slip-reveal'),
     u32le(index),
     ownerBytes,
     u32le(combinations),
     commitmentBytes,
     padded
-  ])
+  ]
+  if (colorBytes.length) parts.push(new TextEncoder().encode('colors-v1'), colorBytes)
+  return hashv(parts)
 }
 
 function nodeAt (level, index, depth) {

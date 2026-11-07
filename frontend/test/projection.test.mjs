@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { combinedScore, kickoffLabel, matchClock, projectCoupon, standingResults } from '../src/services/projection.js'
+import { combinedScore, kickoffLabel, matchClock, projectCoupon, showStandingPayout, standingResults } from '../src/services/projection.js'
 
 const projection = {
   complete: true,
@@ -89,6 +89,16 @@ test('rows from every coupon on an event are added together', () => {
   const same = combinedScore([['1', 'X']], '1X', tiers, false)
   assert.equal(same.lines[0].each, alone.lines[0].each)
   assert.equal(same.lines[0].rows, alone.lines[0].rows)
+})
+
+test('the standing payout shows while matches are still being played', () => {
+  const live = { revealClosed: false, games: [{ projected: '1', final: false }, { projected: 'X', final: true }] }
+  const finished = { revealClosed: false, games: [{ projected: '1', final: true }, { projected: 'X', final: true }] }
+  const beforeKickoff = { revealClosed: false, games: [{ projected: 'X', final: false }, { projected: 'X', final: false }] }
+  assert.equal(showStandingPayout(live), true)
+  assert.equal(showStandingPayout(finished), true)
+  assert.equal(showStandingPayout(beforeKickoff), true)
+  assert.equal(showStandingPayout(null), false)
 })
 
 test('a match without a score has no payout', () => {

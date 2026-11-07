@@ -60,6 +60,7 @@ export const eventApi = {
   payouts: id => data(api.get(`/api/events/${id}/payouts`)),
   projection: id => data(api.get(`/api/events/${id}/projection`)),
   refreshScores: id => data(api.post(`/api/events/${id}/projection/refresh`, null, { timeout: 45000 })),
+  refreshOdds: id => data(api.post(`/api/events/${id}/odds/refresh`, null, { timeout: 90000 })),
   searchFixtures: (team, date, away, timezone) => data(api.get('/api/football/fixtures', { params: { team, date, away, timezone } })),
   fixturesOnDate: (date, timezone) => data(api.get('/api/football/fixtures/day', { params: { date, timezone } }))
 }
@@ -76,6 +77,13 @@ export const entryApi = {
 
 export const lotteryApi = {
   get: () => data(api.get('/api/lottery'))
+}
+
+export const reductionApi = {
+  list: eventId => data(api.get('/api/reductions', { params: { eventId } })),
+  create: (eventId, pieces) => data(api.post('/api/reductions', { eventId, pieces })),
+  mark: (id, piece, signature, slipIndex) => data(api.patch(`/api/reductions/${id}`, { piece, signature, slipIndex })),
+  remove: id => api.delete(`/api/reductions/${id}`)
 }
 
 export const slipApi = {

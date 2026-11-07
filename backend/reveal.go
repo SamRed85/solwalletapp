@@ -314,9 +314,13 @@ func (a *App) publishOne(ctx context.Context, item scheduledReveal) {
 			plain[i] = 0
 		}
 	}()
-	picks, revealNonce, err := lockedPicks(plain)
+	picks, revealNonce, colors, err := lockedPicks(plain)
 	if err != nil {
 		a.finishReveal(ctx, item.Coupon, "rejected", err.Error(), true)
+		return
+	}
+	if len(colors) > 0 {
+		a.finishReveal(ctx, item.Coupon, "rejected", "a coupon account cannot carry colors", true)
 		return
 	}
 	owner := coupon.Data[40:72]
@@ -414,26 +418,44 @@ func decryptLocked(armor string) ([]byte, error) {
 	return plain.Bytes(), nil
 }
 
-func lockedPicks(plain []byte) ([]byte, uint64, error) {
+// lockedPicks reads the time-locked reveal. Colors are optional and come back in the
+// program's byte layout, ten bytes each, so the commitment can be checked as committed.
+func lockedPicks(plain []byte) ([]byte, uint64, []byte, error) {
 	var payload struct {
 		RevealNonce string `json:"revealNonce"`
 		Picks       []int  `json:"picks"`
+		Colors      []struct {
+			Signs string `json:"signs"`
+			Min   int    `json:"min"`
+			Max   int    `json:"max"`
+		} `json:"colors"`
 	}
 	if err := json.Unmarshal(plain, &payload); err != nil || len(payload.Picks) != 13 {
-		return nil, 0, errors.New("the time lock does not contain picks")
+		return nil, 0, nil, errors.New("the time lock does not contain picks")
 	}
 	picks := make([]byte, 13)
 	for i, pick := range payload.Picks {
 		if pick < 0 || pick > 255 {
-			return nil, 0, errors.New("the time lock does not contain picks")
+			return nil, 0, nil, errors.New("the time lock does not contain picks")
 		}
 		picks[i] = byte(pick)
 	}
 	nonce, err := strconv.ParseUint(payload.RevealNonce, 10, 64)
 	if err != nil {
-		return nil, 0, errors.New("the time lock does not contain picks")
+		return nil, 0, nil, errors.New("the time lock does not contain picks")
 	}
-	return picks, nonce, nil
+	if len(payload.Colors) > maxSlipColors {
+		return nil, 0, nil, errors.New("the time lock has too many colors")
+	}
+	colors := make([]slipColor, 0, len(payload.Colors))
+	for _, color := range payload.Colors {
+		signs, err := strconv.ParseUint(color.Signs, 10, 64)
+		if err != nil || color.Min < 0 || color.Max < color.Min || color.Max > 13 {
+			return nil, 0, nil, errors.New("the time lock has an invalid color")
+		}
+		colors = append(colors, slipColor{Signs: signs, Min: uint8(color.Min), Max: uint8(color.Max)})
+	}
+	return picks, nonce, colorsBytes(colors), nil
 }
 
 func couponCommitment(owner, picks []byte, nonce uint64) []byte {

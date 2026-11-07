@@ -562,6 +562,34 @@ func TestVaultMustMatchTheEvent(t *testing.T) {
 	}
 }
 
+func TestCouponLimitDefaults(t *testing.T) {
+	minRows, maxCoupons, msg := normalizeCouponLimits(0, 0)
+	if msg != "" || minRows != 1 || maxCoupons != 250_000 {
+		t.Fatalf("defaults: %d rows, %d coupons, %s", minRows, maxCoupons, msg)
+	}
+	if _, _, msg = normalizeCouponLimits(1, 1_000_001); msg == "" {
+		t.Fatal("a cap above 1,000,000 was accepted")
+	}
+	if _, _, msg = normalizeCouponLimits(44_001, 10); msg == "" {
+		t.Fatal("a minimum above 44,000 rows was accepted")
+	}
+	legacy := &Event{}
+	minRows, maxCoupons = legacy.entryLimits()
+	if minRows != 1 || maxCoupons != 1<<20 {
+		t.Fatalf("legacy event: %d rows, %d coupons", minRows, maxCoupons)
+	}
+	if !sameCouponLimits(legacy, &chainEvent{}) {
+		t.Fatal("an event from before the limits was rejected")
+	}
+	if !sameCouponLimits(legacy, &chainEvent{MinRows: 1, MaxCoupons: 250_000}) {
+		t.Fatal("publishing an older event with the defaults was rejected")
+	}
+	set := &Event{MinRows: 1000, MaxCoupons: 100}
+	if sameCouponLimits(set, &chainEvent{MinRows: 1, MaxCoupons: 250_000}) {
+		t.Fatal("different coupon limits were treated as the same event")
+	}
+}
+
 func TestDecodeChainOutcome(t *testing.T) {
 	admin := "955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun"
 	e := &Event{GameCount: 7, CouponPriceLamports: 1, Tiers: []Tier{{Correct: 7, Percent: 95}}, StartTime: time.Now(), EndTime: time.Now()}

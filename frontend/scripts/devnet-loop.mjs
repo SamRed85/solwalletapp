@@ -147,7 +147,7 @@ const eventData = await account(event)
 const settled = decodeEvent(eventData)
 const house = settled.house
 const perWinner = settled.perWinner[6]
-if (settled.status !== 'resolved' || perWinner !== 190_000_000n || house !== 10_000_000n) {
+if (settled.status !== 'resolved' || perWinner !== 180_000_000n || house !== 10_000_000n) {
   throw new Error(`unexpected settlement perWinner=${perWinner} house=${house}`)
 }
 

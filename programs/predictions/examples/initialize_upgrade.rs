@@ -15,8 +15,6 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-const COUNCIL: &str = "D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt";
-
 fn main() {
     let mut url = "http://127.0.0.1:8899".to_string();
     let mut airdrop = false;
@@ -32,10 +30,11 @@ fn main() {
     let deployer = load_keypair("keys/deployer-keypair.json");
     let council_signer = load_keypair("keys/council-signer.json");
     let council = Pubkey::find_program_address(&[b"upgrade-council"], &predictions::ID).0;
-    assert_eq!(council.to_string(), COUNCIL, "council address drifted from the deploy script");
+    // The address follows the program id, so it is derived and never copied from an older build.
+    let address = council.to_string();
 
     if rpc.account(&council).is_some() {
-        println!("upgrade council already exists at {COUNCIL}");
+        println!("upgrade council already exists at {address}");
         return;
     }
     if airdrop {
@@ -50,7 +49,7 @@ fn main() {
     rpc.send(&deployer, &[initialize_ix(deployer.pubkey(), council_signer.pubkey())]).unwrap();
     assert!(rpc.account(&council).is_some(), "council account was not created");
     assert!(rpc.send(&deployer, &[initialize_ix(deployer.pubkey(), council_signer.pubkey())]).is_err(), "the council can only be created once");
-    println!("upgrade council {COUNCIL}");
+    println!("upgrade council {address}");
     println!("signers {} {}", deployer.pubkey(), council_signer.pubkey());
 }
 

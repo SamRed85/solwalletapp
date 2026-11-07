@@ -29,11 +29,11 @@ func TestKeeperRevealIsSignedOnlyByTheKeeper(t *testing.T) {
 	event := bytes.Repeat([]byte{3}, 32)
 	program := bytes.Repeat([]byte{4}, 32)
 	hash := bytes.Repeat([]byte{5}, 32)
-	picks, nonce, err := lockedPicks([]byte(`{"revealNonce":"99","picks":[1,0,0,0,0,0,0,0,0,0,0,0,0]}`))
+	picks, nonce, _, err := lockedPicks([]byte(`{"revealNonce":"99","picks":[1,0,0,0,0,0,0,0,0,0,0,0,0]}`))
 	if err != nil || nonce != 99 || picks[0] != 1 {
 		t.Fatalf("picks %v nonce %d: %v", picks, nonce, err)
 	}
-	if _, _, err := lockedPicks([]byte(`not-json`)); err == nil {
+	if _, _, _, err := lockedPicks([]byte(`not-json`)); err == nil {
 		t.Fatal("a signed transaction was accepted as picks")
 	}
 	raw, err := buildRevealTx(keeper, program, owner, coupon, event, hash, picks, nonce)

@@ -37,8 +37,12 @@ func slipLeaf(index uint32, owner []byte, combinations uint32, commitment []byte
 	return slipHash([]byte("slip-leaf"), putU32(index), owner, putU32(combinations), commitment)
 }
 
-func slipRevealLeaf(index uint32, owner []byte, combinations uint32, commitment, picks []byte) []byte {
-	return slipHash([]byte("slip-reveal"), putU32(index), owner, putU32(combinations), commitment, picks)
+// slipRevealLeaf matches the program. A slip with no colors keeps the leaf it had before colors.
+func slipRevealLeaf(index uint32, owner []byte, combinations uint32, commitment, picks, colors []byte) []byte {
+	if len(colors) == 0 {
+		return slipHash([]byte("slip-reveal"), putU32(index), owner, putU32(combinations), commitment, picks)
+	}
+	return slipHash([]byte("slip-reveal"), putU32(index), owner, putU32(combinations), commitment, picks, []byte("colors-v1"), colors)
 }
 
 func putU32(value uint32) []byte {
@@ -190,7 +194,7 @@ func (a *App) publishSlip(ctx context.Context, item scheduledReveal) {
 			plain[i] = 0
 		}
 	}()
-	picks, revealNonce, err := lockedPicks(plain)
+	picks, revealNonce, colors, err := lockedPicks(plain)
 	if err != nil {
 		a.finishReveal(ctx, item.Coupon, "rejected", err.Error(), true)
 		return
@@ -201,23 +205,11 @@ func (a *App) publishSlip(ctx context.Context, item scheduledReveal) {
 		a.finishReveal(ctx, item.Coupon, "rejected", "the stored slip is invalid", true)
 		return
 	}
-	if hex.EncodeToString(couponCommitment(owner, picks, revealNonce)) != item.Commitment {
+	if hex.EncodeToString(slipCommitment(owner, picks, revealNonce, colors)) != item.Commitment {
 		a.finishReveal(ctx, item.Coupon, "rejected", "the stored picks do not match this coupon", true)
 		return
 	}
-	nodes := make([][]byte, 0)
-	for _, reveal := range view.Reveals {
-		for int(reveal.Index) >= len(nodes) {
-			nodes = append(nodes, nil)
-		}
-		picksBytes, err := hex.DecodeString(reveal.Picks)
-		commitBytes, err2 := hex.DecodeString(reveal.Commitment)
-		ownerBytes, err3 := base58Decode(reveal.Owner)
-		if err != nil || err2 != nil || err3 != nil {
-			continue
-		}
-		nodes[reveal.Index] = slipRevealLeaf(reveal.Index, ownerBytes, reveal.Combinations, commitBytes, picksBytes)
-	}
+	nodes := revealNodes(view.Reveals)
 	for int(item.Index) >= len(nodes) {
 		nodes = append(nodes, nil)
 	}
@@ -239,6 +231,7 @@ func (a *App) publishSlip(ctx context.Context, item scheduledReveal) {
 	data = append(data, picks...)
 	data = append(data, putU64(revealNonce)...)
 	data = append(data, commitment...)
+	data = append(data, colorsArg(colors)...)
 	data = append(data, putU32(uint32(len(proof)))...)
 	for _, sibling := range proof {
 		data = append(data, sibling...)

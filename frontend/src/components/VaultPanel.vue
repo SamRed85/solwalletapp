@@ -136,7 +136,7 @@
       <v-btn v-if="chain.status === 'tallying'" color="primary" variant="flat" :loading="busy === 'tally'" @click="tally">Count coupons and settle</v-btn>
       <v-btn v-if="canExpire" color="warning" variant="flat" :loading="busy === 'expire'" @click="expire">Refund the whole event (timeout)</v-btn>
       <v-btn v-if="canPassRollover" color="primary" variant="tonal" :loading="busy === 'rollover'" @click="passRollover">
-        {{ destination ? 'Pass rollover to the next event' : 'Park rollover for the next event' }}
+        {{ chain.league ? 'Park the jackpot for the next league event' : (destination ? 'Pass rollover to the next event' : 'Park rollover for the next event') }}
       </v-btn>
       <template v-if="isAdmin">
         <v-btn v-if="canWithdrawHouse" color="success" variant="tonal" :loading="busy === 'house'" @click="withdrawHouse">Withdraw house share {{ sol(chain.house) }}</v-btn>
@@ -272,7 +272,8 @@ async function load () {
     signers.value = signerList
     paused.value = gate
     const future = schedule.entries.filter(entry => entry.deadline > now.value && entry.event !== address.value)
-    destination.value = future.sort((a, b) => a.deadline - b.deadline)[0]?.event ?? null
+    // A league jackpot only returns to the league vault. It is never forwarded into a SOL event.
+    destination.value = state.league ? null : (future.sort((a, b) => a.deadline - b.deadline)[0]?.event ?? null)
     if (draft.value.length !== state.gameCount) {
       draft.value = state.proposalKind === 'resolve' ? [...state.proposalResults] : Array(state.gameCount).fill(null)
     }

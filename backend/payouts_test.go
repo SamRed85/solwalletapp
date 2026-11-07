@@ -15,7 +15,7 @@ import (
 
 func TestDefaultTiers(t *testing.T) {
 	tiers := defaultTiers(13)
-	want := []Tier{{13, 50}, {12, 25}, {11, 15}, {10, 5}}
+	want := []Tier{{13, 45}, {12, 25}, {11, 15}, {10, 5}}
 	if len(tiers) != len(want) {
 		t.Fatalf("got %v", tiers)
 	}
@@ -32,7 +32,7 @@ func TestDefaultTiers(t *testing.T) {
 func TestValidateTiers(t *testing.T) {
 	bad := map[string][]Tier{
 		"empty":          nil,
-		"wrong total":    {{7, 50}, {6, 40}},
+		"wrong total":    {{7, 50}, {6, 30}},
 		"no top tier":    {{6, 60}, {5, 35}},
 		"duplicate":      {{7, 50}, {7, 45}},
 		"too many picks": {{8, 95}},
@@ -45,14 +45,17 @@ func TestValidateTiers(t *testing.T) {
 			t.Errorf("%s: invalid tiers accepted: %v", name, tiers)
 		}
 	}
-	if msg := validateTiers([]Tier{{7, 60}, {6, 35}}, 7); msg != "" {
+	if msg := validateTiers([]Tier{{7, 60}, {6, 30}}, 7); msg != "" {
 		t.Fatalf("valid special event tiers rejected: %s", msg)
+	}
+	if msg := validateLeagueTiers([]Tier{{7, 100}}, 7); msg != "" {
+		t.Fatalf("a 100%% league tier was rejected: %s", msg)
 	}
 }
 
 func checkConservation(t *testing.T, s Settlement) {
 	t.Helper()
-	if s.HouseLamports+s.PaidLamports+s.RolloverOutLamports != s.SalesLamports+s.RolloverInLamports {
+	if s.HouseLamports+s.LeagueLamports+s.PaidLamports+s.RolloverOutLamports != s.SalesLamports+s.RolloverInLamports {
 		t.Fatalf("money not conserved: %+v", s)
 	}
 }
@@ -77,8 +80,8 @@ func TestSettle(t *testing.T) {
 	for _, tp := range s.Tiers {
 		pots[tp.Correct] = tp
 	}
-	if pots[13].PotLamports != (2_500_000+2_000_000)*scale || pots[13].PerWinnerLamports != 4_500_000*scale {
-		t.Fatalf("top tier should get 50%% of sales plus the rollover: %+v", pots[13])
+	if pots[13].PotLamports != (2_250_000+2_000_000)*scale || pots[13].PerWinnerLamports != 4_250_000*scale {
+		t.Fatalf("top tier should get 45%% of sales plus the rollover: %+v", pots[13])
 	}
 	if pots[12].PerWinnerLamports != 1_250_000*scale {
 		t.Fatalf("12 correct: %+v", pots[12])
@@ -114,8 +117,8 @@ func TestSettleSmallRowRollsTheWholeTier(t *testing.T) {
 func TestSettleNoTopWinnerRollsOverJackpot(t *testing.T) {
 	s := settle([]string{"2222222222222"}, "1111111111111", 1_000_000, 7_000_000, defaultTiers(13))
 	checkConservation(t, s)
-	if s.PaidLamports != 0 || s.RolloverOutLamports != 950_000+7_000_000 {
-		t.Fatalf("everything except the house cut should roll over: %+v", s)
+	if s.PaidLamports != 0 || s.RolloverOutLamports != 900_000+7_000_000 || s.LeagueLamports != 50_000 {
+		t.Fatalf("everything except the house and league cuts should roll over: %+v", s)
 	}
 }
 

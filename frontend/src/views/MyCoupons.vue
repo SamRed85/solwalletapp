@@ -61,9 +61,9 @@
         {{ hasOutcome(row) ? 'Open this coupon to see if it won.' : 'Open this coupon to see how it is going.' }}
       </v-card-text>
       <v-card-text v-else>
-        <CouponCompare v-if="row.system?.length" :picks="row.system" :results="shownResults(row.results, row.eventId)" :live="liveScores(row.results, row.eventId)" :games="row.games" />
+        <CouponCompare v-if="row.system?.length" :picks="row.system" :colors="row.colors || []" :results="shownResults(row.results, row.eventId)" :live="liveScores(row.results, row.eventId)" :games="row.games" />
         <CouponScore v-if="row.score" :best="row.score.best" :games="row.score.games" :lines="row.score.lines" />
-        <ProjectedPayout v-if="row.system?.length && !row.results" :system="row.system" :projection="projections[row.eventId]" />
+        <ProjectedPayout v-if="row.system?.length && !row.results" :system="row.system" :colors="row.colors || []" :projection="projections[row.eventId]" />
         <div v-if="row.label === 'Claimed' && row.payout" class="text-body-2 mb-2">Won {{ formatSol(row.payout) }} from the vault.</div>
         <div v-else-if="row.detail" class="text-body-2 mb-2">{{ row.detail }}</div>
         <div class="d-flex flex-wrap ga-2">
@@ -115,7 +115,7 @@
             {{ entrySettled(entry) ? 'Open this coupon to see if it won.' : 'Open this coupon to see how it is going.' }}
           </div>
           <template v-else>
-            <CouponCompare :picks="entry.system" :results="shownResults(resultString(entry.event?.games), entry.eventId)" :live="liveScores(resultString(entry.event?.games), entry.eventId)" :games="entry.event?.games ?? []" />
+            <CouponCompare :picks="entry.system" :colors="entry.colors || []" :results="shownResults(resultString(entry.event?.games), entry.eventId)" :live="liveScores(resultString(entry.event?.games), entry.eventId)" :games="entry.event?.games ?? []" />
             <CouponScore
               v-if="entry.scores?.length" class="mt-3"
               :best="entry.scores[0].correct" :games="entry.system.length"
@@ -236,7 +236,7 @@ function describeSlip (saved, state, now) {
   if (state.status === 'cancelled') return { label: 'Cancelled', color: 'warning', action: 'refund', detail: 'The event was cancelled. Refund the entry price to your wallet.' }
   if (state.status === 'resolved') {
     if (!saved.revealed) return { label: 'Not revealed', color: 'error', detail: 'The picks were not revealed in time, so the stake stayed in the prize pool.' }
-    const score = couponScore({ revealed: true, picks: picksFromSystem(saved.system), gameCount: state.gameCount }, state)
+    const score = couponScore({ revealed: true, picks: picksFromSystem(saved.system), colors: saved.colors, gameCount: state.gameCount }, state)
     const payout = scorePayout(score)
     return {
       label: payout ? 'Won' : 'No win', color: payout ? 'success' : 'default',
@@ -340,7 +340,7 @@ async function loadChain () {
       admin: event?.chain?.admin ?? state?.admin ?? local?.admin, nonce: event?.chain?.nonce ?? local?.nonce ?? state?.nonce,
       deadline: state?.deadline, revealDeadline: state?.revealDeadline,
       canSchedule: state?.status === 'open' && now < state.deadline && !coupon.revealed && !!local?.revealNonce && !!system,
-      system, revealNonce: local?.revealNonce, placedAt: local?.placedAt || 0,
+      system, colors: local?.colors || [], revealNonce: local?.revealNonce, placedAt: local?.placedAt || 0,
       results: state?.status === 'resolved' && coupon.revealed ? state.results : '',
       games: event?.games ?? [],
       ...describe(coupon, local, state, now)
@@ -352,7 +352,7 @@ async function loadChain () {
     const state = states.get(address)
     const settled = state?.status === 'resolved' && local.system?.length
     const described = describe(null, local, state, now)
-    const score = settled ? couponScore({ revealed: true, picks: picksFromSystem(local.system), gameCount: state.gameCount }, state) : null
+    const score = settled ? couponScore({ revealed: true, picks: picksFromSystem(local.system), colors: local.colors, gameCount: state.gameCount }, state) : null
     const payout = scorePayout(score)
     rows.push({
       id: couponId(local), ...local,

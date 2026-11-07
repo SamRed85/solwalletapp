@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
-use predictions::{CreateEventArgs, Event, EventStatus, TierArg};
+use predictions::{ColorArg, CreateEventArgs, Event, EventStatus, RevealArg, SlipArg, TierArg};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -62,7 +62,7 @@ fn main() {
 
     let settled = rpc.event(&event);
     assert_eq!(settled.status, EventStatus::Resolved);
-    assert_eq!(settled.per_winner[6], 190_000_000);
+    assert_eq!(settled.per_winner[6], 180_000_000);
     assert_eq!(settled.house, 10_000_000);
 
     let claim = claim_ix(coupon, event, vault, player.pubkey());
@@ -78,12 +78,123 @@ fn main() {
 
     println!("place, win, and claim succeeded on the local validator");
     println!("player gained {} lamports and the vault kept the house share", after - before);
+    colored_at_the_cap(&rpc, &admin, &other, &player, nonce + 1);
     println!("program {PROGRAM}");
 }
 
+/// The most expensive colored slip the program accepts: 13 games, every outcome, and
+/// three colors at 4 x 4 x 4 = 64 states. Reveal and score must fit one transaction.
+fn colored_at_the_cap(rpc: &Rpc, admin: &Keypair, other: &Keypair, player: &Keypair, nonce: u64) {
+    let now = rpc.unix_time();
+    let deadline = now + 12;
+    let reveal_deadline = deadline + 20;
+    let event = pda(&[b"event", admin.pubkey().as_ref(), &nonce.to_le_bytes()]);
+    let args = CreateEventArgs {
+        nonce,
+        game_count: 13,
+        price: 1_000,
+        deadline,
+        reveal_deadline,
+        end_time: reveal_deadline,
+        resolve_timeout: reveal_deadline + 10_000,
+        threshold: 2,
+        signers: vec![admin.pubkey(), other.pubkey()],
+        tiers: vec![TierArg { correct: 13, percent: 90 }],
+        kind: predictions::KIND_SOL,
+        min_rows: 1,
+        max_coupons: 250_000,
+    };
+    rpc.send(admin, &[create_args_ix(admin, args)], true).unwrap();
+
+    let ones: u64 = (0..13).map(|game| 1u64 << (3 * game)).sum();
+    let away_first_four: u64 = (0..4).map(|game| 4u64 << (3 * game)).sum();
+    let colors = vec![
+        ColorArg { signs: ones, min: 3, max: 3 },
+        ColorArg { signs: ones << 1, min: 3, max: 3 },
+        ColorArg { signs: away_first_four, min: 0, max: 3 },
+    ];
+    let picks = [0b111u8; 13];
+    let commitment = predictions::slip_commitment(&player.pubkey(), &picks, REVEAL_NONCE, &colors);
+    let reveal = RevealArg { index: 0, owner: player.pubkey(), combinations: 32_640, picks, nonce: REVEAL_NONCE, commitment, colors };
+    let slips = pda(&[b"slips", event.as_ref()]);
+    let place = Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::PlaceSlip {
+            player: player.pubkey(),
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            slips,
+            gate: pda(&[b"gate", admin.pubkey().as_ref()]),
+            rad: pda(&[b"rad", player.pubkey().as_ref()]),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::PlaceSlip { slip: SlipArg { commitment, combinations: 32_640 }, proof: vec![] }.data(),
+    };
+    rpc.send(player, &[place], true).unwrap();
+    rpc.wait_until(deadline);
+    let reveal_ix = Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::RevealSlip { caller: player.pubkey(), event, slips }.to_account_metas(None),
+        data: predictions::instruction::RevealSlip { reveal: reveal.clone(), proof: vec![] }.data(),
+    };
+    let reveal_units = rpc.units(&rpc.send(player, &[budget(), reveal_ix], true).unwrap());
+    rpc.wait_until(reveal_deadline);
+
+    let results = b"1X21X21X21X21".to_vec();
+    rpc.send(admin, &[approve_results_ix(admin, &admin.pubkey(), event, results.clone())], true).unwrap();
+    rpc.send_all(&[player, other], &[approve_results_ix(other, &admin.pubkey(), event, results)], true).unwrap();
+    let score = Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::ScoreSlip {
+            caller: player.pubkey(),
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            slips,
+            schedule: pda(&[b"schedule", admin.pubkey().as_ref()]),
+            kinds: pda(&[b"schedule-kinds", admin.pubkey().as_ref()]),
+            league: pda(&[b"league"]),
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::ScoreSlip { reveal, revealed: true, entry_proof: vec![], reveal_proof: vec![], scored_proof: vec![] }.data(),
+    };
+    let score_units = rpc.units(&rpc.send(player, &[budget(), score], true).unwrap());
+    let settled = rpc.event(&event);
+    assert_eq!(settled.status, EventStatus::Resolved);
+    let scored: u64 = settled.winners.iter().sum();
+    assert_eq!(scored, 32_640, "every kept row is scored once");
+    println!("colored slip at 64 states: reveal used {reveal_units} compute units, score used {score_units}");
+    assert!(score_units < 1_000_000, "scoring at the cap must leave room for full-depth proofs");
+}
+
+fn budget() -> Instruction {
+    solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)
+}
+
 fn create_ix(admin: &Keypair, other: &Keypair, nonce: u64, deadline: i64, reveal_deadline: i64) -> Instruction {
+    create_args_ix(
+        admin,
+        CreateEventArgs {
+            nonce,
+            game_count: 7,
+            price: 200_000_000,
+            deadline,
+            reveal_deadline,
+            end_time: reveal_deadline,
+            resolve_timeout: reveal_deadline + 10_000,
+            threshold: 2,
+            signers: vec![admin.pubkey(), other.pubkey()],
+            tiers: vec![TierArg { correct: 7, percent: 90 }],
+            kind: predictions::KIND_SOL,
+            min_rows: 1,
+            max_coupons: 250_000,
+        },
+    )
+}
+
+fn create_args_ix(admin: &Keypair, args: CreateEventArgs) -> Instruction {
     let admin_key = admin.pubkey();
-    let event = pda(&[b"event", admin_key.as_ref(), &nonce.to_le_bytes()]);
+    let event = pda(&[b"event", admin_key.as_ref(), &args.nonce.to_le_bytes()]);
     Instruction {
         program_id: predictions::ID,
         accounts: predictions::accounts::CreateEvent {
@@ -94,24 +205,12 @@ fn create_ix(admin: &Keypair, other: &Keypair, nonce: u64, deadline: i64, reveal
             schedule: pda(&[b"schedule", admin_key.as_ref()]),
             signers: pda(&[b"signers", event.as_ref()]),
             gate: pda(&[b"gate", admin_key.as_ref()]),
+            kinds: pda(&[b"schedule-kinds", admin_key.as_ref()]),
+            league: pda(&[b"league"]),
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),
-        data: predictions::instruction::CreateEvent {
-            args: CreateEventArgs {
-                nonce,
-                game_count: 7,
-                price: 200_000_000,
-                deadline,
-                reveal_deadline,
-                end_time: reveal_deadline,
-                resolve_timeout: reveal_deadline + 10_000,
-                threshold: 2,
-                signers: vec![admin_key, other.pubkey()],
-                tiers: vec![TierArg { correct: 7, percent: 95 }],
-            },
-        }
-        .data(),
+        data: predictions::instruction::CreateEvent { args }.data(),
     }
 }
 
@@ -131,6 +230,7 @@ fn place_ix(player: &Keypair, admin: &Keypair, nonce: u64, index: u32) -> Instru
             vault: pda(&[b"vault", event.as_ref()]),
             coupon: pda(&[b"coupon", event.as_ref(), &index.to_le_bytes()]),
             gate: pda(&[b"gate", admin.pubkey().as_ref()]),
+            rad: pda(&[b"rad", player.pubkey().as_ref()]),
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),
@@ -158,6 +258,10 @@ fn reveal_ix(player: &Keypair, admin: &Keypair, nonce: u64, index: u32) -> Instr
 }
 
 fn approve_ix(signer: &Keypair, admin: &Pubkey, event: Pubkey) -> Instruction {
+    approve_results_ix(signer, admin, event, vec![b'1'; 7])
+}
+
+fn approve_results_ix(signer: &Keypair, admin: &Pubkey, event: Pubkey, results: Vec<u8>) -> Instruction {
     Instruction {
         program_id: predictions::ID,
         accounts: predictions::accounts::Approve {
@@ -165,9 +269,12 @@ fn approve_ix(signer: &Keypair, admin: &Pubkey, event: Pubkey) -> Instruction {
             event,
             signers: pda(&[b"signers", event.as_ref()]),
             schedule: pda(&[b"schedule", admin.as_ref()]),
+            kinds: pda(&[b"schedule-kinds", admin.as_ref()]),
+            vault: pda(&[b"vault", event.as_ref()]),
+            league: pda(&[b"league"]),
         }
         .to_account_metas(None),
-        data: predictions::instruction::ApproveResolution { results: vec![b'1'; 7] }.data(),
+        data: predictions::instruction::ApproveResolution { results }.data(),
     }
 }
 
@@ -178,6 +285,8 @@ fn tally_ix(admin: &Keypair, event: Pubkey) -> Instruction {
             event,
             vault: pda(&[b"vault", event.as_ref()]),
             schedule: pda(&[b"schedule", admin.pubkey().as_ref()]),
+            kinds: pda(&[b"schedule-kinds", admin.pubkey().as_ref()]),
+            league: pda(&[b"league"]),
         }
         .to_account_metas(None),
         data: predictions::instruction::Tally {}.data(),
@@ -275,11 +384,19 @@ impl Rpc {
         panic!("transaction {signature} was not confirmed");
     }
 
-    fn send(&self, payer: &Keypair, instructions: &[Instruction], expect_ok: bool) -> Result<(), String> {
+    fn send(&self, payer: &Keypair, instructions: &[Instruction], expect_ok: bool) -> Result<String, String> {
         self.send_all(&[payer], instructions, expect_ok)
     }
 
-    fn send_all(&self, signers: &[&Keypair], instructions: &[Instruction], expect_ok: bool) -> Result<(), String> {
+    fn units(&self, signature: &str) -> u64 {
+        let transaction = self.rpc(
+            "getTransaction",
+            serde_json::json!([signature, {"commitment":"confirmed","encoding":"json","maxSupportedTransactionVersion":0}]),
+        );
+        transaction["meta"]["computeUnitsConsumed"].as_u64().unwrap_or_else(|| panic!("no compute units for {signature}"))
+    }
+
+    fn send_all(&self, signers: &[&Keypair], instructions: &[Instruction], expect_ok: bool) -> Result<String, String> {
         let blockhash = self.rpc("getLatestBlockhash", serde_json::json!([{"commitment":"confirmed"}]))["value"]["blockhash"]
             .as_str()
             .unwrap()
@@ -313,8 +430,9 @@ impl Rpc {
         if !expect_ok {
             return Err("transaction was accepted".to_string());
         }
-        self.confirm(value["result"].as_str().unwrap());
-        Ok(())
+        let signature = value["result"].as_str().unwrap().to_string();
+        self.confirm(&signature);
+        Ok(signature)
     }
 }
 

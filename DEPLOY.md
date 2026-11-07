@@ -178,25 +178,25 @@ sudo certbot renew --dry-run
 
 # Put Sol on the home web server (devnet)
 
-Build on the laptop, carry the files over on a USB stick, and install them at the server's keyboard. There is no SSH step. This server is a machine on the home network. It is not the Qtagg server.
+Build on the laptop, then copy the files over SSH to the server's address on the home network. This server is a machine on the home network. It is not the Qtagg server.
 
 Nginx on that machine is what friends on the internet talk to. Solana stays on devnet. Do not set `ALLOW_MAINNET`.
 
 Stop `go run .` on the laptop once this copy is running. Two backends both try to reveal and resolve the same devnet events.
 
-## What the stick carries
+## What gets copied
 
-Secrets stay in the files. This document does not repeat them.
+Secrets stay in the files. This document does not repeat them. `scp` lands them in `~/sol` on the server, and the install step moves them into place.
 
-| On the laptop | On the stick | On the server | Why |
+| On the laptop | Staged over SSH | On the server | Why |
 |---|---|---|---|
-| `sol-backend` from `.\build.ps1` | `backend\sol-backend` | `/opt/sol/backend/sol-backend` | The API |
-| `frontend\dist\` | `dist\` | `/var/www/sol/` | The pages |
-| `.env` | `env` (no leading dot, so Linux shows it) | `/opt/sol/.env` | Helius devnet RPC, both API-Football keys, session secret |
-| `docker-compose.yml` | `docker-compose.yml` | `/opt/sol/docker-compose.yml` | MongoDB in Docker, bound to localhost |
-| `programs\predictions\keys\deployer-keypair.json` | `keys\` | `/opt/sol/programs/predictions/keys/` | Signs automatic result submission |
-| `council-signer.json` | `keys\` | same folder | Second result signer |
-| `reveal-keeper.json` | `keys\` | same folder | Publishes coupon reveals |
+| `sol-backend` from `.\build.ps1` | `~/sol/backend/sol-backend` | `/opt/sol/backend/sol-backend` | The API |
+| `frontend\dist\` | `~/sol/dist/` | `/var/www/sol/` | The pages |
+| `.env` | `~/sol/.env` | `/opt/sol/.env` | Helius devnet RPC, both API-Football keys, session secret |
+| `docker-compose.yml` | `~/sol/docker-compose.yml` | `/opt/sol/docker-compose.yml` | MongoDB in Docker, bound to localhost |
+| `programs\predictions\keys\deployer-keypair.json` | `~/sol/keys/` | `/opt/sol/programs/predictions/keys/` | Signs automatic result submission |
+| `council-signer.json` | `~/sol/keys/` | same folder | Second result signer |
+| `reveal-keeper.json` | `~/sol/keys/` | same folder | Publishes coupon reveals |
 
 Leave the other files in `programs\predictions\keys\` on the laptop (`admin-keypair.json`, `buffer-keypair.json`, the program keypairs). Those are for program upgrades. The running site does not read them.
 
@@ -212,7 +212,7 @@ These already match the code, so they do not go in `.env`:
 
 Friends use a hostname that points at the home's public address, for example `sol.example.com`. The router forwards **443** to this server's LAN address, and **80** as well when certificate renewal needs it.
 
-Do not forward 22, 8080, 27017, or any other port. Do not forward anything to the laptop. SSH can stay unused. If the server has an SSH service for your own use, it stays reachable only from inside the house.
+Do not forward 22, 8080, 27017, or any other port. Do not forward anything to the laptop. SSH is only for copying files from the laptop, and stage 1 already limits port 22 to that computer's address. Friends never use it.
 
 The API listens on every interface on port 8080. Nginx calls it at `127.0.0.1:8080`. Close 8080 to the rest of the house with the firewall in step 3, or a phone on the Wi-Fi can open the API directly and skip nginx.
 
@@ -228,41 +228,41 @@ From `C:\solwalletapp`:
 
 That writes a Linux `sol-backend` in the repo root and the pages in `frontend\dist`. `VITE_API_URL` stays unset, so the pages call `/api` on the same host.
 
-## 2. Fill the USB stick
+## 2. Copy over SSH
 
-Plug the stick in. Replace `E:` with its drive letter.
+From the laptop. Replace `you` with the Linux account and `SERVER_LOCAL_IP` with the address from `hostname -I` in stage 1. The first connection asks you to accept the server's host key.
 
 ```powershell
-$usb = "E:\sol"
-New-Item -ItemType Directory -Force -Path "$usb\backend","$usb\keys","$usb\dist" | Out-Null
-Copy-Item C:\solwalletapp\sol-backend "$usb\backend\sol-backend" -Force
-Copy-Item C:\solwalletapp\.env "$usb\env" -Force
-Copy-Item C:\solwalletapp\docker-compose.yml "$usb\docker-compose.yml" -Force
-Copy-Item C:\solwalletapp\programs\predictions\keys\deployer-keypair.json "$usb\keys\" -Force
-Copy-Item C:\solwalletapp\programs\predictions\keys\council-signer.json "$usb\keys\" -Force
-Copy-Item C:\solwalletapp\programs\predictions\keys\reveal-keeper.json "$usb\keys\" -Force
-Copy-Item C:\solwalletapp\frontend\dist\* "$usb\dist\" -Recurse -Force
+$server = "you@SERVER_LOCAL_IP"
+ssh $server "mkdir -p ~/sol/backend ~/sol/keys"
+scp C:\solwalletapp\sol-backend "${server}:sol/backend/sol-backend"
+scp C:\solwalletapp\.env "${server}:sol/.env"
+scp C:\solwalletapp\docker-compose.yml "${server}:sol/docker-compose.yml"
+scp C:\solwalletapp\programs\predictions\keys\deployer-keypair.json C:\solwalletapp\programs\predictions\keys\council-signer.json C:\solwalletapp\programs\predictions\keys\reveal-keeper.json "${server}:sol/keys/"
+scp -r C:\solwalletapp\frontend\dist "${server}:sol/dist"
 ```
 
-Eject the stick from the laptop. It now holds the signing keys and `env`. Keep it with you until those files are on the server, then delete `E:\sol` from the stick. Linux hides names that start with a dot, which is why the stick carries `env` and the server renames it to `.env`.
+`~/sol` now holds the signing keys and `.env`. The next step moves them and deletes that folder. Leave the other key files on the laptop.
 
-## 3. Install at the server's keyboard
+## 3. Install over the same SSH session
 
-Plug the stick into the server. Find its mount with `lsblk` (often `/media/<you>/<stick-name>`). Below, that path is `/media/usb`. Then:
+Connect with `ssh you@SERVER_LOCAL_IP`, then run this on the server:
 
 ```bash
 sudo mkdir -p /opt/sol/backend /opt/sol/programs/predictions/keys /var/www/sol
-sudo cp /media/usb/sol/backend/sol-backend /opt/sol/backend/sol-backend
-sudo cp /media/usb/sol/env /opt/sol/.env
-sudo cp /media/usb/sol/docker-compose.yml /opt/sol/docker-compose.yml
-sudo cp /media/usb/sol/keys/*.json /opt/sol/programs/predictions/keys/
-sudo cp -a /media/usb/sol/dist/. /var/www/sol/
+sudo cp ~/sol/backend/sol-backend /opt/sol/backend/sol-backend
+sudo cp ~/sol/.env /opt/sol/.env
+sudo cp ~/sol/docker-compose.yml /opt/sol/docker-compose.yml
+sudo cp ~/sol/keys/*.json /opt/sol/programs/predictions/keys/
+sudo rm -rf /var/www/sol/*
+sudo cp -a ~/sol/dist/. /var/www/sol/
 sudo chmod 755 /opt/sol/backend/sol-backend
 sudo chmod 600 /opt/sol/.env /opt/sol/programs/predictions/keys/*.json
 sudo chown -R www-data:www-data /var/www/sol
+rm -rf ~/sol
 ```
 
-Unplug the stick when the copy finishes. Nginx must use `/var/www/sol` as the site root. Pointing it at `/opt/sol` would let visitors download the keys and `.env`.
+Nginx must use `/var/www/sol` as the site root. Pointing it at `/opt/sol` would let visitors download the keys and `.env`.
 
 MongoDB runs in Docker. On Ubuntu or Debian, install Docker first. `docker compose` is missing until this finishes:
 
@@ -387,22 +387,30 @@ Sign-in is limited to 10 attempts per minute for the whole site, because every r
 
 ## Later updates
 
-On the laptop, run `.\build.ps1` again and copy the new `sol-backend` and `frontend\dist` onto the stick the same way as step 2. Leave `env` and the keys off the stick unless they changed.
+On the laptop, run `.\build.ps1` again and copy only the new binary and pages. Leave `.env` and the keys alone unless they changed.
 
-At the server:
+```powershell
+$server = "you@SERVER_LOCAL_IP"
+scp C:\solwalletapp\sol-backend "${server}:sol-backend"
+scp -r C:\solwalletapp\frontend\dist "${server}:dist"
+```
+
+Then, over SSH:
 
 ```bash
 sudo systemctl stop sol
 sudo cp /opt/sol/backend/sol-backend /opt/sol/backend/sol-backend.bak
-sudo cp /media/usb/sol/backend/sol-backend /opt/sol/backend/sol-backend
+sudo cp ~/sol-backend /opt/sol/backend/sol-backend
 sudo chmod 755 /opt/sol/backend/sol-backend
 sudo rm -rf /var/www/sol/*
-sudo cp -a /media/usb/sol/dist/. /var/www/sol/
+sudo cp -a ~/dist/. /var/www/sol/
 sudo chown -R www-data:www-data /var/www/sol
+rm -f ~/sol-backend
+rm -rf ~/dist
 sudo systemctl start sol
 ```
 
-Unplug the stick. To roll the binary back: `sudo systemctl stop sol`, copy `sol-backend.bak` back to `sol-backend`, `sudo systemctl start sol`.
+To roll the binary back: `sudo systemctl stop sol`, copy `sol-backend.bak` back to `sol-backend`, `sudo systemctl start sol`.
 
 ## Copy the current database (optional)
 
@@ -411,16 +419,17 @@ Do this only if the events already on the laptop should appear on the server. On
 ```powershell
 docker exec sol-mongodb mongodump --db sol --archive=/tmp/sol.archive
 docker cp sol-mongodb:/tmp/sol.archive C:\solwalletapp\sol.archive
-Copy-Item C:\solwalletapp\sol.archive E:\sol\sol.archive
+scp C:\solwalletapp\sol.archive you@SERVER_LOCAL_IP:sol.archive
 ```
 
 At the server, after `sol-mongodb` is running:
 
 ```bash
-sudo docker cp /media/usb/sol/sol.archive sol-mongodb:/tmp/sol.archive
+sudo docker cp ~/sol.archive sol-mongodb:/tmp/sol.archive
 sudo docker exec sol-mongodb mongorestore --archive=/tmp/sol.archive --drop
 sudo docker exec sol-mongodb rm /tmp/sol.archive
+rm -f ~/sol.archive
 sudo systemctl restart sol
 ```
 
-Delete `sol.archive` from the laptop and from the stick after the restore.
+Delete `sol.archive` from the laptop after the restore.

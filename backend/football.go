@@ -75,6 +75,7 @@ type footballHit struct {
 
 type footballFeed struct {
 	key        string
+	base       string
 	client     *http.Client
 	mu         sync.Mutex
 	scores     map[int]fixtureState
@@ -952,7 +953,19 @@ func (a *App) addSlipCounts(ctx context.Context, event, results string, winners 
 		if err != nil {
 			continue
 		}
-		addMaskCounts(winners, picks, results)
+		colors, err := parseColorHex(record.Colors)
+		if err != nil {
+			continue
+		}
+		if len(colors) == 0 {
+			addMaskCounts(winners, picks, results)
+			continue
+		}
+		for score, rows := range keptCounts(picks, colors, results) {
+			if rows > 0 {
+				winners[score] += int(rows)
+			}
+		}
 	}
 }
 
@@ -1008,6 +1021,14 @@ func (a *App) addEntryCounts(ctx context.Context, eventID bson.ObjectID, results
 	}
 }
 
+func (f *footballFeed) endpoint(path string) string {
+	base := footballBase
+	if f.base != "" {
+		base = f.base
+	}
+	return base + path
+}
+
 func (f *footballFeed) get(ctx context.Context, path string) (json.RawMessage, int, error) {
 	f.mu.Lock()
 	if time.Now().Before(f.pauseUntil) {
@@ -1027,7 +1048,7 @@ func (f *footballFeed) get(ctx context.Context, path string) (json.RawMessage, i
 	f.lastCall = time.Now()
 	f.mu.Unlock()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, footballBase+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.endpoint(path), nil)
 	if err != nil {
 		return nil, 0, err
 	}

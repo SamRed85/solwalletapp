@@ -17,8 +17,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// Payout rules (Phase 1 decisions, see .cursor/plans/master_plan.md):
-//   - The house keeps houseCutPercent of ticket sales; the tiers share the rest.
+// Payout rules (Phase 1 decisions, updated in Phase 14, see .cursor/plans/master_plan.md):
+//   - New events keep leagueCutPercent of ticket sales for the league vault and houseCutPercent for the house.
+//   - The tiers share the other 90%.
 //   - Each tier's pot is split equally between the coupons with exactly that many correct picks.
 //   - A tier rolls over into the top tier of the next event that has not started when it has
 //     no winners, or when each winning row would receive less than 0.01 SOL.
@@ -28,7 +29,8 @@ import (
 const (
 	defaultGameCount     = 13
 	houseCutPercent      = 5
-	tierPercentTotal     = 100 - houseCutPercent
+	leagueCutPercent     = 5
+	tierPercentTotal     = 100 - houseCutPercent - leagueCutPercent
 	cancelledResult      = "C"
 	minRowPayoutLamports = 10_000_000 // 0.01 SOL. A smaller share rolls the whole tier.
 	cancelledDrawDelay   = time.Hour
@@ -36,7 +38,7 @@ const (
 )
 
 // Percentages for "all correct", "one wrong", "two wrong" and "three wrong".
-var defaultTierPercents = []int{50, 25, 15, 5}
+var defaultTierPercents = []int{45, 25, 15, 5}
 
 type Tier struct {
 	Correct int `json:"correct" bson:"correct"`
@@ -57,6 +59,7 @@ type Settlement struct {
 	SalesLamports       uint64         `json:"salesLamports" bson:"salesLamports"`
 	RolloverInLamports  uint64         `json:"rolloverInLamports" bson:"rolloverInLamports"`
 	HouseLamports       uint64         `json:"houseLamports" bson:"houseLamports"`
+	LeagueLamports      uint64         `json:"leagueLamports" bson:"leagueLamports"`
 	PaidLamports        uint64         `json:"paidLamports" bson:"paidLamports"`
 	RolloverOutLamports uint64         `json:"rolloverOutLamports" bson:"rolloverOutLamports"`
 	RolloverToEventID   *bson.ObjectID `json:"rolloverToEventId,omitempty" bson:"rolloverToEventId,omitempty"`
@@ -74,6 +77,18 @@ type Draw struct {
 	Weights   [3]uint64 `json:"weights" bson:"weights"`
 }
 
+func leagueDefaultTiers(gameCount int) []Tier {
+	if gameCount >= 10 {
+		return []Tier{
+			{Correct: gameCount, Percent: 50},
+			{Correct: gameCount - 1, Percent: 25},
+			{Correct: gameCount - 2, Percent: 15},
+			{Correct: gameCount - 3, Percent: 10},
+		}
+	}
+	return []Tier{{Correct: gameCount, Percent: 100}}
+}
+
 func defaultTiers(gameCount int) []Tier {
 	tiers := make([]Tier, 0, len(defaultTierPercents))
 	for i, p := range defaultTierPercents {
@@ -84,30 +99,53 @@ func defaultTiers(gameCount int) []Tier {
 	return tiers
 }
 
-func validateTiers(tiers []Tier, gameCount int) string {
+func validateTierShape(tiers []Tier, gameCount int) (int, string) {
 	if len(tiers) == 0 {
-		return "at least one prize tier is required"
+		return 0, "at least one prize tier is required"
 	}
 	seen := map[int]bool{}
 	total, hasTop := 0, false
 	for _, t := range tiers {
 		switch {
 		case t.Correct < 1 || t.Correct > gameCount:
-			return "tier correct picks must be between 1 and the number of games"
+			return 0, "tier correct picks must be between 1 and the number of games"
 		case seen[t.Correct]:
-			return "each number of correct picks can only have one tier"
+			return 0, "each number of correct picks can only have one tier"
 		case t.Percent < 1:
-			return "tier percentages must be positive"
+			return 0, "tier percentages must be positive"
 		}
 		seen[t.Correct] = true
 		total += t.Percent
 		hasTop = hasTop || t.Correct == gameCount
 	}
 	if !hasTop {
-		return "there must be a tier for all games correct (it receives the rollover)"
+		return 0, "there must be a tier for all games correct (it receives the rollover)"
 	}
-	if total != tierPercentTotal {
-		return fmt.Sprintf("tier percentages must add up to %d%% (the house keeps %d%%)", tierPercentTotal, houseCutPercent)
+	return total, ""
+}
+
+func validateTiers(tiers []Tier, gameCount int) string {
+	total, msg := validateTierShape(tiers, gameCount)
+	if msg != "" {
+		return msg
+	}
+	return tierTotalMessage(total, tierPercentTotal, houseCutPercent, leagueCutPercent)
+}
+
+func validateLeagueTiers(tiers []Tier, gameCount int) string {
+	total, msg := validateTierShape(tiers, gameCount)
+	if msg != "" {
+		return msg
+	}
+	if total != 100 {
+		return "league event tiers must add up to 100% (this pool was already charged)"
+	}
+	return ""
+}
+
+func tierTotalMessage(total, want, house, league int) string {
+	if total != want {
+		return fmt.Sprintf("tier percentages must add up to %d%% (the house keeps %d%% and the league vault keeps %d%%)", want, house, league)
 	}
 	return ""
 }
@@ -196,6 +234,18 @@ func settleCounts(rows int, winners map[int]int, resultCount int, salesLamports,
 		s.Tiers = append(s.Tiers, tp)
 	}
 	s.HouseLamports += salesLamports - allocated
+	total := 0
+	for _, t := range tiers {
+		total += t.Percent
+	}
+	if total == tierPercentTotal {
+		cut := salesLamports * uint64(leagueCutPercent) / 100
+		if s.HouseLamports < cut {
+			cut = s.HouseLamports
+		}
+		s.HouseLamports -= cut
+		s.LeagueLamports = cut
+	}
 	return s
 }
 

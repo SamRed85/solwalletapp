@@ -22,6 +22,11 @@ const (
 	maxTeamNameLen = 60
 
 	maxCouponPriceLamports = 10_000_000_000
+
+	defaultMinRows    = 1
+	defaultMaxCoupons = 250_000
+	hardMaxCoupons    = 1_000_000
+	legacyMaxCoupons  = 1 << 20
 )
 
 // Game results and coupon picks use the same encoding: home win, draw, away win.
@@ -36,6 +41,8 @@ type Game struct {
 	Result    string    `json:"result" bson:"result"`
 	Cancelled bool      `json:"cancelled,omitempty" bson:"cancelled,omitempty"`
 	Draw      *Draw     `json:"draw,omitempty" bson:"draw,omitempty"`
+	// Odds is the stored Match Winner line. It is not part of the saved game.
+	Odds *GameOdds `json:"odds,omitempty" bson:"-"`
 }
 
 // Event status is derived, never stored:
@@ -54,7 +61,15 @@ type Event struct {
 	CreatedBy           string        `json:"createdBy" bson:"createdBy"`
 	CreatedAt           time.Time     `json:"createdAt" bson:"createdAt"`
 	AutoResolve         bool          `json:"autoResolve" bson:"autoResolve"`
-	AutoResolveBlock    string        `json:"autoResolveBlock,omitempty" bson:"-"`
+	// League events are entered with RAD. Their prize is the SOL collected in the league vault.
+	League bool `json:"league" bson:"league,omitempty"`
+	// MinRows is the kept rows a coupon must have. MaxCoupons is how many coupons the event accepts.
+	// Zero on events created before the limits existed.
+	MinRows    int `json:"minRows" bson:"minRows,omitempty"`
+	MaxCoupons int `json:"maxCoupons" bson:"maxCoupons,omitempty"`
+	// EntryCount is the number of coupons, not rows. It is filled for the response.
+	EntryCount       int    `json:"entryCount" bson:"-"`
+	AutoResolveBlock string `json:"autoResolveBlock,omitempty" bson:"-"`
 	// ScoreChecks counts feed reads made by auto resolve after the saved scores were not final.
 	ScoreChecks    int         `json:"-" bson:"scoreChecks,omitempty"`
 	ScoreCheckedAt time.Time   `json:"-" bson:"scoreCheckedAt,omitempty"`
@@ -64,6 +79,8 @@ type Event struct {
 	Status         string      `json:"status" bson:"-"`
 	CouponsSold    int         `json:"couponsSold" bson:"-"`
 	Chain          *ChainVault `json:"chain,omitempty" bson:"chain,omitempty"`
+	// PickShare is filled only from the event start onward. It is not stored on the event.
+	PickShare *PickShare `json:"pickShare,omitempty" bson:"-"`
 
 	// hasVault stays true when prepare hides a vault from another program deployment:
 	// such an event still never takes treasury money.
@@ -79,6 +96,37 @@ type ChainVault struct {
 	Nonce     uint64 `json:"nonce" bson:"nonce"`
 	Address   string `json:"address" bson:"address"`
 	Status    string `json:"status,omitempty" bson:"status,omitempty"`
+}
+
+// normalizeCouponLimits fills the creation defaults. Zero means the caller left the field out.
+func normalizeCouponLimits(minRows, maxCoupons int) (int, int, string) {
+	if minRows == 0 {
+		minRows = defaultMinRows
+	}
+	if maxCoupons == 0 {
+		maxCoupons = defaultMaxCoupons
+	}
+	if minRows < 1 || minRows > maxCombinations {
+		return 0, 0, fmt.Sprintf("minimum rows must be between 1 and %d", maxCombinations)
+	}
+	if maxCoupons < 1 || maxCoupons > hardMaxCoupons {
+		return 0, 0, fmt.Sprintf("maximum coupons must be between 1 and %d", hardMaxCoupons)
+	}
+	return minRows, maxCoupons, ""
+}
+
+// entryLimits is what a coupon is checked against. Events saved before the limits existed
+// still take one row and up to the tree cap.
+func (e *Event) entryLimits() (int, int) {
+	minRows := e.MinRows
+	if minRows == 0 {
+		minRows = defaultMinRows
+	}
+	maxCoupons := e.MaxCoupons
+	if maxCoupons == 0 {
+		maxCoupons = legacyMaxCoupons
+	}
+	return minRows, maxCoupons
 }
 
 func (e *Event) results() string {
@@ -127,11 +175,15 @@ func (a *App) countCoupons(ctx context.Context, events []Event) {
 	}
 	cur, err := a.entries.Aggregate(ctx, mongo.Pipeline{
 		{{Key: "$match", Value: bson.M{"eventId": bson.M{"$in": ids}}}},
-		{{Key: "$group", Value: bson.M{"_id": "$eventId", "coupons": bson.M{"$sum": bson.M{"$cond": bson.A{
-			bson.M{"$gt": bson.A{"$combinations", 0}},
-			"$combinations",
-			bson.M{"$size": bson.M{"$ifNull": bson.A{"$coupons", bson.A{}}}},
-		}}}}}},
+		{{Key: "$group", Value: bson.M{
+			"_id":     "$eventId",
+			"entries": bson.M{"$sum": 1},
+			"coupons": bson.M{"$sum": bson.M{"$cond": bson.A{
+				bson.M{"$gt": bson.A{"$combinations", 0}},
+				"$combinations",
+				bson.M{"$size": bson.M{"$ifNull": bson.A{"$coupons", bson.A{}}}},
+			}}},
+		}}},
 	})
 	if err != nil {
 		return
@@ -139,16 +191,18 @@ func (a *App) countCoupons(ctx context.Context, events []Event) {
 	var counts []struct {
 		ID      bson.ObjectID `bson:"_id"`
 		Coupons int           `bson:"coupons"`
+		Entries int           `bson:"entries"`
 	}
 	if cur.All(ctx, &counts) != nil {
 		return
 	}
-	byID := map[bson.ObjectID]int{}
+	byID := map[bson.ObjectID]struct{ coupons, entries int }{}
 	for _, c := range counts {
-		byID[c.ID] = c.Coupons
+		byID[c.ID] = struct{ coupons, entries int }{c.Coupons, c.Entries}
 	}
 	for i := range events {
-		events[i].CouponsSold = byID[events[i].ID]
+		events[i].CouponsSold = byID[events[i].ID].coupons
+		events[i].EntryCount = byID[events[i].ID].entries
 	}
 }
 
@@ -235,10 +289,11 @@ func (a *App) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "event not found")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	events := []Event{*e}
 	a.countCoupons(ctx, events)
+	a.decorateEvent(ctx, &events[0], time.Now())
 	writeJSON(w, http.StatusOK, events[0])
 }
 
@@ -271,6 +326,9 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		CouponPriceLamports uint64 `json:"couponPriceLamports"`
 		Tiers               []Tier `json:"tiers"`
 		AutoResolve         *bool  `json:"autoResolve"`
+		League              bool   `json:"league"`
+		MinRows             int    `json:"minRows"`
+		MaxCoupons          int    `json:"maxCoupons"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -282,13 +340,27 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		req.GameCount = defaultGameCount
 	}
 	special := req.GameCount != defaultGameCount
-	if req.CouponPriceLamports == 0 && !special {
-		req.CouponPriceLamports = a.cfg.CouponPriceLamports
-	}
-	if len(req.Tiers) == 0 && !special {
-		req.Tiers = defaultTiers(req.GameCount)
+	if req.League {
+		if req.CouponPriceLamports == 0 {
+			req.CouponPriceLamports = 1
+		}
+		if len(req.Tiers) == 0 {
+			req.Tiers = leagueDefaultTiers(req.GameCount)
+		}
+	} else {
+		if req.CouponPriceLamports == 0 && !special {
+			req.CouponPriceLamports = a.cfg.CouponPriceLamports
+		}
+		if len(req.Tiers) == 0 && !special {
+			req.Tiers = defaultTiers(req.GameCount)
+		}
 	}
 	sortTiers(req.Tiers)
+	minRows, maxCoupons, limitMsg := normalizeCouponLimits(req.MinRows, req.MaxCoupons)
+	if limitMsg != "" {
+		writeError(w, http.StatusBadRequest, limitMsg)
+		return
+	}
 
 	switch {
 	case req.Title == "" || len(req.Title) > maxTitleLen:
@@ -310,13 +382,21 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "a coupon price between 1 lamport and 10 SOL is required for special events")
 		return
 	}
-	if msg := validateTiers(req.Tiers, req.GameCount); msg != "" {
+	tierCheck := validateTiers
+	if req.League {
+		tierCheck = validateLeagueTiers
+	}
+	if msg := tierCheck(req.Tiers, req.GameCount); msg != "" {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+	pendingRollover := uint64(0)
+	if !req.League {
+		pendingRollover = a.takePendingRollover(ctx)
+	}
 	e := Event{
 		ID:                  bson.NewObjectID(),
 		Title:               req.Title,
@@ -324,7 +404,10 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		GameCount:           req.GameCount,
 		CouponPriceLamports: req.CouponPriceLamports,
 		Tiers:               req.Tiers,
-		RolloverInLamports:  a.takePendingRollover(ctx),
+		RolloverInLamports:  pendingRollover,
+		League:              req.League,
+		MinRows:             minRows,
+		MaxCoupons:          maxCoupons,
 		StartTime:           req.StartTime.UTC(),
 		EndTime:             req.EndTime.UTC(),
 		Games:               []Game{},

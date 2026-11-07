@@ -26,14 +26,19 @@ deadline and end time, inclusive.
 
 A standard event has 13 games, costs 1,000,000 lamports per coupon row, and uses these tiers:
 
-- 13 correct: 50% of ticket sales
+- 13 correct: 45% of ticket sales
 - 12 correct: 25%
 - 11 correct: 15%
 - 10 correct: 5%
 
 A special event explicitly stores its price and tiers. Each tier identifies a distinct number
-of correct picks, has a positive integer percentage, and all percentages total 95. A tier for
-all games correct is mandatory.
+of correct picks, has a positive integer percentage, and all percentages total 90. A tier for
+all games correct is mandatory. The remaining 10% of ticket sales is the house remainder:
+settlement moves 5% of ticket sales into the league vault (section 11) and leaves the rest,
+including rounding dust, as the house share.
+
+An event created before this rule, whose stored tiers total 95, keeps that settlement. It does
+not fund the league vault. A league event (section 11) stores tiers that total 100.
 
 ## 3. Coupon format and canonicalization
 
@@ -130,20 +135,24 @@ rounding_remainder = tier_pot - paid_for_tier
 Every winning row receives `per_winner`. The rounding remainder belongs to the house. If
 `winner_count == 0`, the entire tier pot is rollover out.
 
-The house amount is:
+The house remainder is:
 
 ```text
-house = sales - sum(floor(sales * tier_percent / 100)) + sum(rounding_remainders)
+remainder = sales - sum(floor(sales * tier_percent / 100)) + sum(rounding_remainders)
 ```
 
-Rollover out goes to the all-correct tier of the earliest event that has not started when
-resolution is submitted. If no such event exists, it is assigned to the next event created.
-The 5% house allocation is not charged again on rollover.
+When the tiers total 90, the league cut is `floor(sales * 5 / 100)` and the house amount is
+`remainder - league_cut`. When the tiers total 95, the league cut is zero and the house amount
+is the whole remainder. Rollover is not taxed again.
+
+Rollover out goes to the all-correct tier of the earliest event of the same kind that has not
+started when resolution is submitted. If no such event exists, it is assigned to the next event
+of that kind. A SOL event and a league event never accept each other's rollover.
 
 Settlement is deterministic and may occur only once. For each resolved event:
 
 ```text
-sales + rollover_in = house + paid_to_winners + rollover_out
+sales + rollover_in = house + league_cut + paid_to_winners + rollover_out
 ```
 
 ## 8. Claims, cancellation, and refunds
@@ -169,7 +178,8 @@ funds.
 2. No coupon is accepted at or after the deadline.
 3. Total claims plus refunds cannot exceed vault liabilities.
 4. A claim or refund cannot be repeated or redirected.
-5. The administrator cannot withdraw event funds other than the settled house share, once.
+5. The administrator cannot withdraw event funds other than the settled house share, once,
+   and cannot withdraw from the league vault at all.
 6. Settlement and every draw can be recomputed from public inputs.
 7. Claims remain available without administrator or indexer cooperation.
 8. Cancellation or timeout provides a permissionless refund path.
@@ -213,3 +223,43 @@ program is authoritative; MongoDB only mirrors its status.
   resolved or cancelled. A coupon holds at most 44,000 rows, as in section 3.
 - **Treasury payments.** An event with a vault never turns a treasury transfer into an entry;
   such a transfer is recorded for manual refund.
+- **League funding.** Resolving a vault event whose tiers total 90 transfers the league cut
+  into the league vault in the same instruction that settles the event.
+
+## 11. League vault and RAD
+
+RAD is a per-wallet counter held by the program. It is not an SPL token. One RAD is credited
+for each row of a SOL entry at the moment the entry is accepted. Spending RAD is only possible
+by entering a league event. Cancelling a SOL event does not debit RAD already credited.
+
+The league vault is a single program account. Its liquid balance above rent is the collected
+league cuts plus any parked league jackpot. The jackpot portion is stored as an integer on the
+account so it is not spread across every prize tier. Nobody can withdraw this account except
+by creating a league event, which moves the whole liquid balance into that event's vault. The
+jackpot integer becomes that event's `rollover_in`. The rest becomes its `sales`.
+
+A league event:
+
+- costs a stored RAD price per row (one, unless the admin sets another price)
+- accepts entry only by debiting that wallet's RAD
+- does not credit RAD for its own rows
+- uses tiers that total 100, so there is no second house cut; integer dust left after paying
+  winners is added to rollover out
+- parks an unwon rollover into the league vault's jackpot integer, for the next league event
+- on cancellation, returns the swept SOL to the league vault and refunds each row's RAD
+
+A league event's prize is SOL that earlier players funded. Entry does not add SOL to it.
+
+## 12. Color reduction
+
+A vault coupon can be built with up to four colors (purple, yellow, red, and green). A color is a set of signs. A sign is one outcome of one game, and the same sign may belong to more than one color. Each color has a minimum and a maximum. A row is kept only when, for every color, the number of its signs on that row is inside that range.
+
+A colored entry is one slip. Its commitment covers the 13 pick masks, the reveal nonce, and the list of colors. Each color is 10 bytes: the sign bits (game `g` outcome `k` is bit `3g + k`, in the order `1`, `X`, `2`) as a little-endian u64, then the minimum, then the maximum. With colors the commitment is `sha256(owner, picks, nonce, "colors-v1", colors)` and the reveal leaf ends with `"colors-v1"` and the same bytes. A slip with no colors hashes exactly as before colors existed.
+
+The row count paid at entry is the number of kept rows. The frame may be larger than 44,000 rows, but the kept rows may not. The program counts the kept rows without listing them, using a table of states: one more than each color's effective maximum, multiplied over the colors. A color whose minimum is 0 and whose maximum covers all of its signs adds no states. A table over 64 states is refused.
+
+Reveal checks the commitment and the colors. It rejects a color with no signs, a sign outside the frame, a minimum above its maximum, a maximum above the game count, more than four colors, a table over the cap, and a kept-row count that differs from the paid count. A rejected coupon stays unrevealed: its stake stays in the pool and it cannot win. Scoring and claims count only the kept rows by number of correct picks, never the raw frame. A void game still counts every pick correct.
+
+Worked example: six games marked yellow on `1`, minimum 3 and maximum 5, and every other selected sign left as it is. The other two games of an eight-game frame are `1`, `X`, and `2`. The frame is 6,561 rows and the kept rows are 2,088, on one coupon with one signature.
+
+Entries placed before this rule were split in the browser into ordinary system coupons, one `place_slip` per pattern, from a group saved in MongoDB with the picks sealed by the wallet's coupon key. A group saved that way can still be resumed, and each of its coupons is revealed, scored, claimed, and refunded by the rules for one slip.

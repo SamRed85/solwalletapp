@@ -18,16 +18,18 @@ type App struct {
 	nonces  *nonceStore
 	limiter rateLimiter
 
-	users    *mongo.Collection
-	events   *mongo.Collection
-	entries  *mongo.Collection
-	payments *mongo.Collection
-	rollover *mongo.Collection
-	reveals  *mongo.Collection
-	sessions *mongo.Collection
-	slips    *mongo.Collection
-	scores   *mongo.Collection
-	feed     *footballFeed
+	users      *mongo.Collection
+	events     *mongo.Collection
+	entries    *mongo.Collection
+	payments   *mongo.Collection
+	rollover   *mongo.Collection
+	reveals    *mongo.Collection
+	sessions   *mongo.Collection
+	slips      *mongo.Collection
+	scores     *mongo.Collection
+	odds       *mongo.Collection
+	reductions *mongo.Collection
+	feed       *footballFeed
 
 	rpc                *solanaRPC
 	keeper             ed25519.PrivateKey
@@ -75,6 +77,8 @@ func main() {
 		sessions:              db.Collection("sessions"),
 		slips:                 db.Collection("slipArchive"),
 		scores:                db.Collection("fixtureScores"),
+		odds:                  db.Collection("fixtureOdds"),
+		reductions:            db.Collection("reductions"),
 		rpc:                   rpc,
 		feed:                  newFootballFeed(cfg.APIFootballKey),
 		verifyPayment:         rpc.verifyPayment,
@@ -129,9 +133,13 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/entries", a.requireAuth(a.handleMyEntries))
 	mux.HandleFunc("GET /api/lottery", a.requireAuth(a.handleLottery))
 	mux.HandleFunc("GET /api/slip-archive", a.requireAuth(a.handleSlipArchive))
-	mux.HandleFunc("POST /api/slip-archive", a.requireAuth(a.limitRequests("slip-archive", 30, time.Minute, walletRateKey, a.handleIngestSlip)))
+	mux.HandleFunc("POST /api/slip-archive", a.requireAuth(a.limitRequests("slip-archive", 600, time.Minute, walletRateKey, a.handleIngestSlip)))
 	mux.HandleFunc("POST /api/events/{id}/chain/sync", a.requireAuth(a.limitRequests("chain-sync", 20, time.Minute, walletRateKey, a.handleSyncChain)))
-	mux.HandleFunc("POST /api/reveals", a.requireAuth(a.limitRequests("reveal-arm", 20, time.Minute, walletRateKey, a.handleArmReveal)))
+	mux.HandleFunc("POST /api/reveals", a.requireAuth(a.limitRequests("reveal-arm", 600, time.Minute, walletRateKey, a.handleArmReveal)))
+	mux.HandleFunc("GET /api/reductions", a.requireAuth(a.handleListReductions))
+	mux.HandleFunc("POST /api/reductions", a.requireAuth(a.limitRequests("reduction-save", 10, time.Minute, walletRateKey, a.handleCreateReduction)))
+	mux.HandleFunc("PATCH /api/reductions/{id}", a.requireAuth(a.limitRequests("reduction-sign", 600, time.Minute, walletRateKey, a.handleMarkReduction)))
+	mux.HandleFunc("DELETE /api/reductions/{id}", a.requireAuth(a.handleDeleteReduction))
 	mux.HandleFunc("POST /api/events/{id}/payment-recoveries", a.requireAuth(a.limitRequests("payment-recovery", 5, time.Minute, walletRateKey, a.handleCreatePaymentRecovery)))
 
 	mux.HandleFunc("GET /api/users", a.requireAdmin(a.handleListUsers))
@@ -144,6 +152,7 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/events/{id}/results", a.requireAdmin(a.handleSetResults))
 	mux.HandleFunc("GET /api/events/{id}/projection", a.requireAuth(a.handleProjection))
 	mux.HandleFunc("POST /api/events/{id}/projection/refresh", a.requireAdmin(a.handleRefreshScores))
+	mux.HandleFunc("POST /api/events/{id}/odds/refresh", a.requireAdmin(a.handleRefreshOdds))
 	mux.HandleFunc("GET /api/events/{id}/payouts", a.requireAdmin(a.handlePayouts))
 	mux.HandleFunc("GET /api/football/fixtures", a.requireAdmin(a.handleFixtureSearch))
 	mux.HandleFunc("GET /api/football/fixtures/day", a.requireAdmin(a.handleFixturesByDate))
@@ -187,6 +196,12 @@ func (a *App) ensureIndexes() error {
 		return err
 	}
 	_, err = a.sessions.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.M{"expiresAt": 1}, Options: options.Index().SetExpireAfterSeconds(0)})
+	if err != nil {
+		return err
+	}
+	_, err = a.reductions.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "owner", Value: 1}, {Key: "eventId", Value: 1}, {Key: "createdAt", Value: -1}},
+	})
 	return err
 }
 
@@ -216,6 +231,8 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"defaultGameCount":    defaultGameCount,
 		"defaultTiers":        defaultTiers(defaultGameCount),
 		"houseCutPercent":     houseCutPercent,
+		"leagueCutPercent":    leagueCutPercent,
 		"tierPercentTotal":    tierPercentTotal,
+		"leagueTierPercent":   100,
 	})
 }

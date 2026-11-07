@@ -59,7 +59,8 @@ func testApp(t *testing.T, db *mongo.Database) *App {
 		payments: db.Collection("payments"),
 		rollover: db.Collection("rollover"),
 		reveals:  db.Collection("reveals"),
-		sessions: db.Collection("sessions"),
+		sessions:   db.Collection("sessions"),
+		reductions: db.Collection("reductions"),
 		verifyRecoveryPayment: func(context.Context, string, string, string, uint64, string) error {
 			return nil
 		},

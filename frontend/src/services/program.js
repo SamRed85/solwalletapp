@@ -2,6 +2,7 @@ import { ed25519 } from '@noble/curves/ed25519'
 import { sha256 } from '@noble/hashes/sha256'
 import { base58Decode, base58Encode, getAccount, getProgramAccounts, latestBlockhash, signAndSendTransaction } from './solana.js'
 import { slipZero } from './slipTree.js'
+import { keptCounts } from '../utils/reduce.js'
 
 export const PROGRAM_ID = 'AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX'
 export const SYSTEM_PROGRAM = '11111111111111111111111111111111'
@@ -96,12 +97,35 @@ export function signersPda (event) {
   return findPda([text('signers'), base58Decode(event, 32)])
 }
 
+export function kindsPda (admin) {
+  return findPda([text('schedule-kinds'), base58Decode(admin, 32)])
+}
+
+export function leaguePda () {
+  return findPda([text('league')])
+}
+
+export function radPda (owner) {
+  return findPda([text('rad'), base58Decode(owner, 32)])
+}
+
 export function escrowPda (admin) {
   return findPda([text('rollover-escrow'), base58Decode(admin, 32)])
 }
 
 export function couponCommitment (player, picks, nonce) {
   return sha256(concat([base58Decode(player, 32), picks, u64(nonce)]))
+}
+
+// Ten bytes per color: the sign bits, then min, then max. `signs` may be a BigInt or a decimal string.
+export function colorsBytes (colors = []) {
+  return concat(colors.map(color => concat([u64(color.signs), Uint8Array.of(color.min, color.max)])))
+}
+
+// A slip with no colors commits exactly as a coupon did before colors existed.
+export function slipCommitment (player, picks, nonce, colorBytes = new Uint8Array(0)) {
+  if (!colorBytes.length) return couponCommitment(player, picks, nonce)
+  return sha256(concat([base58Decode(player, 32), picks, u64(nonce), text('colors-v1'), colorBytes]))
 }
 
 export function picksFromSystem (system) {
@@ -134,17 +158,23 @@ export function vaultSchedule (event) {
   return { deadline, revealDeadline: endTime, endTime, resolveTimeout: endTime + RESOLVE_WINDOW_SECONDS }
 }
 
-export function createEventIx ({ admin, other, nonce, deadline, revealDeadline, endTime, resolveTimeout, gameCount = 7, price = 1_000_000, tiers }) {
+export const DEFAULT_MIN_ROWS = 1
+export const DEFAULT_MAX_COUPONS = 250_000
+export const HARD_MAX_COUPONS = 1_000_000
+
+export function createEventIx ({ admin, other, nonce, deadline, revealDeadline, endTime, resolveTimeout, gameCount = 7, price = 1_000_000, tiers, league = false, minRows = DEFAULT_MIN_ROWS, maxCoupons = DEFAULT_MAX_COUPONS }) {
   const event = eventPda(admin, nonce)
-  const prizeTiers = tiers?.length ? tiers : [{ correct: gameCount, percent: 95 }]
+  const prizeTiers = tiers?.length ? tiers : [{ correct: gameCount, percent: league ? 100 : 90 }]
   const data = concat([
     u64(nonce), Uint8Array.of(gameCount), u64(price), u64(deadline), u64(revealDeadline), u64(endTime ?? revealDeadline), u64(resolveTimeout ?? revealDeadline + 10_000),
     Uint8Array.of(2), u32(2), base58Decode(admin, 32), base58Decode(other, 32),
-    u32(prizeTiers.length), Uint8Array.from(prizeTiers.flatMap(tier => [tier.correct, tier.percent]))
+    u32(prizeTiers.length), Uint8Array.from(prizeTiers.flatMap(tier => [tier.correct, tier.percent])),
+    Uint8Array.of(league ? 1 : 0), u32(minRows), u32(maxCoupons)
   ])
   return ix('create_event', [
     signer(admin, true), writable(event), writable(vaultPda(event)), writable(escrowPda(admin)),
-    writable(schedulePda(admin)), writable(signersPda(event)), writable(gatePda(admin)), readonly(SYSTEM_PROGRAM)
+    writable(schedulePda(admin)), writable(signersPda(event)), writable(gatePda(admin)),
+    writable(kindsPda(admin)), writable(leaguePda()), readonly(SYSTEM_PROGRAM)
   ], data)
 }
 
@@ -153,7 +183,7 @@ export function placeCouponIx ({ player, admin, nonce, index, commitment, combin
   if (sealed.length !== SEALED_LEN) throw new Error('The sealed coupon backup has the wrong size')
   return ix('place_coupon', [
     signer(player, true), writable(event), writable(vaultPda(event)), writable(couponPda(event, index)),
-    readonly(gatePda(admin)), readonly(SYSTEM_PROGRAM)
+    readonly(gatePda(admin)), writable(radPda(player)), readonly(SYSTEM_PROGRAM)
   ], concat([commitment, u32(combinations), sealed]))
 }
 
@@ -167,7 +197,8 @@ export function revealCouponIx ({ player, admin, nonce, index, picks, revealNonc
 }
 
 const approveAccounts = (signerKey, admin, event) => [
-  signer(signerKey, false), writable(event), readonly(signersPda(event)), writable(schedulePda(admin))
+  signer(signerKey, false), writable(event), readonly(signersPda(event)), writable(schedulePda(admin)),
+  writable(kindsPda(admin)), writable(vaultPda(event)), writable(leaguePda())
 ]
 
 // results is a string such as "1X21C11": one of 1, X, 2 or C (void) per game.
@@ -183,7 +214,8 @@ export function approveCancelIx ({ signer: signerKey, admin, event }) {
 
 export function tallyIx ({ admin, event, coupons }) {
   return ix('tally', [
-    writable(event), readonly(vaultPda(event)), writable(schedulePda(admin)), ...coupons.map(readonly)
+    writable(event), writable(vaultPda(event)), writable(schedulePda(admin)),
+    writable(kindsPda(admin)), writable(leaguePda()), ...coupons.map(readonly)
   ], new Uint8Array())
 }
 
@@ -192,7 +224,10 @@ export function computeBudgetIx (units) {
 }
 
 export function expireEventIx ({ caller, admin, event }) {
-  return ix('expire_event', [signer(caller, false), writable(event), writable(schedulePda(admin))], new Uint8Array())
+  return ix('expire_event', [
+    signer(caller, false), writable(event), writable(schedulePda(admin)),
+    writable(kindsPda(admin)), writable(vaultPda(event)), writable(leaguePda())
+  ], new Uint8Array())
 }
 
 export function setPauseIx ({ admin, paused }) {
@@ -209,13 +244,15 @@ export function withdrawHouseIx ({ admin, event }) {
 
 export function forwardRolloverIx ({ admin, source, destination }) {
   return ix('forward_rollover', [
-    writable(source), writable(vaultPda(source)), writable(destination), writable(vaultPda(destination)), writable(schedulePda(admin))
+    writable(source), writable(vaultPda(source)), writable(destination), writable(vaultPda(destination)),
+    writable(schedulePda(admin)), readonly(kindsPda(admin))
   ], new Uint8Array())
 }
 
 export function parkRolloverIx ({ admin, source }) {
   return ix('park_rollover', [
-    writable(source), writable(vaultPda(source)), writable(escrowPda(admin)), writable(schedulePda(admin))
+    writable(source), writable(vaultPda(source)), writable(escrowPda(admin)), writable(schedulePda(admin)),
+    readonly(kindsPda(admin)), writable(leaguePda())
   ], new Uint8Array())
 }
 
@@ -264,7 +301,13 @@ export function decodeEvent (data) {
     proposalResults: ascii(data.slice(291, 291 + gameCount)),
     approvals: data[304],
     tallied: v.getUint32(305, true),
-    winners
+    winners,
+    league: data.length > 421 && data[421] === 1,
+    leagueCut: data.length >= 430 ? v.getBigUint64(422, true) : 0n,
+    // Zero means the account was created before these limits. The program then requires 1 row
+    // and allows the tree cap of 2^20 coupons.
+    minRows: data.length >= 434 ? v.getUint32(430, true) : 0,
+    maxCoupons: data.length >= 438 ? v.getUint32(434, true) : 0
   }
 }
 
@@ -306,6 +349,13 @@ export function decodeSchedule (data) {
     entries.push({ event: base58Encode(data.slice(at, at + 32)), deadline: Number(v.getBigInt64(at + 32, true)) })
   }
   return { entries }
+}
+
+export async function fetchRad (rpcUrl, owner) {
+  const data = await getAccount(rpcUrl, radPda(owner))
+  if (!data || data.length < 8 + 32 + 16) return { balance: 0n, lifetime: 0n }
+  const v = view(data)
+  return { balance: v.getBigUint64(40, true), lifetime: v.getBigUint64(48, true) }
 }
 
 export async function fetchEvent (rpcUrl, address) {
@@ -351,6 +401,16 @@ export async function couponCount (rpcUrl, eventAddress) {
   return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(COUPON_COUNT_OFFSET, true)
 }
 
+// count is the coupons already placed. A zero limit is an event created before limits existed.
+export async function couponCapacity (rpcUrl, eventAddress) {
+  const event = decodeEvent(await getAccount(rpcUrl, eventAddress))
+  return {
+    count: event.couponCount,
+    minRows: event.minRows || DEFAULT_MIN_ROWS,
+    maxCoupons: event.maxCoupons || (1 << 20)
+  }
+}
+
 export function systemFromPicks (picks, gameCount) {
   return [...picks.slice(0, gameCount)].map(mask => ['1', 'X', '2'].filter((_, bit) => mask & (1 << bit)).join(''))
 }
@@ -379,7 +439,8 @@ const popcount = mask => (mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1)
 // Best row and the prize tiers this coupon actually hit. `each` is the payout of one row at that tier.
 export function couponScore (coupon, event) {
   if (!coupon?.revealed || event?.status !== 'resolved' || !event.results) return null
-  const counts = correctCounts(coupon.picks, event.results.slice(0, coupon.gameCount))
+  const results = event.results.slice(0, coupon.gameCount)
+  const counts = coupon.colors?.length ? keptCounts(coupon.picks, coupon.colors, results) : correctCounts(coupon.picks, results)
   let best = 0
   for (let score = counts.length - 1; score > 0; score--) {
     if (counts[score]) {
@@ -481,30 +542,34 @@ function proofBytes (proof) {
   return concat([u32(compact.length), ...compact])
 }
 
-function revealArg ({ index, owner, combinations, picks, revealNonce, commitment }) {
+function revealArg ({ index, owner, combinations, picks, revealNonce, commitment, colors = new Uint8Array(0) }) {
   const padded = new Uint8Array(13)
   padded.set(picks.subarray(0, 13))
-  return concat([u32(index), base58Decode(owner, 32), u32(combinations), padded, u64(revealNonce), commitment])
+  return concat([
+    u32(index), base58Decode(owner, 32), u32(combinations), padded, u64(revealNonce), commitment,
+    u32(colors.length / 10), colors
+  ])
 }
 
 export function placeSlipIx ({ player, admin, nonce, commitment, combinations, proof }) {
   const event = eventPda(admin, nonce)
   return ix('place_slip', [
     signer(player, true), writable(event), writable(vaultPda(event)), writable(slipsPda(event)),
-    readonly(gatePda(admin)), readonly(SYSTEM_PROGRAM)
+    readonly(gatePda(admin)), writable(radPda(player)), readonly(SYSTEM_PROGRAM)
   ], concat([commitment, u32(combinations), proofBytes(proof)]))
 }
 
-export function revealSlipIx ({ caller, admin, nonce, index, owner, combinations, picks, revealNonce, commitment, proof }) {
+export function revealSlipIx ({ caller, admin, nonce, index, owner, combinations, picks, revealNonce, commitment, colors, proof }) {
   const event = eventPda(admin, nonce)
   return ix('reveal_slip', [
     signer(caller, false), readonly(event), writable(slipsPda(event))
-  ], concat([revealArg({ index, owner, combinations, picks, revealNonce, commitment }), proofBytes(proof)]))
+  ], concat([revealArg({ index, owner, combinations, picks, revealNonce, commitment, colors }), proofBytes(proof)]))
 }
 
 export function scoreSlipIx ({ caller, admin, event, reveal, revealed, entryProof, revealProof, scoredProof }) {
   return ix('score_slip', [
-    signer(caller, false), writable(event), readonly(vaultPda(event)), writable(slipsPda(event)), writable(schedulePda(admin))
+    signer(caller, false), writable(event), writable(vaultPda(event)), writable(slipsPda(event)), writable(schedulePda(admin)),
+    writable(kindsPda(admin)), writable(leaguePda())
   ], concat([
     revealArg(reveal), Uint8Array.of(revealed ? 1 : 0),
     proofBytes(entryProof), proofBytes(revealProof), proofBytes(scoredProof)
@@ -521,7 +586,8 @@ export function claimSlipIx ({ owner, admin, nonce, reveal, entryProof, revealPr
 export function refundSlipIx ({ owner, admin, nonce, index, combinations, commitment, entryProof, refundProof }) {
   const event = eventPda(admin, nonce)
   return ix('refund_slip', [
-    signer(owner, true), readonly(event), writable(vaultPda(event)), writable(slipsPda(event))
+    signer(owner, true), readonly(event), writable(vaultPda(event)), writable(slipsPda(event)),
+    writable(radPda(owner)), readonly(SYSTEM_PROGRAM)
   ], concat([u32(index), u32(combinations), commitment, proofBytes(entryProof), proofBytes(refundProof)]))
 }
 

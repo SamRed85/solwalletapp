@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Publish target/deploy/predictions.so to devnet when the deployer already has SOL.
-# Does not request an airdrop. The deployer key then creates the upgrade council.
+# Does not request an airdrop. The deployer key stays the upgrade authority.
 set -euo pipefail
 export PATH="/root/.local/share/solana/install/active_release/bin:/usr/local/cargo/bin:${PATH}"
 url="https://api.devnet.solana.com"
@@ -37,17 +37,9 @@ solana program deploy /app/target/deploy/predictions.so \
   --url "${url}" \
   --commitment confirmed
 
-# The council PDA is seeds [b"upgrade-council"]. It cannot sign this handoff.
-# After this, only execute_upgrade can replace the program. The devnet build waits five
-# minutes, with a test-only override that requires every council member to sign.
-solana program set-upgrade-authority "${program}" \
-  --new-upgrade-authority D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt \
-  --skip-new-upgrade-authority-signer-check \
-  --keypair /app/keys/deployer-keypair.json \
-  --url "${url}" \
-  --commitment confirmed
-
+# The upgrade authority stays with the deployer key. Handing it to the council PDA would
+# freeze the program: a program cannot upgrade itself (PrivilegeEscalation).
 if [[ ! -f /app/keys/council-signer.json ]]; then
   solana-keygen new --no-bip39-passphrase --force -o /app/keys/council-signer.json >/dev/null 2>&1
 fi
-echo "program published; the council transaction is sent by finish-devnet.mjs --council"
+echo "program published; the deployer key is still the upgrade authority"

@@ -461,15 +461,27 @@ func (a *App) resolutionTransaction(ctx context.Context, signer ed25519.PrivateK
 	if err != nil {
 		return nil, err
 	}
+	kinds, err := findPDA([][]byte{[]byte("schedule-kinds"), adminKey}, program)
+	if err != nil {
+		return nil, err
+	}
+	vault, err := findPDA([][]byte{[]byte("vault"), eventKey}, program)
+	if err != nil {
+		return nil, err
+	}
+	league, err := findPDA([][]byte{[]byte("league")}, program)
+	if err != nil {
+		return nil, err
+	}
 	hash, err := a.rpc.latestBlockhash(ctx)
 	if err != nil {
 		return nil, err
 	}
 	data := append(ixDisc("approve_resolution"), putU32(uint32(len(results)))...)
 	data = append(data, results...)
-	// 0 signer, 1 event, 2 schedule, 3 signers, 4 program.
-	return signLegacy(signer, [][]byte{eventKey, schedule}, [][]byte{signers, program}, []ixSpec{{
-		program: 4, accounts: []int{0, 1, 3, 2}, data: data,
+	// 0 signer, 1 event, 2 schedule, 3 kinds, 4 vault, 5 league, 6 signers, 7 program.
+	return signLegacy(signer, [][]byte{eventKey, schedule, kinds, vault, league}, [][]byte{signers, program}, []ixSpec{{
+		program: 7, accounts: []int{0, 1, 6, 2, 3, 4, 5}, data: data,
 	}}, hash)
 }
 

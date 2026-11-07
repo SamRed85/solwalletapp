@@ -1,5 +1,5 @@
 <template>
-  <div v-if="projection?.revealClosed" class="mt-3">
+  <div v-if="show" class="mt-3">
     <div class="text-subtitle-2">If these scores stand</div>
     <div v-if="!projection.complete" class="text-caption text-medium-emphasis">
       {{ waiting }}
@@ -18,14 +18,16 @@
 <script setup>
 import { computed } from 'vue'
 import CouponScore from '@/components/CouponScore.vue'
-import { projectCoupon } from '@/services/projection'
+import { projectCoupon, showStandingPayout } from '@/services/projection'
 
 const props = defineProps({
   system: { type: Array, default: () => [] },
+  colors: { type: Array, default: () => [] },
   projection: { type: Object, default: null }
 })
 
-const view = computed(() => projectCoupon(props.system, props.projection))
+const show = computed(() => showStandingPayout(props.projection))
+const view = computed(() => projectCoupon(props.system, props.projection, props.colors))
 const waiting = computed(() => {
   if (props.projection?.games?.some(game => !game.linked)) return 'A match is not linked to a live score, so this payout cannot be shown.'
   return 'The payout appears once every match has a score.'

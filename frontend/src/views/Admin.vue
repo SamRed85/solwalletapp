@@ -109,13 +109,17 @@
               v-if="!isSpecial" v-model="newEvent.customRules" label="Custom price and prize tiers"
               color="primary" density="compact" hide-details class="mt-2" @update:model-value="resetTiers"
             />
-            <template v-if="isSpecial || newEvent.customRules">
+            <v-checkbox v-model="newEvent.league" label="League event, entered with RAD" density="compact" hide-details class="mt-2" @update:model-value="resetTiers" />
+            <div v-if="newEvent.league" class="text-caption text-medium-emphasis mb-2">
+              Players spend RAD. The prize is the SOL already collected in the league vault, and an unwon jackpot feeds the next league event.
+            </div>
+            <template v-if="isSpecial || newEvent.customRules || newEvent.league">
               <v-text-field
-                v-model.number="newEvent.priceSol" label="Coupon price (SOL)" type="number" step="0.001" min="0" class="mt-4"
-                :rules="[v => (v > 0 && v <= 10) || 'Between 0 and 10 SOL']"
+                v-model.number="newEvent.priceSol" :label="newEvent.league ? 'Coupon price (RAD)' : 'Coupon price (SOL)'" type="number" :step="newEvent.league ? 1 : 0.001" min="0" class="mt-4"
+                :rules="[newEvent.league ? v => (v >= 1 && v <= 1000) || 'Between 1 and 1000 RAD' : v => (v > 0 && v <= 10) || 'Between 0 and 10 SOL']"
               />
               <div class="text-subtitle-2 mb-2">
-                Prize tiers ({{ tierTotal }}% of {{ config?.tierPercentTotal ?? 95 }}% allocated, the house keeps {{ config?.houseCutPercent ?? 5 }}%)
+                Prize tiers ({{ tierTotal }}% of {{ newEvent.league ? 100 : (config?.tierPercentTotal ?? 90) }}% allocated<span v-if="!newEvent.league">, the house keeps {{ config?.houseCutPercent ?? 5 }}% and the league vault keeps {{ config?.leagueCutPercent ?? 5 }}%</span>)
               </div>
               <v-row v-for="(tier, index) in newEvent.tiers" :key="index" dense align="center">
                 <v-col cols="5">
@@ -146,6 +150,16 @@
             <v-text-field
               v-model="newEvent.endTime" label="End time" type="datetime-local"
               :rules="[required, v => new Date(v) > new Date(newEvent.startTime) || 'Must be after start time']"
+            />
+            <v-text-field
+              v-model.number="newEvent.minRows" label="Minimum rows per coupon" type="number" min="1" max="44000" step="1"
+              :rules="[v => Number.isInteger(v) && v >= 1 && v <= 44000 || 'Between 1 and 44,000 rows']"
+              hint="A coupon with fewer kept rows is refused. Raise this as the app grows." persistent-hint
+            />
+            <v-text-field
+              v-model.number="newEvent.maxCoupons" label="Maximum coupons" type="number" min="1" max="1000000" step="1"
+              :rules="[v => Number.isInteger(v) && v >= 1 && v <= 1000000 || 'Between 1 and 1,000,000 coupons']"
+              hint="The event stops taking entries at this many coupons. The default is 250,000." persistent-hint
             />
             <v-checkbox v-model="newEvent.autoResolve" label="Auto resolve" density="compact" hide-details class="mt-2" />
             <div class="text-caption text-medium-emphasis mb-2">
@@ -283,6 +297,7 @@
           <p><strong>Start (entries close):</strong> {{ formatDate(details.startTime) }}</p>
           <p><strong>End:</strong> {{ formatDate(details.endTime) }}</p>
           <p><strong>Coupon price:</strong> {{ formatSol(details.couponPriceLamports) }} · <strong>Coupons sold:</strong> {{ details.couponsSold }}</p>
+          <p><strong>Minimum rows:</strong> {{ details.minRows || 1 }} · <strong>Maximum coupons:</strong> {{ (details.maxCoupons || 1048576).toLocaleString() }}</p>
           <p><strong>Tiers:</strong> {{ details.tiers.map(t => `${t.correct} correct ${t.percent}%`).join(', ') }}</p>
           <p v-if="details.rolloverInLamports"><strong>Rollover received:</strong> {{ formatSol(details.rolloverInLamports) }}</p>
           <p class="mb-4"><strong>Created by:</strong> <code>{{ details.createdBy }}</code></p>
@@ -404,14 +419,14 @@ const defaultGameCount = computed(() => config.value?.defaultGameCount ?? 13)
 const isSpecial = computed(() => newEvent.value.gameCount !== defaultGameCount.value)
 const tierTotal = computed(() => (newEvent.value.tiers ?? []).reduce((sum, t) => sum + (Number(t.percent) || 0), 0))
 const tierError = computed(() => {
-  if (!isSpecial.value && !newEvent.value.customRules) return ''
+  if (!isSpecial.value && !newEvent.value.customRules && !newEvent.value.league) return ''
   const tiers = newEvent.value.tiers ?? []
   const counts = tiers.map(t => t.correct)
   if (tiers.some(t => !(t.correct >= 1 && t.correct <= newEvent.value.gameCount))) return 'Correct picks must be between 1 and the number of games'
   if (tiers.some(t => !Number.isInteger(t.correct) || !Number.isInteger(t.percent))) return 'Correct picks and percentages must be whole numbers'
   if (new Set(counts).size !== counts.length) return 'Each number of correct picks can only appear once'
   if (tiers.some(t => !(t.percent >= 1))) return 'Every tier needs a positive percentage'
-  const target = config.value?.tierPercentTotal ?? 95
+  const target = newEvent.value.league ? 100 : (config.value?.tierPercentTotal ?? 90)
   if (tierTotal.value !== target) return `Tiers must add up to ${target}%`
   return ''
 })
@@ -419,6 +434,13 @@ const tierError = computed(() => {
 // Standard split (50/25/15/5) shifted to the chosen number of games; the admin can adjust it.
 function resetTiers () {
   const n = newEvent.value.gameCount
+  if (newEvent.value.league) {
+    newEvent.value.priceSol = 1
+    newEvent.value.tiers = n >= 10
+      ? [{ correct: n, percent: 50 }, { correct: n - 1, percent: 25 }, { correct: n - 2, percent: 15 }, { correct: n - 3, percent: 10 }]
+      : [{ correct: n, percent: 100 }]
+    return
+  }
   const percents = (config.value?.defaultTiers ?? []).map(t => t.percent)
   newEvent.value.tiers = percents.map((percent, i) => ({ correct: n - i, percent })).filter(t => t.correct > 0)
 }
@@ -496,7 +518,10 @@ async function publishVault (item) {
           ...schedule,
           gameCount: item.gameCount,
           price: item.couponPriceLamports,
-          tiers: item.tiers
+          tiers: item.tiers,
+          league: !!item.league,
+          minRows: item.minRows || 1,
+          maxCoupons: item.maxCoupons || 250_000
         })
       ])
       await waitForConfirmation(rpcUrl, sent.signature, sent.lastValidBlockHeight)
@@ -565,23 +590,32 @@ async function openCreate () {
     startTime: '',
     endTime: '',
     customRules: false,
+    league: false,
     priceSol: config.value.couponPriceLamports / 1e9,
-    tiers: []
+    tiers: [],
+    minRows: 1,
+    maxCoupons: 250000
   }
   resetTiers()
   createDialog.value = true
 }
 
 function createEvent () {
-  const { title, description, gameCount, startTime, endTime, customRules, priceSol, tiers } = newEvent.value
+  const { title, description, gameCount, startTime, endTime, customRules, league, priceSol, tiers } = newEvent.value
   const body = {
     title,
     description,
     gameCount: Math.round(Number(gameCount)),
+    minRows: Math.round(Number(newEvent.value.minRows)),
+    maxCoupons: Math.round(Number(newEvent.value.maxCoupons)),
     startTime: new Date(startTime).toISOString(),
-    endTime: new Date(endTime).toISOString()
+    endTime: new Date(endTime).toISOString(),
+    league: !!league
   }
-  if (isSpecial.value || customRules) {
+  if (league) {
+    body.couponPriceLamports = Math.round(Number(priceSol))
+    body.tiers = tiers.map(t => ({ correct: Math.round(Number(t.correct)), percent: Math.round(Number(t.percent)) }))
+  } else if (isSpecial.value || customRules) {
     body.couponPriceLamports = Math.round(priceSol * 1e9)
     // Tiers are int fields on the backend: round defensively in case a tier was left
     // with a fractional percent/correct value (e.g. while rebalancing payouts).

@@ -229,12 +229,24 @@ func (a *App) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
+	minRows, maxCoupons := e.entryLimits()
+	if combinations < minRows {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("a coupon on this event needs at least %d rows", minRows))
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	if n, _ := a.entries.CountDocuments(ctx, bson.M{"signature": req.Signature}); n > 0 {
 		writeError(w, http.StatusConflict, "this payment has already been used")
+		return
+	}
+	if n, err := a.entries.CountDocuments(ctx, bson.M{"eventId": e.ID}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to count coupons")
+		return
+	} else if n >= int64(maxCoupons) {
+		writeError(w, http.StatusConflict, fmt.Sprintf("this event is full at %d coupons", maxCoupons))
 		return
 	}
 

@@ -27,6 +27,7 @@ type slipRecord struct {
 	Combinations uint32 `bson:"combinations" json:"combinations"`
 	Commitment   string `bson:"commitment" json:"commitment"`
 	Picks        string `bson:"picks,omitempty" json:"picks,omitempty"`
+	Colors       string `bson:"colors,omitempty" json:"colors,omitempty"`
 	Signature    string `bson:"signature" json:"signature"`
 }
 
@@ -59,13 +60,20 @@ func parseSlipLog(line string) (slipRecord, bool) {
 		}
 		record.Kind = "entry"
 	case "reveal-v1":
-		if len(parts) != 6 {
+		if len(parts) != 6 && len(parts) != 7 {
 			return slipRecord{}, false
 		}
 		record.Kind = "reveal"
 		record.Picks = parts[5]
 		if _, err := hex.DecodeString(record.Picks); err != nil || len(record.Picks)%2 != 0 {
 			return slipRecord{}, false
+		}
+		if len(parts) == 7 {
+			colors, err := parseColorHex(parts[6])
+			if err != nil || len(colors) == 0 {
+				return slipRecord{}, false
+			}
+			record.Colors = parts[6]
 		}
 	case "score-v1", "claim-v1", "refund-v1":
 		if len(parts) != 2 {

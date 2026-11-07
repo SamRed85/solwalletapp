@@ -26,6 +26,8 @@ type Config struct {
 	ProgramID           string
 	ResultCosigner      string
 	APIFootballKey      string
+	// OddsBookmakerID is the API-Football bookmaker used for every game. 8 is Bet365.
+	OddsBookmakerID int
 }
 
 const defaultWallet = "4tyf8awFN919MwuhDs7AkPN4gY6RJNawSwqisK3dcHdy"
@@ -44,6 +46,11 @@ func loadConfig() Config {
 		AdminWallets:   map[string]bool{},
 	}
 	cfg.APIFootballKey = chooseAPIFootballKey(footballAPIKeys())
+	bookmaker, err := strconv.Atoi(env("ODDS_BOOKMAKER", "8"))
+	if err != nil || bookmaker <= 0 {
+		log.Fatal("ODDS_BOOKMAKER must be the API-Football bookmaker id, for example 8 for Bet365")
+	}
+	cfg.OddsBookmakerID = bookmaker
 	if strings.Contains(env("ADMIN_WALLETS", defaultWallet), cfg.ResultCosigner) {
 		log.Fatal("RESULT_COSIGNER must not be an admin wallet: an admin would then hold both result keys")
 	}

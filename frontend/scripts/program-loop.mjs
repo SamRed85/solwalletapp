@@ -109,7 +109,8 @@ for (let attempt = 0; attempt < 60; attempt++) {
 }
 
 const council = findPda([new TextEncoder().encode('upgrade-council')])
-if (council !== 'D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt') {
+// The council address follows the program id. This is the one for AaXABVJE...
+if (council !== 'EKQ7HANAWg8hz9zyM15rJErjiY2EcTb7WvdTEcttcx9w') {
   throw new Error(`PDA derivation drifted: ${council}`)
 }
 
@@ -157,7 +158,7 @@ const eventData = await account(event)
 const settled = decodeEvent(eventData)
 const house = settled.house
 const perWinner = settled.perWinner[6]
-if (settled.status !== 'resolved' || perWinner !== 190_000_000n || house !== 10_000_000n) {
+if (settled.status !== 'resolved' || perWinner !== 180_000_000n || house !== 10_000_000n) {
   throw new Error(`unexpected settlement perWinner=${perWinner} house=${house}`)
 }
 

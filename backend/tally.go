@@ -169,13 +169,21 @@ func (a *App) scoreTransaction(ctx context.Context, admin, eventAddress string, 
 	if err != nil {
 		return nil, err
 	}
+	kinds, err := findPDA([][]byte{[]byte("schedule-kinds"), adminKey}, program)
+	if err != nil {
+		return nil, err
+	}
+	league, err := findPDA([][]byte{[]byte("league")}, program)
+	if err != nil {
+		return nil, err
+	}
 	hash, err := a.rpc.latestBlockhash(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// 0 keeper, 1 event, 2 slips, 3 schedule, 4 vault, 5 program.
-	return signLegacy(a.keeper, [][]byte{eventKey, slips, schedule}, [][]byte{vault, program}, []ixSpec{{
-		program: 5, accounts: []int{0, 1, 4, 2, 3}, data: data,
+	// 0 keeper, 1 event, 2 vault, 3 slips, 4 schedule, 5 kinds, 6 league, 7 program.
+	return signLegacy(a.keeper, [][]byte{eventKey, vault, slips, schedule, kinds, league}, [][]byte{program}, []ixSpec{{
+		program: 7, accounts: []int{0, 1, 2, 3, 4, 5, 6}, data: data,
 	}}, hash)
 }
 
@@ -203,12 +211,18 @@ func scoreSlipData(index uint32, view slipArchiveView) ([]byte, error) {
 		}
 	}
 	picks := make([]byte, 13)
+	var colors []byte
 	if revealed != nil {
 		raw, err := hex.DecodeString(revealed.Picks)
 		if err != nil {
 			return nil, errors.New("the stored picks are invalid")
 		}
 		copy(picks, raw)
+		parsed, err := parseColorHex(revealed.Colors)
+		if err != nil {
+			return nil, err
+		}
+		colors = colorsBytes(parsed)
 	}
 	entryProof := compactProof(sparseProof(entryNodes(view.Entries), index))
 	revealProof := compactProof(sparseProof(revealNodes(view.Reveals), index))
@@ -224,6 +238,7 @@ func scoreSlipData(index uint32, view slipArchiveView) ([]byte, error) {
 	data = append(data, picks...)
 	data = append(data, putU64(0)...)
 	data = append(data, commitment...)
+	data = append(data, colorsArg(colors)...)
 	if revealed != nil {
 		data = append(data, 1)
 	} else {
@@ -260,7 +275,8 @@ func revealNodes(reveals []slipRecord) [][]byte {
 		owner, err := base58Decode(reveal.Owner)
 		commitment, err2 := hex.DecodeString(reveal.Commitment)
 		picks, err3 := hex.DecodeString(reveal.Picks)
-		if err != nil || err2 != nil || err3 != nil || len(owner) != 32 || len(commitment) != 32 {
+		colors, err4 := hex.DecodeString(reveal.Colors)
+		if err != nil || err2 != nil || err3 != nil || err4 != nil || len(owner) != 32 || len(commitment) != 32 {
 			continue
 		}
 		padded := make([]byte, 13)
@@ -268,7 +284,7 @@ func revealNodes(reveals []slipRecord) [][]byte {
 		for int(reveal.Index) >= len(nodes) {
 			nodes = append(nodes, nil)
 		}
-		nodes[reveal.Index] = slipRevealLeaf(reveal.Index, owner, reveal.Combinations, commitment, padded)
+		nodes[reveal.Index] = slipRevealLeaf(reveal.Index, owner, reveal.Combinations, commitment, padded, colors)
 	}
 	return nodes
 }

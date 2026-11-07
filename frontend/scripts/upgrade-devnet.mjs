@@ -9,16 +9,26 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ed25519 } from '@noble/curves/ed25519'
 import { base58Decode, base58Encode } from '../src/services/solana.js'
-import { compileMessage, PROGRAM_ID } from '../src/services/program.js'
+import { compileMessage, findPda, PROGRAM_ID } from '../src/services/program.js'
 
-const ENDPOINTS = [process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com']
+function configuredRpc () {
+  if (process.env.SOLANA_RPC_URL) return process.env.SOLANA_RPC_URL
+  const envPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../.env')
+  if (!existsSync(envPath)) return ''
+  const line = readFileSync(envPath, 'utf8').split(/\r?\n/).find(item => item.startsWith('SOLANA_RPC_URL='))
+  if (!line) return ''
+  return line.slice('SOLANA_RPC_URL='.length).trim().replace(/^["']|["']$/g, '')
+}
+
+const PUBLIC_RPC = 'https://api.devnet.solana.com'
+const ENDPOINTS = [configuredRpc() || PUBLIC_RPC]
 const LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111'
 const SYSTEM = '11111111111111111111111111111111'
 const RENT = 'SysvarRent111111111111111111111111111111111'
 const CLOCK = 'SysvarC1ock11111111111111111111111111111111'
 const DEPLOYER = '955GUT5WguA7BJr1J9JVzRnSkqr1uszy2yHGBCz6Adun'
 const COUNCIL_SIGNER = '4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH'
-const COUNCIL = 'D6e74RVzp1cTXKQb1UyCygJg17szm9uvphiKZTKfarpt'
+const COUNCIL = findPda([new TextEncoder().encode('upgrade-council')])
 const BUFFER_HEADER = 37
 const PROGRAM_DATA_HEADER = 45
 // Devnet rejects an ExtendProgram smaller than 10 KiB unless it reaches the account maximum.
@@ -84,9 +94,12 @@ function programDataAddress (program) {
 let endpoint = 0
 
 async function rpc (method, params) {
+  // The app RPC does not list the new buffer account, so account reads stay on the public devnet RPC.
+  // Sends and signature checks use the app RPC, which is the path previous upgrades used.
+  const urls = method === 'getAccountInfo' ? [PUBLIC_RPC] : ENDPOINTS
   let last
-  for (let attempt = 0; attempt < ENDPOINTS.length; attempt++) {
-    const url = ENDPOINTS[(endpoint + attempt) % ENDPOINTS.length]
+  for (let attempt = 0; attempt < urls.length; attempt++) {
+    const url = urls[(endpoint + attempt) % urls.length]
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -126,25 +139,37 @@ async function recentBlockhash () {
   return value.blockhash
 }
 
+async function confirm (signature) {
+  for (let check = 0; check < 40; check++) {
+    const status = (await rpc('getSignatureStatuses', [[signature]])).value[0]
+    if (status?.err) throw new Error(`transaction ${signature} failed: ${JSON.stringify(status.err)}`)
+    if (status?.confirmationStatus === 'processed' || status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') return signature
+    await sleep(200)
+  }
+  cachedHash = null
+  throw new Error(`transaction ${signature} was not confirmed`)
+}
+
 async function send (signers, ixList) {
   for (let attempt = 0; attempt < 8; attempt++) {
+    let signature
     try {
       const blockhash = await recentBlockhash()
       const transaction = signedTransaction(signers, ixList, blockhash)
-      const signature = await rpc('sendTransaction', [
+      signature = await rpc('sendTransaction', [
         Buffer.from(transaction).toString('base64'),
         { encoding: 'base64', skipPreflight: true, preflightCommitment: 'processed' }
       ])
-      for (let check = 0; check < 20; check++) {
-        const status = (await rpc('getSignatureStatuses', [[signature]])).value[0]
-        if (status?.err) throw new Error(`transaction ${signature} failed: ${JSON.stringify(status.err)}`)
-        if (status?.confirmationStatus) return signature
-        await sleep(400)
-      }
-      cachedHash = null
-      throw new Error(`transaction ${signature} was not confirmed`)
+      return await confirm(signature)
     } catch (error) {
       if (/blockhash/i.test(String(error))) cachedHash = null
+      if (signature && /not confirmed/.test(String(error))) {
+        try {
+          return await confirm(signature)
+        } catch (again) {
+          error = again
+        }
+      }
       if ((!limited(error) && !/not confirmed/.test(String(error))) || attempt === 7) throw error
       await sleep(800 * (attempt + 1))
     }
@@ -194,15 +219,9 @@ function extendProgramIx (additional) {
 }
 
 if (mode === '--probe') {
-  console.log(`probing execute_upgrade with program data ${programData}`)
-  console.log(`schedule ${await send(councilSigners, [scheduleIx(DEPLOYER)])}`)
-  console.log(`override ${await send(councilSigners, [overrideIx()])}`)
-  try {
-    console.log(`execute ${await send([deployer], [executeIx(DEPLOYER)])}`)
-  } catch (error) {
-    console.log(String(error.message).slice(0, 4000))
-  }
-  process.exit(0)
+  // The council was never created for this program id and cannot upgrade it anyway.
+  console.log('--probe is retired: the council cannot upgrade the program (PrivilegeEscalation). Use --upgrade.')
+  process.exit(1)
 }
 
 const programKey = loadKey('program-keypair.json', PROGRAM_ID)

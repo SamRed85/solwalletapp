@@ -14,7 +14,14 @@ const SIGNERS_SEED: &[u8] = b"signers";
 const GATE_SEED: &[u8] = b"gate";
 const UPGRADE_SEED: &[u8] = b"upgrade-council";
 const SLIP_SEED: &[u8] = b"slips";
+const LEAGUE_SEED: &[u8] = b"league";
+const RAD_SEED: &[u8] = b"rad";
+const KINDS_SEED: &[u8] = b"schedule-kinds";
+pub const KIND_SOL: u8 = 0;
+pub const KIND_LEAGUE: u8 = 1;
 const SLIP_DEPTH: usize = 20;
+/// An admin can cap an event lower. Coupon 1,000,001 is refused on every event.
+const HARD_MAX_COUPONS: u32 = 1_000_000;
 #[cfg(not(feature = "devnet-testing"))]
 const UPGRADE_DELAY: i64 = 24 * 60 * 60;
 #[cfg(feature = "devnet-testing")]
@@ -50,12 +57,16 @@ pub mod predictions {
         for (index, signer) in args.signers.iter().enumerate() {
             require!(args.signers[..index].iter().all(|prior| prior != signer), PredError::BadSigners);
         }
+        require!(args.kind == KIND_SOL || args.kind == KIND_LEAGUE, PredError::BadEvent);
+        require!(args.min_rows >= 1 && args.min_rows <= math::MAX_COMBINATIONS, PredError::BadEvent);
+        require!(args.max_coupons >= 1 && args.max_coupons <= HARD_MAX_COUPONS, PredError::BadEvent);
         let tiers: Vec<math::Tier> = args
             .tiers
             .iter()
             .map(|tier| math::Tier { correct: tier.correct, percent: tier.percent })
             .collect();
-        math::validate_tiers(&tiers, args.game_count).map_err(|_| error!(PredError::BadTiers))?;
+        let expected = if args.kind == KIND_LEAGUE { math::LEAGUE_TIER_TOTAL } else { math::SOL_TIER_TOTAL };
+        math::validate_tiers_total(&tiers, args.game_count, expected).map_err(|_| error!(PredError::BadTiers))?;
 
         let event = &mut ctx.accounts.event;
         event.admin = ctx.accounts.admin.key();
@@ -70,12 +81,17 @@ pub mod predictions {
         event.end_time = args.end_time;
         event.resolve_timeout = args.resolve_timeout;
         event.status = EventStatus::Open;
+        event.kind = args.kind;
+        event.min_rows = args.min_rows;
+        event.max_coupons = args.max_coupons;
         event.bump = ctx.bumps.event;
         event.vault_bump = ctx.bumps.vault;
         event.rent_reserve = ctx.accounts.vault.to_account_info().lamports();
         if ctx.accounts.escrow.rent_reserve == 0 {
             ctx.accounts.escrow.rent_reserve = ctx.accounts.escrow.to_account_info().lamports();
         }
+        let league_rent = ctx.accounts.league.to_account_info().lamports();
+        touch_league(&mut ctx.accounts.league, ctx.bumps.league, league_rent);
 
         let event_key = event.key();
         let signers = &mut ctx.accounts.signers;
@@ -89,9 +105,25 @@ pub mod predictions {
             ctx.accounts.gate.admin = ctx.accounts.admin.key();
             ctx.accounts.gate.bump = ctx.bumps.gate;
         }
-        schedule_insert(&mut ctx.accounts.schedule, event_key, args.deadline)?;
-        // Parked rollover belongs to the earliest event that has not started.
-        if earliest_future(&ctx.accounts.schedule, now) == Some(event_key) {
+        schedule_insert(&mut ctx.accounts.schedule, &mut ctx.accounts.kinds, event_key, args.deadline, args.kind)?;
+        if args.kind == KIND_LEAGUE {
+            // The collected pool is this event's sales. A parked jackpot is only the top tier.
+            let rent_reserve = ctx.accounts.league.rent_reserve;
+            let jackpot_now = ctx.accounts.league.jackpot;
+            let league_info = ctx.accounts.league.to_account_info();
+            let liquid = league_info.lamports().checked_sub(rent_reserve).ok_or(error!(PredError::InsufficientVault))?;
+            let jackpot = jackpot_now.min(liquid);
+            let skim = liquid.checked_sub(jackpot).ok_or(error!(PredError::Overflow))?;
+            if liquid > 0 {
+                transfer_from_vault(&league_info, &ctx.accounts.vault.to_account_info(), liquid, rent_reserve)?;
+            }
+            drop(league_info);
+            let event = &mut ctx.accounts.event;
+            event.sales = skim;
+            event.rollover_in = jackpot;
+            ctx.accounts.league.jackpot = 0;
+        } else if earliest_future(&ctx.accounts.schedule, &ctx.accounts.kinds, now, KIND_SOL) == Some(event_key) {
+            // Parked SOL rollover belongs to the earliest SOL event that has not started.
             let pending = ctx.accounts.escrow.pending;
             if pending > 0 {
                 transfer_from_vault(
@@ -100,7 +132,7 @@ pub mod predictions {
                     pending,
                     ctx.accounts.escrow.rent_reserve,
                 )?;
-                event.rollover_in = pending;
+                ctx.accounts.event.rollover_in = pending;
                 ctx.accounts.escrow.pending = 0;
             }
         }
@@ -112,9 +144,10 @@ pub mod predictions {
     pub fn place_coupon(ctx: Context<PlaceCoupon>, commitment: [u8; 32], combinations: u32, sealed: [u8; SEALED_LEN]) -> Result<()> {
         require!(!ctx.accounts.gate.paused, PredError::Paused);
         let event = &mut ctx.accounts.event;
+        require!(event.kind == KIND_SOL, PredError::BadEvent);
         require!(event.status == EventStatus::Open, PredError::BadStatus);
         require!(Clock::get()?.unix_timestamp < event.deadline, PredError::DeadlinePassed);
-        require!(combinations >= 1 && combinations <= math::MAX_COMBINATIONS, PredError::BadPicks);
+        require_entry_room(event, combinations)?;
         let cost = event.price.checked_mul(u64::from(combinations)).ok_or(error!(PredError::Overflow))?;
 
         system_program::transfer(
@@ -142,6 +175,7 @@ pub mod predictions {
 
         event.coupon_count = event.coupon_count.checked_add(1).ok_or(error!(PredError::Overflow))?;
         event.sales = event.sales.checked_add(cost).ok_or(error!(PredError::Overflow))?;
+        credit_rad(&mut ctx.accounts.rad, ctx.accounts.player.key(), combinations, ctx.bumps.rad)?;
         Ok(())
     }
 
@@ -191,7 +225,7 @@ pub mod predictions {
         }
         require!(book.event == event.key(), PredError::WrongEvent);
         require!(book.count == event.coupon_count, PredError::BadStatus);
-        require!(slip.combinations >= 1 && slip.combinations <= math::MAX_COMBINATIONS, PredError::BadPicks);
+        require_entry_room(event, slip.combinations)?;
         let index = book.count;
         require!(index < (1u32 << SLIP_DEPTH), PredError::TooManyCoupons);
 
@@ -204,18 +238,23 @@ pub mod predictions {
         book.count = book.count.checked_add(1).ok_or(error!(PredError::Overflow))?;
         let cost = event.price.checked_mul(u64::from(slip.combinations)).ok_or(error!(PredError::Overflow))?;
 
-        system_program::transfer(
-            CpiContext::new(
-                ctx.accounts.system_program.to_account_info(),
-                system_program::Transfer {
-                    from: ctx.accounts.player.to_account_info(),
-                    to: ctx.accounts.vault.to_account_info(),
-                },
-            ),
-            cost,
-        )?;
+        if event.kind == KIND_LEAGUE {
+            spend_rad(&mut ctx.accounts.rad, cost)?;
+        } else {
+            system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.to_account_info(),
+                    system_program::Transfer {
+                        from: ctx.accounts.player.to_account_info(),
+                        to: ctx.accounts.vault.to_account_info(),
+                    },
+                ),
+                cost,
+            )?;
+            event.sales = event.sales.checked_add(cost).ok_or(error!(PredError::Overflow))?;
+            credit_rad(&mut ctx.accounts.rad, owner, slip.combinations, ctx.bumps.rad)?;
+        }
         event.coupon_count = book.count;
-        event.sales = event.sales.checked_add(cost).ok_or(error!(PredError::Overflow))?;
         Ok(())
     }
 
@@ -228,19 +267,32 @@ pub mod predictions {
         require!(now >= event.deadline && now < event.reveal_deadline, PredError::RevealClosed);
         let book = &mut ctx.accounts.slips;
         require!(book.event == event.key(), PredError::WrongEvent);
-        check_reveal(&reveal, event.game_count)?;
+        check_reveal(&reveal, event.game_count, None)?;
         require!(reveal.index < book.count, PredError::MissingCoupon);
-        let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks);
+        let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks, &reveal.colors);
         write_leaf(&mut book.reveal_hash, reveal.index, &proof, &leaf)?;
-        msg!(
-            "reveal-v1:{}:{}:{}:{}:{}:{}",
-            event.key(),
-            reveal.index,
-            reveal.owner,
-            reveal.combinations,
-            hex_encode(&reveal.commitment),
-            hex_encode(&reveal.picks)
-        );
+        if reveal.colors.is_empty() {
+            msg!(
+                "reveal-v1:{}:{}:{}:{}:{}:{}",
+                event.key(),
+                reveal.index,
+                reveal.owner,
+                reveal.combinations,
+                hex_encode(&reveal.commitment),
+                hex_encode(&reveal.picks)
+            );
+        } else {
+            msg!(
+                "reveal-v1:{}:{}:{}:{}:{}:{}:{}",
+                event.key(),
+                reveal.index,
+                reveal.owner,
+                reveal.combinations,
+                hex_encode(&reveal.commitment),
+                hex_encode(&reveal.picks),
+                hex_encode(&colors_bytes(&reveal.colors))
+            );
+        }
         book.reveal_count = book.reveal_count.checked_add(1).ok_or(error!(PredError::Overflow))?;
         Ok(())
     }
@@ -264,9 +316,9 @@ pub mod predictions {
         let event_key_games = ctx.accounts.event.game_count;
         let results = ctx.accounts.event.results;
         if revealed {
-            let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks);
+            let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks, &reveal.colors);
             require_leaf(&book.reveal_hash, reveal.index, &leaf, &reveal_proof)?;
-            let counts = math::correct_counts(&reveal.picks[..event_key_games as usize], &results[..event_key_games as usize]).map_err(|_| error!(PredError::BadResults))?;
+            let counts = scored_rows(&reveal, event_key_games, &results[..event_key_games as usize])?;
             for (score, winner) in ctx.accounts.event.winners.iter_mut().enumerate() {
                 *winner = winner.checked_add(u64::from(counts[score])).ok_or(error!(PredError::Overflow))?;
             }
@@ -280,8 +332,9 @@ pub mod predictions {
         if event.tallied < event.coupon_count {
             return Ok(());
         }
-        apply_settlement(event, ctx.accounts.vault.to_account_info().lamports())?;
-        schedule_remove(&mut ctx.accounts.schedule, event.key())?;
+        let event_key = event.key();
+        apply_settlement(event, &ctx.accounts.vault.to_account_info(), &ctx.accounts.league.to_account_info())?;
+        schedule_remove(&mut ctx.accounts.schedule, &mut ctx.accounts.kinds, event_key)?;
         Ok(())
     }
 
@@ -300,12 +353,11 @@ pub mod predictions {
         let book = &mut ctx.accounts.slips;
         require!(book.event == event.key(), PredError::WrongEvent);
         require!(reveal.index < book.count, PredError::MissingCoupon);
-        check_reveal(&reveal, event.game_count)?;
-        require_leaf(&book.entry_hash, reveal.index, &slip_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment), &entry_proof)?;
-        let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks);
-        require_leaf(&book.reveal_hash, reveal.index, &leaf, &reveal_proof)?;
         let game_count = event.game_count as usize;
-        let counts = math::correct_counts(&reveal.picks[..game_count], &event.results[..game_count]).map_err(|_| error!(PredError::BadResults))?;
+        let counts = check_reveal(&reveal, event.game_count, Some(&event.results[..game_count]))?;
+        require_leaf(&book.entry_hash, reveal.index, &slip_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment), &entry_proof)?;
+        let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks, &reveal.colors);
+        require_leaf(&book.reveal_hash, reveal.index, &leaf, &reveal_proof)?;
         let mut amount = 0u64;
         for tier in &event.tiers[..event.tier_count as usize] {
             let rows = u64::from(counts[tier.correct as usize]);
@@ -341,7 +393,17 @@ pub mod predictions {
         let amount = event.price.checked_mul(u64::from(combinations)).ok_or(error!(PredError::Overflow))?;
         write_leaf(&mut book.claimed_root, index, &refund_proof, &slip_mark())?;
         msg!("refund-v1:{}:{}", event.key(), index);
-        transfer_from_vault(&ctx.accounts.vault.to_account_info(), &ctx.accounts.owner.to_account_info(), amount, event.rent_reserve)?;
+        if event.kind == KIND_LEAGUE {
+            let rad = &mut ctx.accounts.rad;
+            if rad.owner == Pubkey::default() {
+                rad.owner = owner;
+                rad.bump = ctx.bumps.rad;
+            }
+            require_keys_eq!(rad.owner, owner, PredError::WrongWinner);
+            rad.balance = rad.balance.checked_add(amount).ok_or(error!(PredError::Overflow))?;
+        } else {
+            transfer_from_vault(&ctx.accounts.vault.to_account_info(), &ctx.accounts.owner.to_account_info(), amount, event.rent_reserve)?;
+        }
         Ok(())
     }
 
@@ -377,7 +439,8 @@ pub mod predictions {
             [0; math::MAX_GAMES],
         )? {
             close_open_event(&mut ctx.accounts.event)?;
-            schedule_remove(&mut ctx.accounts.schedule, ctx.accounts.event.key())?;
+            restore_league_pool(&mut ctx.accounts.event, &ctx.accounts.vault.to_account_info(), &mut ctx.accounts.league)?;
+            schedule_remove(&mut ctx.accounts.schedule, &mut ctx.accounts.kinds, ctx.accounts.event.key())?;
         }
         Ok(())
     }
@@ -411,8 +474,9 @@ pub mod predictions {
         if tallied < event.coupon_count {
             return Ok(());
         }
-        apply_settlement(event, ctx.accounts.vault.to_account_info().lamports())?;
-        schedule_remove(&mut ctx.accounts.schedule, event.key())?;
+        let event_key = event.key();
+        apply_settlement(event, &ctx.accounts.vault.to_account_info(), &ctx.accounts.league.to_account_info())?;
+        schedule_remove(&mut ctx.accounts.schedule, &mut ctx.accounts.kinds, event_key)?;
         Ok(())
     }
 
@@ -425,7 +489,8 @@ pub mod predictions {
         require!(ctx.accounts.event.status == EventStatus::Open, PredError::BadStatus);
         require!(Clock::get()?.unix_timestamp >= ctx.accounts.event.resolve_timeout, PredError::TooEarly);
         close_open_event(&mut ctx.accounts.event)?;
-        schedule_remove(&mut ctx.accounts.schedule, ctx.accounts.event.key())?;
+        restore_league_pool(&mut ctx.accounts.event, &ctx.accounts.vault.to_account_info(), &mut ctx.accounts.league)?;
+        schedule_remove(&mut ctx.accounts.schedule, &mut ctx.accounts.kinds, ctx.accounts.event.key())?;
         Ok(())
     }
 
@@ -493,7 +558,9 @@ pub mod predictions {
         require!(amount > 0, PredError::NothingToForward);
         require!(ctx.accounts.destination.key() != ctx.accounts.source.key(), PredError::WrongEvent);
         let now = Clock::get()?.unix_timestamp;
-        let earliest = earliest_future(&ctx.accounts.schedule, now).ok_or(error!(PredError::DestinationStarted))?;
+        require!(ctx.accounts.source.kind == ctx.accounts.destination.kind, PredError::WrongEvent);
+        require!(ctx.accounts.source.kind == KIND_SOL, PredError::WrongEvent);
+        let earliest = earliest_future(&ctx.accounts.schedule, &ctx.accounts.kinds, now, ctx.accounts.source.kind).ok_or(error!(PredError::DestinationStarted))?;
         require!(ctx.accounts.destination.key() == earliest, PredError::NotEarliestEvent);
         require!(ctx.accounts.destination.status == EventStatus::Open, PredError::BadStatus);
         require!(now < ctx.accounts.destination.deadline, PredError::DestinationStarted);
@@ -516,17 +583,29 @@ pub mod predictions {
         );
         require!(!ctx.accounts.source.rollover_forwarded, PredError::AlreadyForwarded);
         require!(amount > 0, PredError::NothingToForward);
-        require!(
-            earliest_future(&ctx.accounts.schedule, Clock::get()?.unix_timestamp).is_none(),
-            PredError::FutureEventExists
-        );
-        transfer_from_vault(
-            &ctx.accounts.source_vault.to_account_info(),
-            &ctx.accounts.escrow.to_account_info(),
-            amount,
-            ctx.accounts.source.rent_reserve,
-        )?;
-        ctx.accounts.escrow.pending = ctx.accounts.escrow.pending.checked_add(amount).ok_or(error!(PredError::Overflow))?;
+        if ctx.accounts.source.kind == KIND_LEAGUE {
+            let league_lamports = ctx.accounts.league.to_account_info().lamports();
+            touch_league(&mut ctx.accounts.league, ctx.bumps.league, league_lamports);
+            transfer_from_vault(
+                &ctx.accounts.source_vault.to_account_info(),
+                &ctx.accounts.league.to_account_info(),
+                amount,
+                ctx.accounts.source.rent_reserve,
+            )?;
+            ctx.accounts.league.jackpot = ctx.accounts.league.jackpot.checked_add(amount).ok_or(error!(PredError::Overflow))?;
+        } else {
+            require!(
+                earliest_future(&ctx.accounts.schedule, &ctx.accounts.kinds, Clock::get()?.unix_timestamp, KIND_SOL).is_none(),
+                PredError::FutureEventExists
+            );
+            transfer_from_vault(
+                &ctx.accounts.source_vault.to_account_info(),
+                &ctx.accounts.escrow.to_account_info(),
+                amount,
+                ctx.accounts.source.rent_reserve,
+            )?;
+            ctx.accounts.escrow.pending = ctx.accounts.escrow.pending.checked_add(amount).ok_or(error!(PredError::Overflow))?;
+        }
         ctx.accounts.source.rollover_forwarded = true;
         Ok(())
     }
@@ -635,7 +714,7 @@ fn record_approval(event: &mut Event, signers: &ResultSigners, signer: &Pubkey, 
     Ok(event.approvals.count_ones() >= u32::from(signers.threshold))
 }
 
-fn apply_settlement(event: &mut Event, vault_lamports: u64) -> Result<()> {
+fn apply_settlement(event: &mut Event, vault: &AccountInfo, league: &AccountInfo) -> Result<()> {
     let tiers: Vec<math::Tier> = event.tiers[..event.tier_count as usize]
         .iter()
         .map(|tier| math::Tier { correct: tier.correct, percent: tier.percent })
@@ -645,23 +724,61 @@ fn apply_settlement(event: &mut Event, vault_lamports: u64) -> Result<()> {
     for (tier, per_winner) in tiers.iter().zip(&settlement.per_winner) {
         event.per_winner[tier.correct as usize - 1] = *per_winner;
     }
-    event.house = settlement.house;
+    let total = math::tier_total(&tiers).map_err(|_| error!(PredError::BadTiers))?;
+    let mut house = settlement.house;
+    let mut rollover_out = settlement.rollover_out;
+    let mut league_cut = 0u64;
+    if event.kind == KIND_LEAGUE {
+        // Dust stays in the league instead of becoming a second house cut.
+        rollover_out = rollover_out.checked_add(house).ok_or(error!(PredError::Overflow))?;
+        house = 0;
+    } else if total == math::SOL_TIER_TOTAL {
+        league_cut = event.sales.checked_mul(5).ok_or(error!(PredError::Overflow))? / 100;
+        require!(house >= league_cut, PredError::Insolvent);
+        house = house.checked_sub(league_cut).ok_or(error!(PredError::Overflow))?;
+        if league_cut > 0 {
+            transfer_from_vault(vault, league, league_cut, event.rent_reserve)?;
+        }
+    }
+    event.house = house;
+    event.league_cut = league_cut;
     event.paid = settlement.paid;
-    event.rollover_out = settlement.rollover_out;
+    event.rollover_out = rollover_out;
     event.status = EventStatus::Resolved;
-    let liquid = vault_lamports.checked_sub(event.rent_reserve).ok_or(error!(PredError::Insolvent))?;
-    let liability = settlement.paid.checked_add(settlement.house).ok_or(error!(PredError::Overflow))?.checked_add(settlement.rollover_out).ok_or(error!(PredError::Overflow))?;
+    let liquid = vault.lamports().checked_sub(event.rent_reserve).ok_or(error!(PredError::Insolvent))?;
+    let liability = settlement.paid.checked_add(house).ok_or(error!(PredError::Overflow))?.checked_add(rollover_out).ok_or(error!(PredError::Overflow))?;
     require!(liquid >= liability, PredError::Insolvent);
     Ok(())
 }
 
-fn check_reveal(reveal: &RevealArg, game_count: u8) -> Result<()> {
+/// Rows of a slip by number of correct picks, counting only rows inside every color's range.
+/// Reveal, score, and claim all use this. Their sum must equal the rows paid at entry.
+fn scored_rows(reveal: &RevealArg, game_count: u8, results: &[u8]) -> Result<[u32; math::MAX_GAMES + 1]> {
+    kept_by_score(reveal, game_count, Some(results))
+}
+
+fn kept_by_score(reveal: &RevealArg, game_count: u8, results: Option<&[u8]>) -> Result<[u32; math::MAX_GAMES + 1]> {
+    let games = game_count as usize;
+    let colors: Vec<math::Color> = reveal.colors.iter().map(|color| math::Color { signs: color.signs, min: color.min, max: color.max }).collect();
+    let counts = math::kept_counts(&reveal.picks[..games], &colors, results).map_err(|_| error!(PredError::BadPicks))?;
+    let mut total = 0u32;
+    for rows in counts {
+        total = total.checked_add(rows).ok_or(error!(PredError::Overflow))?;
+    }
+    require!(total >= 1 && total == reveal.combinations, PredError::BadPicks);
+    Ok(counts)
+}
+
+/// Checks a reveal against its commitment and returns its kept rows by score. With no
+/// results every kept row is counted at zero correct.
+fn check_reveal(reveal: &RevealArg, game_count: u8, results: Option<&[u8]>) -> Result<[u32; math::MAX_GAMES + 1]> {
     let games = game_count as usize;
     require!(reveal.picks[games..].iter().all(|mask| *mask == 0), PredError::BadPicks);
-    let combinations = math::combination_count(&reveal.picks[..games]).map_err(|_| error!(PredError::BadPicks))?;
-    require!(combinations == reveal.combinations, PredError::BadPicks);
-    require!(coupon_commitment(&reveal.owner, &reveal.picks, reveal.nonce) == reveal.commitment, PredError::BadCommitment);
-    Ok(())
+    require!(
+        slip_commitment(&reveal.owner, &reveal.picks, reveal.nonce, &reveal.colors) == reveal.commitment,
+        PredError::BadCommitment
+    );
+    kept_by_score(reveal, game_count, results)
 }
 
 /// A proof may stop once every remaining sibling is an empty subtree. Those hashes are
@@ -759,16 +876,35 @@ pub fn slip_mark() -> [u8; 32] {
     anchor_lang::solana_program::hash::hash(b"slip-marked").to_bytes()
 }
 
-pub fn slip_reveal_leaf(index: u32, owner: &Pubkey, combinations: u32, commitment: &[u8; 32], picks: &[u8; math::MAX_GAMES]) -> [u8; 32] {
-    anchor_lang::solana_program::hash::hashv(&[
-        b"slip-reveal",
-        &index.to_le_bytes(),
-        owner.as_ref(),
-        &combinations.to_le_bytes(),
-        commitment,
-        picks,
-    ])
-    .to_bytes()
+/// Ten bytes per color: the sign bits, then min, then max.
+pub fn colors_bytes(colors: &[ColorArg]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(colors.len() * 10);
+    for color in colors {
+        out.extend_from_slice(&color.signs.to_le_bytes());
+        out.push(color.min);
+        out.push(color.max);
+    }
+    out
+}
+
+/// A slip with no colors commits exactly as a coupon did before colors existed.
+pub fn slip_commitment(player: &Pubkey, picks: &[u8; math::MAX_GAMES], nonce: u64, colors: &[ColorArg]) -> [u8; 32] {
+    if colors.is_empty() {
+        return coupon_commitment(player, picks, nonce);
+    }
+    anchor_lang::solana_program::hash::hashv(&[player.as_ref(), picks, &nonce.to_le_bytes(), b"colors-v1", &colors_bytes(colors)]).to_bytes()
+}
+
+pub fn slip_reveal_leaf(index: u32, owner: &Pubkey, combinations: u32, commitment: &[u8; 32], picks: &[u8; math::MAX_GAMES], colors: &[ColorArg]) -> [u8; 32] {
+    let index_bytes = index.to_le_bytes();
+    let combination_bytes = combinations.to_le_bytes();
+    let colored = colors_bytes(colors);
+    let mut parts: Vec<&[u8]> = vec![b"slip-reveal", &index_bytes, owner.as_ref(), &combination_bytes, commitment, picks];
+    if !colors.is_empty() {
+        parts.push(b"colors-v1");
+        parts.push(&colored);
+    }
+    anchor_lang::solana_program::hash::hashv(&parts).to_bytes()
 }
 
 /// Folds a leaf up `SLIP_DEPTH` sibling hashes. `proof[0]` is the leaf's sibling.
@@ -808,29 +944,35 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn schedule_insert(schedule: &mut Schedule, event: Pubkey, deadline: i64) -> Result<()> {
+fn schedule_insert(schedule: &mut Schedule, kinds: &mut ScheduleKinds, event: Pubkey, deadline: i64, kind: u8) -> Result<()> {
     require!((schedule.count as usize) < MAX_SCHEDULE, PredError::ScheduleFull);
     let index = schedule.count as usize;
     schedule.entries[index] = ScheduleEntry { event, deadline };
+    kinds.kinds[index] = kind;
     schedule.count += 1;
     Ok(())
 }
 
-fn schedule_remove(schedule: &mut Schedule, event: Pubkey) -> Result<()> {
+fn schedule_remove(schedule: &mut Schedule, kinds: &mut ScheduleKinds, event: Pubkey) -> Result<()> {
     let count = schedule.count as usize;
     let position = schedule.entries[..count]
         .iter()
         .position(|entry| entry.event == event)
         .ok_or(error!(PredError::NotScheduled))?;
     schedule.entries[position] = schedule.entries[count - 1];
+    kinds.kinds[position] = kinds.kinds[count - 1];
     schedule.entries[count - 1] = ScheduleEntry::default();
+    kinds.kinds[count - 1] = KIND_SOL;
     schedule.count -= 1;
     Ok(())
 }
 
-fn earliest_future(schedule: &Schedule, now: i64) -> Option<Pubkey> {
+fn earliest_future(schedule: &Schedule, kinds: &ScheduleKinds, now: i64, kind: u8) -> Option<Pubkey> {
     let mut best: Option<(i64, Pubkey)> = None;
-    for entry in &schedule.entries[..schedule.count as usize] {
+    for (index, entry) in schedule.entries[..schedule.count as usize].iter().enumerate() {
+        if kinds.kinds[index] != kind {
+            continue;
+        }
         if entry.deadline > now {
             match best {
                 Some((deadline, _)) if deadline <= entry.deadline => {}
@@ -839,6 +981,49 @@ fn earliest_future(schedule: &Schedule, now: i64) -> Option<Pubkey> {
         }
     }
     best.map(|(_, event)| event)
+}
+
+fn touch_league(league: &mut LeagueVault, bump: u8, lamports: u64) {
+    if league.rent_reserve == 0 {
+        league.bump = bump;
+        league.rent_reserve = lamports;
+    }
+}
+
+fn credit_rad(rad: &mut RadAccount, owner: Pubkey, rows: u32, bump: u8) -> Result<()> {
+    if rad.owner == Pubkey::default() {
+        rad.owner = owner;
+        rad.bump = bump;
+    }
+    require_keys_eq!(rad.owner, owner, PredError::WrongWinner);
+    let rows = u64::from(rows);
+    rad.balance = rad.balance.checked_add(rows).ok_or(error!(PredError::Overflow))?;
+    rad.lifetime_earned = rad.lifetime_earned.checked_add(rows).ok_or(error!(PredError::Overflow))?;
+    Ok(())
+}
+
+fn spend_rad(rad: &mut RadAccount, cost: u64) -> Result<()> {
+    require!(rad.balance >= cost, PredError::NotEnoughRad);
+    rad.balance = rad.balance.checked_sub(cost).ok_or(error!(PredError::Overflow))?;
+    Ok(())
+}
+
+/// Puts a cancelled league event's SOL back. The jackpot stays a jackpot; the sales
+/// become part of the pool the next league event sweeps. Each row's RAD is refunded later.
+fn restore_league_pool<'info>(event: &mut Event, vault: &AccountInfo<'info>, league: &mut Account<'info, LeagueVault>) -> Result<()> {
+    if event.kind != KIND_LEAGUE {
+        return Ok(());
+    }
+    let liquid = vault.lamports().saturating_sub(event.rent_reserve);
+    if liquid > 0 {
+        let league_info = league.to_account_info();
+        transfer_from_vault(vault, &league_info, liquid, event.rent_reserve)?;
+    }
+    let jackpot_back = event.rollover_in.min(liquid);
+    league.jackpot = league.jackpot.checked_add(jackpot_back).ok_or(error!(PredError::Overflow))?;
+    event.rollover_out = 0;
+    event.rollover_forwarded = true;
+    Ok(())
 }
 
 fn transfer_from_vault(vault: &AccountInfo, to: &AccountInfo, amount: u64, reserve: u64) -> Result<()> {
@@ -868,6 +1053,12 @@ pub struct CreateEventArgs {
     pub threshold: u8,
     pub signers: Vec<Pubkey>,
     pub tiers: Vec<TierArg>,
+    /// 0 pays in SOL and credits RAD. 1 is a league event paid in RAD.
+    pub kind: u8,
+    /// Kept rows a coupon must have. The default at creation is 1.
+    pub min_rows: u32,
+    /// Coupons the event accepts. The default at creation is 250,000, and 1,000,000 is the ceiling.
+    pub max_coupons: u32,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -911,6 +1102,24 @@ pub struct Event {
     pub approvals: u8,
     pub tallied: u32,
     pub winners: [u64; math::MAX_GAMES + 1],
+    /// 0 is a SOL event. 1 is a league event entered with RAD. Older accounts read as 0.
+    pub kind: u8,
+    /// SOL moved into the league vault when this event settled. Zero for legacy and league events.
+    pub league_cut: u64,
+    /// Kept rows a coupon must have. Zero on events created before the limit existed, which means 1.
+    pub min_rows: u32,
+    /// Coupons this event accepts. Zero on older events, which means the tree cap of 2^20.
+    pub max_coupons: u32,
+}
+
+/// A coupon is admitted when it has enough rows and the event is not full.
+/// Older accounts leave both limits at zero and keep the rules they were created with.
+fn require_entry_room(event: &Event, combinations: u32) -> Result<()> {
+    let min_rows = if event.min_rows == 0 { 1 } else { event.min_rows };
+    let max_coupons = if event.max_coupons == 0 { 1u32 << SLIP_DEPTH } else { event.max_coupons };
+    require!(combinations >= min_rows && combinations <= math::MAX_COMBINATIONS, PredError::BadPicks);
+    require!(event.coupon_count < max_coupons, PredError::TooManyCoupons);
+    Ok(())
 }
 
 impl Event {
@@ -942,6 +1151,15 @@ pub struct SlipArg {
     pub combinations: u32,
 }
 
+/// One reduction color: three bits per game in pick-mask order, and the range of hits a
+/// kept row needs. An empty list is an ordinary system coupon.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct ColorArg {
+    pub signs: u64,
+    pub min: u8,
+    pub max: u8,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct RevealArg {
     pub index: u32,
@@ -950,6 +1168,7 @@ pub struct RevealArg {
     pub picks: [u8; math::MAX_GAMES],
     pub nonce: u64,
     pub commitment: [u8; 32],
+    pub colors: Vec<ColorArg>,
 }
 
 /// One book per event. `entry_hash` is the Merkle root of the coupons entered so far.
@@ -989,6 +1208,14 @@ pub struct PlaceSlip<'info> {
     pub slips: Account<'info, SlipBook>,
     #[account(seeds = [GATE_SEED, event.admin.as_ref()], bump = gate.bump)]
     pub gate: Account<'info, Gate>,
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = 8 + RadAccount::SIZE,
+        seeds = [RAD_SEED, player.key().as_ref()],
+        bump
+    )]
+    pub rad: Account<'info, RadAccount>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1006,12 +1233,16 @@ pub struct ScoreSlip<'info> {
     pub caller: Signer<'info>,
     #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
     pub event: Box<Account<'info, Event>>,
-    #[account(seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut, seeds = [SLIP_SEED, event.key().as_ref()], bump = slips.bump)]
     pub slips: Account<'info, SlipBook>,
     #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
     pub schedule: Box<Account<'info, Schedule>>,
+    #[account(mut, seeds = [KINDS_SEED, event.admin.as_ref()], bump)]
+    pub kinds: Account<'info, ScheduleKinds>,
+    #[account(mut, seeds = [LEAGUE_SEED], bump)]
+    pub league: Account<'info, LeagueVault>,
 }
 
 #[derive(Accounts)]
@@ -1026,6 +1257,41 @@ pub struct ClaimSlip<'info> {
     pub slips: Account<'info, SlipBook>,
 }
 
+#[account]
+pub struct RadAccount {
+    pub owner: Pubkey,
+    pub balance: u64,
+    pub lifetime_earned: u64,
+    pub bump: u8,
+}
+
+impl RadAccount {
+    pub const SIZE: usize = 32 + 8 + 8 + 1;
+}
+
+#[account]
+pub struct LeagueVault {
+    pub bump: u8,
+    /// Unwon league jackpot waiting for the next league event. The rest of the
+    /// liquid balance is the 5% collected from SOL events.
+    pub jackpot: u64,
+    pub rent_reserve: u64,
+}
+
+impl LeagueVault {
+    pub const SIZE: usize = 1 + 8 + 8;
+}
+
+#[account]
+pub struct ScheduleKinds {
+    pub kinds: [u8; MAX_SCHEDULE],
+    pub bump: u8,
+}
+
+impl ScheduleKinds {
+    pub const SIZE: usize = MAX_SCHEDULE + 1;
+}
+
 #[derive(Accounts)]
 pub struct RefundSlip<'info> {
     #[account(mut)]
@@ -1036,6 +1302,15 @@ pub struct RefundSlip<'info> {
     pub vault: Account<'info, Vault>,
     #[account(mut, seeds = [SLIP_SEED, event.key().as_ref()], bump = slips.bump)]
     pub slips: Account<'info, SlipBook>,
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + RadAccount::SIZE,
+        seeds = [RAD_SEED, owner.key().as_ref()],
+        bump
+    )]
+    pub rad: Account<'info, RadAccount>,
+    pub system_program: Program<'info, System>,
 }
 
 #[account]
@@ -1121,6 +1396,22 @@ pub struct CreateEvent<'info> {
         bump
     )]
     pub gate: Account<'info, Gate>,
+    #[account(
+        init_if_needed,
+        payer = admin,
+        space = 8 + ScheduleKinds::SIZE,
+        seeds = [KINDS_SEED, admin.key().as_ref()],
+        bump
+    )]
+    pub kinds: Account<'info, ScheduleKinds>,
+    #[account(
+        init_if_needed,
+        payer = admin,
+        space = 8 + LeagueVault::SIZE,
+        seeds = [LEAGUE_SEED],
+        bump
+    )]
+    pub league: Account<'info, LeagueVault>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1142,6 +1433,14 @@ pub struct PlaceCoupon<'info> {
     pub coupon: Account<'info, Coupon>,
     #[account(seeds = [GATE_SEED, event.admin.as_ref()], bump = gate.bump)]
     pub gate: Account<'info, Gate>,
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = 8 + RadAccount::SIZE,
+        seeds = [RAD_SEED, player.key().as_ref()],
+        bump
+    )]
+    pub rad: Account<'info, RadAccount>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1154,16 +1453,26 @@ pub struct Approve<'info> {
     pub signers: Account<'info, ResultSigners>,
     #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
     pub schedule: Box<Account<'info, Schedule>>,
+    #[account(mut, seeds = [KINDS_SEED, event.admin.as_ref()], bump)]
+    pub kinds: Account<'info, ScheduleKinds>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [LEAGUE_SEED], bump)]
+    pub league: Account<'info, LeagueVault>,
 }
 
 #[derive(Accounts)]
 pub struct Tally<'info> {
     #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
     pub event: Box<Account<'info, Event>>,
-    #[account(seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
     pub schedule: Box<Account<'info, Schedule>>,
+    #[account(mut, seeds = [KINDS_SEED, event.admin.as_ref()], bump)]
+    pub kinds: Account<'info, ScheduleKinds>,
+    #[account(mut, seeds = [LEAGUE_SEED], bump)]
+    pub league: Account<'info, LeagueVault>,
 }
 
 #[derive(Accounts)]
@@ -1214,6 +1523,12 @@ pub struct ExpireEvent<'info> {
     pub event: Box<Account<'info, Event>>,
     #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
     pub schedule: Box<Account<'info, Schedule>>,
+    #[account(mut, seeds = [KINDS_SEED, event.admin.as_ref()], bump)]
+    pub kinds: Account<'info, ScheduleKinds>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [LEAGUE_SEED], bump)]
+    pub league: Account<'info, LeagueVault>,
 }
 
 #[derive(Accounts)]
@@ -1255,6 +1570,8 @@ pub struct ForwardRollover<'info> {
     pub destination_vault: Account<'info, Vault>,
     #[account(mut, seeds = [SCHEDULE_SEED, source.admin.as_ref()], bump)]
     pub schedule: Box<Account<'info, Schedule>>,
+    #[account(seeds = [KINDS_SEED, source.admin.as_ref()], bump)]
+    pub kinds: Account<'info, ScheduleKinds>,
 }
 
 #[derive(Accounts)]
@@ -1267,6 +1584,10 @@ pub struct ParkRollover<'info> {
     pub escrow: Account<'info, Escrow>,
     #[account(mut, seeds = [SCHEDULE_SEED, source.admin.as_ref()], bump)]
     pub schedule: Box<Account<'info, Schedule>>,
+    #[account(seeds = [KINDS_SEED, source.admin.as_ref()], bump)]
+    pub kinds: Account<'info, ScheduleKinds>,
+    #[account(mut, seeds = [LEAGUE_SEED], bump)]
+    pub league: Account<'info, LeagueVault>,
 }
 
 #[error_code]
@@ -1302,6 +1623,7 @@ pub enum PredError {
     Insolvent,
     UpgradeTimelock,
     AlreadyWithdrawn,
+    NotEnoughRad,
     DrawInProgress,
     DrawRequired,
     LotteryFull,

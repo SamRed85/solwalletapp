@@ -76,20 +76,43 @@ todos:
     dependencies:
       - phase12_auto_count
   - id: phase14_interface
-    content: "Phase 14: Professional player site. Europatipset-style coupon, quiet dark shell. No admin restyle. No rule changes."
-    status: pending
+    content: "Phase 14: League vault and RAD. Every new event keeps 90% for players, 5% for the house, and 5% in a second vault. RAD is earned per row and is the only entry ticket for an admin-created league event whose unwon jackpot feeds the next one."
+    status: completed
     dependencies:
       - phase13_auto_resolve
-  - id: phase15_canopy
-    content: "Phase 15: Canopy so one score, place, or claim still fits at 1,000,000 coupons. The program refuses coupon 1,000,001. The tree stays depth 20."
-    status: pending
+  - id: phase15_reduction
+    content: "Phase 15: Color reduction. Up to 4 colors, each with a min and max, stay on one coupon. The player signs once and pays for the surviving rows. The earlier split into one slip per pattern stays for entries already placed."
+    status: completed
     dependencies:
       - phase14_interface
-  - id: phase10_audit_mainnet
-    content: "Final phase: Tests, fuzzing, external audit, bug bounty, capped mainnet launch. Do not start until the user says start final phase."
+  - id: phase16_game_details
+    content: "Phase 16: Game details on the game card. One checkbox per detail: stored API odds for 1, X and 2, the probability calculated from those odds, the start time, and, from the event start onward, the share of rows that picked each outcome. An admin button fetches the odds into MongoDB."
+    status: completed
+    dependencies:
+      - phase15_reduction
+  - id: phase17_canopy
+    content: "Phase 17: Canopy so one score, place, or claim still fits at 1,000,000 coupons. The program refuses coupon 1,000,001. The tree stays depth 20."
     status: pending
     dependencies:
-      - phase15_canopy
+      - phase16_game_details
+  - id: phase18_signed_totals
+    content: "Phase 18: Signed totals. The keeper counts off chain, the result signers sign the winner totals, and claims open after a 6-hour challenge window. The admin sets the disputer's minimum and maximum SOL when creating the event (defaults 10 and 50). A challenge locks 10% of the player pot inside that range and starts the on-chain recount. Claims are capped per tier at the signed totals."
+    status: pending
+    dependencies:
+      - phase16_game_details
+  - id: fixes_before_final
+    content: "Fixes before the final phase: move the upgrade authority to a multisig with a time lock, split the two result keys, show who can approve an event, add a dispute window, and decide what happens to unclaimed prizes. Do not start until the user asks for it."
+    status: pending
+    dependencies:
+      - phase16_game_details
+      - phase18_signed_totals
+  - id: phase10_audit_mainnet
+    content: "Final phase: Tests, fuzzing, external audit, bug bounty, capped mainnet launch. When it starts, choose the independent second signer: it signs only a result it derived from the full-time scores, a mismatch stays unsigned, and the 7-day refund stays. A timeout must not adopt the first signature. Do not start until the user says start final phase."
+    status: pending
+    dependencies:
+      - phase17_canopy
+      - phase18_signed_totals
+      - fixes_before_final
 ---
 
 # Master Plan: Product First, Then Strict Safety
@@ -368,9 +391,9 @@ admin opens that vault, entries still pay the treasury.
       deployer key can create the council. A local validator run rejected a stranger, created the
       council once, and rejected a second create. The signers are the deployer and
       `4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH` (gitignored `keys/council-signer.json`).
-      On devnet the loader authority is council `9ad7bFZNUVuvGkM2ZbepzK6wADV4LaWpW2weQPxXSWD2`.
-      Its threshold is 2 and its signers are the deployer and
-      `4gGayWwFTHeuwK2o1chizBDPaMwqUBUvmBdpaYXzFEHH`.
+      **Superseded by "Fixes before the final phase":** the council cannot upgrade the program,
+      because a program cannot upgrade itself. On the live devnet program `AaXABVJE...` the loader
+      authority is the deployer key and no council account exists.
 - [x] **Pause:** may only stop new coupons. A paused event still pays a claim.
 - [x] **Permissionless refund:** after `resolve_timeout`, any caller can expire the event and the
       player can refund. Before the timeout that call is rejected.
@@ -396,7 +419,8 @@ admin opens that vault, entries still pay the treasury.
 8. Upgrades and privileged actions are public and delayed.
 9. The deployed binary matches the audited source.
 
-**Done when:** all nine invariants hold and are covered by tests.
+**Done when:** all nine invariants hold and are covered by tests. Invariants 3 and 8 do not hold
+on the live devnet program. The work that closes them is in "Fixes before the final phase".
 
 ---
 
@@ -577,7 +601,7 @@ Each saved game stores that feed's fixture id. Team names are not matched again 
 - [x] A restart continues from the on-chain `tallied` counter. A coupon that is already scored is not sent again.
 - [x] The keeper pays the network fee. The count does not wait for the admin's wallet.
 - [x] **Count coupons and settle** stays and still counts from the same counter.
-- [x] If one score transaction does not fit, the keeper stops and says so. This phase does not add a canopy. A few hundred coupons fit. Ten thousand do not. Phase 15 is the canopy.
+- [x] If one score transaction does not fit, the keeper stops and says so. This phase does not add a canopy. A few hundred coupons fit. Ten thousand do not. Phase 17 is the canopy.
 
 **Done when:** an approved event with several coupons settles with no Phantom approval for the count, and a stopped keeper finishes the remaining coupons on its own.
 
@@ -599,12 +623,108 @@ Each saved game stores that feed's fixture id. Team names are not matched again 
 
 ---
 
-## Phase 14: Player interface
+## Phase 14: League vault and RAD
 
+**Goal:** a second program-owned vault collects 5% of every new event's ticket sales. Playing a row earns one RAD. An admin can open a league event that is entered only with RAD, pays out the whole collected pool, and feeds an unwon jackpot into the next league event.
+
+The player-site restyle that used to sit in this phase was reverted and is not part of this work.
+
+- [x] **90 / 5 / 5.** New events' prize tiers add up to 90. Settlement still computes the old house remainder, then moves exactly 5% of ticket sales from that remainder into the league vault. The event admin can still withdraw the rest once. Rollover is not taxed again. Events already created with tiers that add up to 95 settle exactly as before and do not fund the league vault.
+- [x] **League vault.** One global program account, seeds `[b"league"]`. No instruction lets an admin withdraw from it. It is funded only by the 5% transfer inside settlement, and it is emptied only when a league event is created.
+- [x] **RAD.** One program account per wallet, seeds `[b"rad", owner]`, holding a balance and a lifetime total. It is not a token and cannot be transferred. A SOL entry credits one RAD per row. A cancelled SOL event does not take that RAD back.
+- [x] **League event.** The admin creates it like any other vault event, with `kind = league`, tiers that add up to 100, and a price in RAD (one RAD per row unless the admin sets another price). Creation sweeps the league vault: the parked jackpot becomes `rollover_in`, and the rest becomes `sales`, so it is split across every tier. Entry spends RAD and sends no SOL. Rows on a league event do not earn RAD.
+- [x] **Feed-forward jackpot.** A league event's unwon or too-small tiers stay `rollover_out`. Parking them adds that amount to the league vault's jackpot, which the next league event takes as `rollover_in` only. SOL rollover never enters a league event, and a league jackpot never enters a SOL event.
+- [x] **Cancel.** Cancelling a league event returns the swept SOL to the league vault (jackpot back to jackpot, sales back to the pool) and each slip refunds its RAD. It does not pay the pool out as SOL refunds.
+
+**Done when:** a SOL event leaves 5% of its sales in the league vault and one RAD per row with the player, and a later league event pays that pool to its winners, or parks an unwon jackpot for the next league event.
 
 ---
 
-## Phase 15: Canopy for large events
+## Phase 15: Color reduction
+
+**Goal:** a player can start from a large frame of picks and cut it down with up to 4 colors, as on [reducering.se](https://www.reducering.se/hur-funkar-det/fargreducering), and sign once. The coupon carries the frame and the colors. The stake is the coupon price times the surviving rows.
+
+The first build of this phase split each color pattern into its own ordinary coupon, so a tight reduction could ask for dozens or hundreds of signatures. That split stays on devnet for entries already placed. New colored entries do not use it.
+
+How a color works, unchanged from the first build:
+
+- The player marks a frame: any mix of 1, X and 2 on each game. A system coupon is this frame with no colors.
+- A color is a group of signs. A sign is one outcome of one game, such as "game 4, X". One sign can be in several colors.
+- Each color has a **min** and a **max**. A row is kept only when every color is hit between its min and max.
+- At most 4 colors (purple, yellow, red, green). 1X2 reduction, point reduction, and payout forecasts are not in this phase.
+- Min cannot be above max. A reduction that leaves no rows is refused. Treasury events stay unreduced.
+- The page shows the row count before and after, the share removed, and the cost. A colored entry is one signature, so the page no longer shows a coupon count for the split.
+
+What one coupon stores:
+
+- The frame is the same 13 masks as today. Each color is the signs it covers (13 games by 3 outcomes, bit `3 × game + outcome`), plus a min and a max: 10 bytes per color, so four colors are 40 bytes.
+- `place_slip` still takes a commitment and a row count. The row count is the kept rows, and the stake is the price times that count. The colors are inside the commitment, with the masks and the reveal nonce, so they stay hidden until the reveal window.
+- The browser record and the time-locked reveal hold the masks, the colors, and the nonce together. A slip has no on-chain sealed backup, so the exported backup file is the copy to keep.
+- A coupon with no colors commits exactly as it does today. Events already on chain keep verifying.
+
+How the program counts, without listing rows:
+
+- Reveal publishes the masks and the colors. The program counts the kept rows and rejects the reveal unless the count equals the paid row count. A rejected reveal stays unrevealed: its stake stays in the pool and it cannot win. It does not stop settlement.
+- Scoring uses the same count and also tracks how many kept rows have each number of correct picks. For each game it keeps a table of rows so far by correct picks and by hits in each color. An outcome that would push a color past its max is dropped. At the end, a state counts only when every color has reached its min.
+- The table size is the product, over the colors, of one more than each color's effective max. A color whose min is 0 and whose max covers every one of its signs adds no states. The program refuses a coupon whose table is over the cap of 64 states, and the coupon page shows the refusal before the signature. On a local Agave 4.3.2 validator the worst case at the cap (13 games, every outcome, three colors at 4 × 4 × 4 states, 32,640 kept rows) used 156,195 compute units to reveal and 325,996 to score and settle. `examples/local_loop.rs` repeats that measurement.
+- A void game still scores every pick correct. Colors describe picks, not results.
+- The same count is implemented in the program, in the browser, and in the Go pick-share code. One shared set of test vectors checks all three. The browser refuses anything the program would reject, including a sign that is not in the frame, a color with no signs, and a table over the cap.
+
+Security rules:
+
+- **One count everywhere.** Reveal, scoring, and claim all call the same colored count. `claim_slip` pays `per_winner` times this coupon's kept rows by score, never the raw frame. A frame of every outcome is 1,594,323 rows; paying that when 1,000 were scored would drain the tier pot.
+- **The kept rows equal the paid rows.** Across every score, a coupon's kept rows add up to the row count in its entry leaf. Reveal rejects anything else.
+- **The commitment binds the colors.** Every sign, min, and max is inside the commitment and the reveal leaf, as the exact list of up to four 10-byte colors. Any other list, order, or byte hashes to a different commitment, so a coupon can only be revealed the way it was committed. Reveal also rejects a color with no signs, a sign outside the frame, and a min above its max or a max above the game count.
+- **Old bytes for no colors.** A coupon with an empty color list hashes its commitment and its reveal leaf exactly as before, so coupons already on chain still reveal, score, and claim.
+- **Settlement cannot stall.** The state cap is checked at reveal, and it is measured on `score_slip`, which also checks three proofs. A coupon that would run out of compute while scoring is refused at reveal and stays unrevealed. Never lower the cap after colored coupons exist: a revealed coupon above a lower cap could no longer be scored.
+- **Treasury and legacy coupon accounts** never carry colors.
+
+Edges the count has to get right:
+
+- Every outcome selected on all 13 games is 1,594,323 rows. That entry is allowed only when the colors bring the kept rows down to 44,000 or fewer. The count does not walk the rows.
+- Zero kept rows is refused. One kept row is a normal coupon. Min 0 and a max that covers every sign keeps the whole frame.
+- Two signs of the same color on one game can add at most one hit, because a row picks one outcome. A min above that returns zero rows.
+
+Already built, and left in place for entries that used it:
+
+- [x] **Spec for the split.** `docs/rules-spec.md` describes colors, min and max, and the split into disjoint systems, including the 41-coupon example.
+- [x] **Browser splitter.** `reduceSystem` built the pieces. It is replaced by `colorReduction`; groups already saved keep their pieces.
+- [x] **MongoDB group and signing queue.** `reductions` stores the encrypted plan. The page signs one `place_slip` per piece and can resume. Reveal, claim, and refund follow the same queue. The page now only resumes groups saved before the upgrade.
+- [x] **Coupon page.** The four colors, min, max, row count, share removed, and cost are on the event page.
+- [x] **Uncolored coupons.** A coupon with no colors is still one slip, and its commitment is unchanged.
+
+One coupon per colored entry:
+
+- [x] **Spec.** `docs/rules-spec.md` has the one-coupon rule: colors travel inside the commitment, reveal checks the kept-row count, and scoring and claims count only kept rows. Entries placed before this upgrade remain a group of ordinary slips.
+- [x] **Counting function.** `kept_counts` in `programs/predictions/src/math.rs` counts with a table of states and never lists rows. Tests compare it to brute force on 600 random frames and colors, and cover the 13-game edges, zero rows, and the cap. The table uses precomputed flags per state, a bitmask of live states, and one score slot when there are no results; the first version ran out of compute at the cap.
+- [x] **Program.** `RevealArg` ends with the color list. The commitment and the reveal leaf add `colors-v1` and the color bytes only when there are colors. `reveal_slip`, `score_slip`, and `claim_slip` all use the kept rows, and their sum must equal the paid rows. `reveal-v1` logs the colors as a 7th field only for a colored coupon.
+- [x] **Keeper, archive, and counts.** `backend/colors.go` has the leaf, commitment, and count. The time-locked reveal carries the colors, `archive.go` reads the 7th field, the keeper's reveal and score send the colors, and the live winner counts and pick share count only kept rows.
+- [x] **Browser.** `colorReduction` prices the frame with the same count and cap, and the event page enters one slip with one signature. Reveal, score, claim, the projected payout, and the settled score on My Coupons all use the colors.
+- [x] **Shared vector.** The same colored commitment and reveal leaf are pinned in the program, Go, and browser tests.
+- [x] **Lifecycle test.** A colored coupon is placed, revealed, scored, and claimed and is paid for its 14 kept rows only, not the jackpot row in its frame. Changed colors, dropped colors, and a paid count that differs from the kept rows are rejected.
+- [x] **Devnet upgrade.** Built with `DEVNET_TESTING=1` and upgraded. New colored entries sign once. Groups already saved in `reductions` still finish through the old queue.
+
+**Done when:** a player can mark a large frame, add colors, see the kept rows and the cost, and enter with one signature. Reveal and scoring count only the rows inside every color's range, and an uncolored coupon is unchanged. A reduction that leaves no rows, or whose count is too expensive, is refused before the signature.
+
+---
+
+## Phase 16: Game details on the game card
+
+**Goal:** a player can choose which extra details each game card shows. There is one checkbox per detail: odds, probability, start time, and pick share. The settings apply to every game card on the page.
+
+- [x] **Checkboxes.** Add a small "Show on game cards" control above the games in `frontend/src/views/Event.vue` with four checkboxes: **Odds**, **Probability**, **Start time**, and **Pick share**. Each one shows or hides its detail on every game card. The choice is saved in `localStorage` per browser, not per event. By default, Start time is on and the other three are off. A detail with no data for a game, such as a game with no fixture id, shows a dash on that card.
+- [x] **Odds from the API.** An event is about 13 high-profile games from one weekend day, so the chosen bookmaker has a Match Winner line for each of them. The backend reads 1X2 odds from API-Football (`/odds?fixture=<id>`, bet "Match Winner") in `backend/football.go`, using the fixture id saved on each game. Odds come from one fixed bookmaker, named in the config, so all games use the same source. The free plan allows 100 requests a day and that budget is already shared with scores and auto resolve, so this phase does not fetch odds on a timer. An admin-only button on the event page, next to Refresh scores, fetches the odds for that event's games and stores them in MongoDB. The game card shows the stored odds. A game that has not been fetched yet shows a dash. Show the odds as decimals with 2 decimals for `1`, `X` and `2`. The API key never reaches the browser.
+- [x] **Probability from the odds.** For each game, the raw value for each outcome is `1 / odds`. These raw values add up to more than 100% because of the bookmaker margin, so divide each one by their sum. Show the result as a whole percent for `1`, `X` and `2`, so the three add up to about 100%. The calculation runs in one shared function and is tested against worked examples. These numbers are an estimate only and never affect payouts.
+- [x] **Start time.** The checkbox shows or hides the kickoff stamp that game cards already display (`kickoffStamp`).
+- [x] **Pick share, only once the event has started.** From the event start time onward, and for good after that, each game card shows the share of all rows on the event that picked `1`, `X` and `2` for that game. Before the start this detail stays hidden, and the checkbox says "after start". Shares count rows, not coupons, so a system coupon with 2 picks on a game adds weight to both outcomes based on how many of its rows use each one. A Phase 15 reduced coupon counts only its surviving rows.
+- [x] **Hidden picks stay hidden.** Vault events keep picks secret until they are revealed (Phase 9). Pick share counts only revealed coupons, says "from N of M coupons revealed", and updates as more coupons are revealed. Unrevealed coupons are not guessed at. Treasury events count every entry from MongoDB. The backend computes the shares once per update and serves them on the event, so no browser loads every coupon.
+- [x] **Tests.** Test probability normalization, row-weighted pick share for a system coupon and a reduced coupon, and that no share is returned before the event start.
+
+**Done when:** a player can turn each of the four details on or off for every game card. After an admin fetches the odds, they and the probabilities appear on the linked games. Pick share shows nothing before the event starts and, from then on, the share of revealed rows for each outcome.
+
+---
+
+## Phase 17: Canopy for large events
 
 **Goal:** placing, counting, and claiming one coupon still fit in a Solana transaction at 1,000,000 coupons, and the program refuses another one. The tree stays depth 20, which could hold 1,048,576. The event stops at 1,000,000.
 
@@ -615,24 +735,100 @@ Empty proof hashes are already left out. Above a few hundred coupons the upper h
 - [ ] `place_slip` rejects the coupon that would make the count 1,000,001. The create-event page and the coupon page say the event is full.
 - [ ] The tree depth stays 20. Events already on chain keep the proofs they use now.
 - [ ] The stored nodes have to fit in accounts the event can rent.
-- [ ] The payout math does not change. Counting is still one coupon per transaction, in order, by the Phase 12 keeper. A canopy makes each transaction fit. It does not settle every coupon in one approval.
+- [ ] The payout math does not change. The on-chain count is still one coupon per transaction, in order. A canopy makes each transaction fit. It does not settle every coupon in one approval. After Phase 18, that count runs only as the recount after a challenge, or when no totals are signed in time.
 
 **Done when:** coupon 1,000,000 can be placed, counted, and claimed in a transaction that fits, and coupon 1,000,001 is rejected.
 
 ---
 
+## Phase 18: Signed totals and a challenge window
+
+Do not start this phase until the user asks for it. Its program change ships in the same build as "Fixes before the final phase", so the deployer key signs one upgrade, not two.
+
+**Goal:** an event with 1,000,000 coupons settles in hours, not weeks. Counting moves off chain. Each claim is still checked on chain. A wrong total can be thrown out by anyone during a short window, and the vault can never pay out more than the pool.
+
+At about 2 seconds per `score_slip`, the Phase 12 count takes about 23 days for 1,000,000 coupons. One slot per coupon is still about 4.6 days and about 5 SOL in fees. A claim already checks the coupon's entry and reveal proofs and recomputes its score, so the only thing the chain still needs from the count is the number of winning rows per tier, which sets the payout per row.
+
+How it works:
+
+- After the results are approved, the keeper counts every coupon from the archive and posts the winner rows per score. The event's result signers sign that exact list, with the same threshold as a result: 2 today, more if the final phase allows a larger set. A list that differs in any value is a different proposal.
+- The poster locks a 3 SOL bond with the totals.
+- The 6-hour window starts when the totals land, not at result approval. It is measured in slots, about 54,000, so a cluster halt does not shorten it.
+- During the window, claims are closed, and anyone can challenge by locking a bond.
+- When the window ends with no challenge, anyone can call `finalize_totals`. It sets the payout per row, runs the existing settlement (house share, league 5%, rollover), opens claims, and returns the poster's bond.
+- A challenge starts the recount: `tallied` goes back to 0 and the existing `score_slip` count runs, one coupon per transaction, in order. Anyone can send scores. When the recount reaches `coupon_count`, the program compares it with the signed totals. This is the same count as Phase 12, so 1,000,000 coupons still takes about 23 days at the current pace, or about 4.6 days if each transaction lands in one slot. Claims stay closed until it finishes.
+- If the totals were wrong, the recount totals are used. The challenger gets their bond back plus the poster's bond, and the event shows that its signed totals were rejected.
+- If the totals were right, the signed totals stand. The challenger's bond first pays back the recount fees of whoever sent the scores, and the remainder goes to the event pool.
+
+Rules:
+
+- [ ] **Totals instruction.** `sign_totals` records one signer's approval of a totals list and its poster, the same way `approve_resolution` records a result. When the threshold agrees on the same list, the totals are locked, the poster's bond moves into the event, and the window opens. A second list cannot replace a locked one.
+- [ ] **Bounded totals.** Every revealed row has exactly one score, so the totals for 0 through 13 correct must add up to the kept rows of every revealed coupon. `reveal_slip` keeps that running sum on chain. Totals that add up to anything else are rejected, so rows cannot be invented or dropped as a whole. Rows can still be moved between tiers, and the challenge is what catches that.
+- [ ] **Per-tier claim cap.** `claim_slip` adds the rows it pays to a per-tier counter and refuses a claim that would go past the signed total for that tier. The tier pot is the ceiling, whatever was signed.
+- [ ] **Disputer bond set on the event.** The create-event form has a minimum and a maximum SOL for the disputer. The defaults are 10 and 50. Both are whole SOL amounts from 1 to 100, and the minimum cannot be above the maximum. The program stores them on the event. The bond is 10% of the player pot, clamped to that event's minimum and maximum. The player pot is the amount the tiers divide: sales plus rollover, after the house and league shares. With the defaults, a pot of 100 SOL or less locks 10 SOL, a pot of 250 SOL locks 25 SOL, and a pot of 500 SOL or more locks 50 SOL. The page shows the amount before the challenger signs. Events created before this field existed use 10 and 50. A minimum under 10 SOL does not cover the fees of a recount at 1,000,000 coupons.
+- [ ] **One challenge.** Only the first challenge counts. A later challenge is refused and moves no money. Only the challenger's signing key can receive the bonds, so copying the challenge transaction earns nothing.
+- [ ] **Recount fees.** Each `score_slip` in a recount records its fee payer and the fee. The losing bond pays those fees back first, up to the bond, before anything else is paid. At 1,000,000 coupons the recount costs about 5 SOL. With the default minimum of 10 SOL, a false challenge covers those fees and the remainder goes to the event pool. A lower minimum set on the event can leave some of the fees unpaid. A challenge that wins is repaid from the poster's 3 SOL bond, so fees above that stay with whoever sent the scores.
+- [ ] **No totals in time.** If no totals are locked within 24 hours of result approval, anyone can start the on-chain count without bonds, as today. An event cannot be stuck because nobody signed.
+- [ ] **Signers can still cancel.** During the window the result signers can cancel the event with the usual threshold. Every stake is then refunded. This is the dispute window from "Fixes before the final phase": a wrong result, such as a mistyped `C`, can still be undone before money moves.
+- [ ] **Claims wait.** No claim is paid while the event is in the window or a recount. A signer who undercounts a tier cannot claim first.
+- [ ] **Too-high totals.** A total that is too high makes every payout smaller and leaves the rest in the vault. That remainder follows the unclaimed-prize rule chosen in the fixes phase.
+- [ ] **Events already on chain.** Events already tallying, and events created before the upgrade, keep the Phase 12 count. The new path applies to events created after the upgrade.
+
+Off-chain work:
+
+- [ ] **Keeper.** It counts with the same colored row count as the program (`kept_counts`, the shared test vectors), builds the scored list, asks the signers to sign, and posts. A count error in Go must lose a challenge, not settle.
+- [ ] **Two watchers.** At least two watchers, each with its own archive built from chain history as the event runs, on different RPC providers. Neither may read the other's MongoDB. Each counts independently and challenges automatically when its totals differ from the signed totals, and it alerts the operator either way. Many RPC providers drop old transactions, so the archive is kept from the first coupon, not rebuilt after the event.
+- [ ] **The second signer counts on its own.** It signs totals only when its own count, from its own archive, matches. When the counts differ, it does not sign, and the 24-hour fallback applies.
+- [ ] **Event page.** It shows the signed totals, the time left in the window, the bond amounts, the challenge button, and the recount progress, and it says whether the totals were confirmed or rejected.
+
+Tests:
+
+- [ ] Correct totals settle after the window with no challenge, and claims pay as before.
+- [ ] Undercounted totals are challenged and recounted, the recount totals are used, and the challenger receives both bonds.
+- [ ] A false challenge loses its bond, the recount fees are paid back first, and the signed totals stand.
+- [ ] A claim past the tier cap is refused. A claim during the window or a recount is refused.
+- [ ] A second challenge, a totals list that differs between signers, totals above the revealed rows, and a window shortened by wall-clock time are all rejected.
+- [ ] With no totals after 24 hours, the old count runs and settles.
+
+**Done when:** a devnet event settles from signed totals 6 hours after posting with no score transactions, a deliberately wrong total is thrown out by a watcher's challenge and recounted, and no claim can pay more than its tier pot.
+
+---
+
+## Fixes before the final phase
+
+Do not start this phase until the user asks for it. It does not wait for Phase 17, and the final phase does not start until this one is done. Nothing here changes the live devnet program until the user asks for a build.
+
+The Phase 5 council cannot upgrade the program. `execute_upgrade` fails with PrivilegeEscalation: the loader needs the program account writable, and the runtime keeps the running program read-only. On devnet the upgrade authority is the deployer key `955GUT...`, so that one key can replace the program instantly and can therefore take any vault. No council account exists for program `AaXABVJE...`.
+
+- [x] **Stop the handoff that would freeze the program.** `handoff-devnet.sh` and `deploy-devnet.sh` moved the authority to the council PDA, which can never sign an upgrade. The handoff is disabled in both. `upgrade-devnet.mjs --probe` is retired. Council addresses are derived from the program id. The copied address `D6e74...` belonged to the retired program. `examples/initialize_upgrade.rs` derives the address too, so a local run no longer panics on the old one.
+- [ ] **Add a dispute window.** Once the threshold approves, the event is in Tallying and cannot be cancelled, so a wrong result, including a mistyped void game `C`, cannot be corrected. Phase 18's 6-hour totals window is that window: the signers can cancel during it. Ship both in this build.
+- [ ] **Decide unclaimed prizes.** Winnings with no claim stay in the vault forever, so a lost key locks that share. Choose one: leave them, or roll them into the next event after a claim deadline. A rollover needs a program change, so it belongs in the same build as the items below.
+- [ ] **Delete the dead council instructions.** Remove `schedule_upgrade`, `execute_upgrade`, `override_upgrade_delay` and `initialize_upgrade`. The last one hard-codes the deployer address. The devnet-testing build's five-minute delay and override go with them.
+- [ ] **Build the production binary.** The live program is the devnet-testing build. The replacement drops the delay and the override, because the delay will live in the multisig. This build also carries the dispute window and the unclaimed-prize rule. It is the last program change before the audit, and the last upgrade the deployer key signs.
+- [ ] **Move the upgrade authority off the deployer key.** After that build is deployed, move the loader authority to a multisig program, such as Squads, with a 24-hour time lock, or burn the authority after the audit. Until then the deployer key remains a single point of control.
+- [ ] **Split the two result keys.** With auto resolve on, the backend holds the admin key and `keys/council-signer.json`, so one machine approves both. That file is also named as a council member. Separate the keys in this phase. How the second signer acts is the option chosen at the start of the final phase.
+- [ ] **Show who can settle an event.** Any wallet can create an event with two keys it controls, and players have to trust that creator. The event page shows the signer set. On mainnet, either only a platform signer set is allowed, or a third signer is required that the creator does not choose.
+
+**Done when:** no single key can replace the program or approve a result, the event page shows the signers, a wrong approval can still be cancelled inside the dispute window, and unclaimed prizes follow the chosen rule.
+
+---
+
 ## Final phase: Audit and Mainnet
 
-Do not start this phase until the user says "start final phase". Other product features come first. The app stays on devnet until then.
+Do not start this phase until the user says "start final phase", and not before "Fixes before the final phase" is done. The app stays on devnet until then.
 
-- [ ] Switch the program to the 24-hour build with no override. This is the last program change
-      before mainnet, and the last upgrade that can skip the delay.
+**Choose this when the phase starts.** The second result signer runs apart from the first and signs only a result it has derived itself from the full-time scores. When both sides produce the same 1, X, 2 string, both approvals land and the event settles with no one at the keyboard. When they differ, the event stays unsigned. The 7-day rule stays: after the resolution window, anyone can cancel and every stake is refunded. A timeout must not adopt the first signer's result, because that would let one key settle the pot by waiting.
+
+- [ ] **Independent second signer.** Take the option above. The first signature never becomes the result on its own. The same signer also signs the Phase 18 totals only from its own count.
+- [ ] **More result signers.** Decide whether an event can have more than 2 result signers, and its threshold. Results and Phase 18 totals use the same set.
+- [ ] Confirm the deployed program is the production build from the fixes phase, with the council instructions removed and the upgrade authority on the multisig.
 - [ ] Internal review against the spec and invariants.
 - [ ] Fuzz tests on `place_coupon`, `claim` and `refund`.
 - [ ] External audit, using the Phase 2 spec and Phase 5 invariants as the brief.
 - [ ] Bug bounty.
 - [ ] Mainnet launch with caps on stake per coupon and per event, raised gradually.
 - [ ] Monitoring and an incident plan (what pause does and does not do).
+- [ ] Replace the free API-Football plan so the app is no longer capped at 100 requests a day. Then refresh scores and odds on a schedule, instead of the Phase 11 score marks and the Phase 16 admin odds button.
 
 ---
 
@@ -652,8 +848,12 @@ Do not start this phase until the user says "start final phase". Other product f
 | 11 | Players cannot see what the current scores would pay, or a live score is mistaken for a settlement |
 | 12 | Someone has to approve a transaction for every coupon before the event can settle |
 | 13 | Someone has to type every result, or a live match is settled before it is finished |
-| 14 | The product works but the player site still looks like a default app |
-| 15 | An event past a few hundred coupons cannot be counted or claimed, or it keeps accepting coupons after 1,000,000 |
+| 14 | Players keep 95% of every pool, and there is no season event funded by play |
+| 15 | Players can only buy every row of a system, or a colored entry asks them to sign once per pattern |
+| 16 | Players pick without seeing the odds, the probabilities, or how everyone else picked once the event has started |
+| 17 | An event past a few hundred coupons cannot be counted or claimed, or it keeps accepting coupons after 1,000,000 |
+| 18 | A 1,000,000-coupon event takes about 23 days to count before anyone can claim |
+| Fixes | One key can replace the program and take every vault, one server approves both sides of a result, and a wrong result cannot be undone |
 | Final | Real users lose real money |
 
-**Next step:** Phase 13 auto resolve is in review. The Phase 14 restyle was reverted after it hid the live forecast. Phase 11 stays in progress until a linked event has shown a projected payout. Phase 15 does not start until the user asks for it. `Test1` still waits until 31 Oct 2026. Do not start the final phase until the user says "start final phase". The old lottery vault is not paid by this program.
+**Next step:** Phase 15 is done: a colored entry is one coupon and one signature, and the devnet program counts only its kept rows. Groups split before the upgrade still finish through the old queue. Phase 16 game details are on the event page. Phase 17 is the canopy and does not start until the user asks for it. Phase 18 replaces the coupon-by-coupon count with signed totals, a 6-hour challenge window and an on-chain recount on challenge. It does not start until the user asks for it, and its program change ships with the fixes build. "Fixes before the final phase" covers the upgrade authority, the result signers, the dispute window and unclaimed prizes, and does not start until the user asks for it. Do not start the final phase until the user says "start final phase". The old lottery vault is not paid by this program.

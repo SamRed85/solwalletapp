@@ -40,22 +40,22 @@ func TestScoreSlipFitsAndKeepsAnUnrevealedCoupon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hidden[8+4+32+4+13+8+32] != 0 {
+	if hidden[8+4+32+4+13+8+32+4] != 0 {
 		t.Fatal("an unrevealed coupon was sent as revealed")
 	}
 	shown, err := scoreSlipData(7, slipArchiveView{Entries: entries, Reveals: reveals})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if shown[8+4+32+4+13+8+32] != 1 {
+	if shown[8+4+32+4+13+8+32+4] != 1 {
 		t.Fatal("a revealed coupon was sent as hidden")
 	}
 	_, keeper, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := signLegacy(keeper, [][]byte{bytesRepeat(2, 32), bytesRepeat(3, 32), bytesRepeat(4, 32)}, [][]byte{bytesRepeat(5, 32), bytesRepeat(6, 32)}, []ixSpec{{
-		program: 5, accounts: []int{0, 1, 4, 2, 3}, data: shown,
+	raw, err := signLegacy(keeper, [][]byte{bytesRepeat(2, 32), bytesRepeat(3, 32), bytesRepeat(4, 32), bytesRepeat(5, 32), bytesRepeat(6, 32), bytesRepeat(7, 32)}, [][]byte{bytesRepeat(8, 32)}, []ixSpec{{
+		program: 7, accounts: []int{0, 1, 2, 3, 4, 5, 6}, data: shown,
 	}}, bytesRepeat(9, 32))
 	if err != nil {
 		t.Fatal(err)

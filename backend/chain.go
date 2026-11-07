@@ -42,6 +42,8 @@ const (
 	eventCouponCountOffset  = 130
 	eventSalesOffset        = 134
 	eventRolloverOffset     = 142
+	eventMinRowsOffset      = 430
+	eventMaxCouponsOffset   = 434
 	eventAccountMinimumSize = 421
 
 	signersEventOffset     = 8
@@ -79,6 +81,9 @@ type chainEvent struct {
 	CouponCount    uint32
 	Sales          uint64
 	RolloverIn     uint64
+	League         bool
+	MinRows        uint32
+	MaxCoupons     uint32
 }
 
 func decodeChainEvent(account *chainAccount, programID string) (*chainEvent, error) {
@@ -120,6 +125,15 @@ func decodeChainEvent(account *chainAccount, programID string) (*chainEvent, err
 	}
 	if ev.Status == "resolved" || ev.Status == "tallying" {
 		ev.Results = string(d[eventResultsOffset : eventResultsOffset+ev.GameCount])
+	}
+	// kind sits in the spare bytes after the winner table. Older accounts are zero, which is a SOL event.
+	if len(d) > 421 {
+		ev.League = d[421] == 1
+	}
+	// Limits sit after league_cut. Zero means the account was created before the limits existed.
+	if len(d) >= eventMaxCouponsOffset+4 {
+		ev.MinRows = binary.LittleEndian.Uint32(d[eventMinRowsOffset:])
+		ev.MaxCoupons = binary.LittleEndian.Uint32(d[eventMaxCouponsOffset:])
 	}
 	return ev, nil
 }
@@ -182,6 +196,10 @@ func checkVaultMatches(e *Event, vault ChainVault, ev *chainEvent, signers *chai
 		return "the on-chain coupon price differs from the event"
 	case !sameTiers(ev.Tiers, e.Tiers):
 		return "the on-chain prize tiers differ from the event"
+	case ev.League != e.League:
+		return "the on-chain event is not the same kind of pool"
+	case !sameCouponLimits(e, ev):
+		return "the on-chain coupon limits differ from the event"
 	case ev.Deadline != e.StartTime.Unix():
 		return "the on-chain entry deadline differs from the event start"
 	case ev.EndTime != e.EndTime.Unix() || ev.RevealDeadline != ev.EndTime:
@@ -200,6 +218,19 @@ func checkVaultMatches(e *Event, vault ChainVault, ev *chainEvent, signers *chai
 		delete(want, m)
 	}
 	return ""
+}
+
+// A legacy account and a legacy event both carry zeros. Publishing that event with the
+// current program writes the defaults, which is the same event.
+func sameCouponLimits(e *Event, ev *chainEvent) bool {
+	wantMin, wantMax := e.MinRows, e.MaxCoupons
+	if wantMin == 0 && wantMax == 0 {
+		if ev.MinRows == 0 && ev.MaxCoupons == 0 {
+			return true
+		}
+		wantMin, wantMax = defaultMinRows, defaultMaxCoupons
+	}
+	return int(ev.MinRows) == wantMin && int(ev.MaxCoupons) == wantMax
 }
 
 func (s *solanaRPC) getAccount(ctx context.Context, address string) (*chainAccount, error) {

@@ -1,10 +1,11 @@
-import { entryApi, revealApi, slipApi } from './api'
+import { entryApi, reductionApi, revealApi, slipApi } from './api'
 import { lockUntil } from './timelock'
 import {
-  COUPON_KEY_MESSAGE, claimIx, claimSlipIx, couponCommitment, couponCount, couponKeyFromSignature, couponPda, eventPda, fetchEvent,
-  picksFromSystem, placeSlipIx, PROGRAM_ID, refundIx, refundSlipIx, revealCouponIx, revealSlipIx, scoreSlipIx, sealCoupon,
-  sendProgramTransaction, systemFromPicks, unsealCoupon, vaultSchedule, walletCoupons
+  COUPON_KEY_MESSAGE, claimIx, claimSlipIx, colorsBytes, couponCapacity, couponCommitment, couponCount, couponKeyFromSignature, couponPda, eventPda,
+  fetchEvent, picksFromSystem, placeSlipIx, PROGRAM_ID, refundIx, refundSlipIx, revealCouponIx, revealSlipIx, scoreSlipIx, sealCoupon,
+  sendProgramTransaction, slipCommitment, systemFromPicks, unsealCoupon, vaultSchedule, walletCoupons
 } from './program'
+import { combinationCount } from '../utils/coupons.js'
 import { publishedSlipPatch } from './slipStatus'
 import { hexToBytes, slipLeaf, slipMark, slipRevealLeaf, sparseProof } from './slipTree'
 import { sendPayment, signMessageBytes, waitForConfirmation } from './solana'
@@ -46,18 +47,37 @@ function leavesOf (entries) {
   return leaves
 }
 
+// The archive can lag behind a coupon this wallet just signed. Fill that gap from
+// the local record. A wrong leaf makes the program reject the proof and nothing is paid.
+function leavesForIndex (archiveEntries, index, wallet, eventId) {
+  const known = new Map()
+  for (const row of archiveEntries || []) known.set(row.index, row)
+  for (const row of loadChainCoupons(wallet)) {
+    if (row.slip && row.eventId === eventId && Number.isInteger(row.index) && !known.has(row.index)) {
+      known.set(row.index, { index: row.index, owner: wallet, combinations: row.combinations, commitment: row.commitment })
+    }
+  }
+  const rows = []
+  for (let cursor = 0; cursor < index; cursor += 1) {
+    const row = known.get(cursor)
+    if (!row) throw new Error('The coupon list is still catching up. Nothing was paid; please submit again.')
+    rows.push(row)
+  }
+  return leavesOf(rows)
+}
+
 function markedNodes (rows, count) {
   const nodes = Array.from({ length: count }, () => null)
   for (const row of rows || []) nodes[row.index] = slipMark()
   return nodes
 }
 
-async function slipProofs (eventAddress, index) {
+async function slipProofs (eventAddress) {
   const archive = await slipApi.get(eventAddress)
   const leaves = leavesOf(archive.entries)
   const reveals = Array.from({ length: leaves.length }, () => null)
   for (const row of archive.reveals || []) {
-    reveals[row.index] = slipRevealLeaf(row.index, row.owner, row.combinations, row.commitment, hexToBytes(row.picks))
+    reveals[row.index] = slipRevealLeaf(row.index, row.owner, row.combinations, row.commitment, hexToBytes(row.picks), row.colors || '')
   }
   const taken = [...(archive.claims || []), ...(archive.refunds || [])]
   return { archive, leaves, reveals, claimed: markedNodes(taken, leaves.length) }
@@ -121,18 +141,36 @@ export async function couponKey (wallet) {
   return key
 }
 
-export async function placeOnChain ({ config, wallet, event, system, combinations, onStep = () => {} }) {
+// Stored with the coupon and in the time lock. Sign bits are a decimal string so JSON keeps them exact.
+const savedColors = colors => colors.map(color => ({ signs: color.signs.toString(), min: color.min, max: color.max }))
+
+function assertCouponAllowed ({ minRows, maxCoupons, count }, combinations) {
+  if (combinations < minRows) {
+    throw new Error(`This event requires at least ${minRows.toLocaleString()} rows on a coupon`)
+  }
+  if (count >= maxCoupons) {
+    throw new Error(`This event is full at ${maxCoupons.toLocaleString()} coupons`)
+  }
+}
+
+// A colored coupon is one slip over the whole frame. `combinations` is the kept rows, which
+// the program recounts from the colors at reveal, score and claim.
+export async function placeOnChain ({ config, wallet, event, system, combinations, colors = [], onStep = () => {} }) {
   onStep('sign')
   const admin = event.chain.admin
   const nonce = event.chain.nonce
   const eventAddress = eventPda(admin, nonce)
-  const key = await couponKey(wallet)
-  const index = await couponCount(config.solanaRpcUrl, eventAddress)
+  const capacity = await couponCapacity(config.solanaRpcUrl, eventAddress)
+  assertCouponAllowed(capacity, combinations)
+  const index = capacity.count
   const picks = picksFromSystem(system)
   const revealNonce = crypto.getRandomValues(new BigUint64Array(1))[0]
-  const commitment = couponCommitment(wallet, picks, revealNonce)
-  const sealed = sealCoupon(key, commitment, picks, revealNonce)
-  if (!unsealCoupon(key, { owner: wallet, commitment, sealed })) throw new Error('The coupon backup could not be verified')
+  const commitment = slipCommitment(wallet, picks, revealNonce, colorsBytes(colors))
+  if (!colors.length) {
+    const key = await couponKey(wallet)
+    const sealed = sealCoupon(key, commitment, picks, revealNonce)
+    if (!unsealCoupon(key, { owner: wallet, commitment, sealed })) throw new Error('The coupon backup could not be verified')
+  }
   const archive = await slipApi.get(eventAddress).catch(() => ({ entries: [] }))
   const leaves = leavesOf(archive.entries || [])
   if (leaves.length !== index) throw new Error('The coupon list is still catching up. Nothing was paid; please submit again.')
@@ -151,7 +189,8 @@ export async function placeOnChain ({ config, wallet, event, system, combination
   const coupon = {
     signature, programId: PROGRAM_ID, eventId: event.id, eventTitle: event.title, admin, nonce, index, slip: true,
     address: `slip:${eventAddress}:${index}`, revealNonce: revealNonce.toString(), commitment: hexBytes(commitment),
-    system, combinations, lamports: event.couponPriceLamports * combinations, placedAt: Date.now(), revealed: false
+    system, combinations, lamports: event.couponPriceLamports * combinations, placedAt: Date.now(), revealed: false,
+    ...(colors.length ? { colors: savedColors(colors) } : {})
   }
   rememberCoupon(wallet, coupon)
   onStep('confirm')
@@ -173,6 +212,137 @@ export async function placeOnChain ({ config, wallet, event, system, combination
   }
   window.dispatchEvent(new Event(COUPON_PLACED))
   return coupon
+}
+
+// Places one piece of a reduction that was sealed before the first signature.
+// The same commitment is reused on resume, and a piece already in this browser is not paid again.
+async function placePreparedSlip ({ config, wallet, event, system, combinations, revealNonce, commitment, onStep = () => {} }) {
+  onStep('sign')
+  const admin = event.chain.admin
+  const nonce = event.chain.nonce
+  const eventAddress = eventPda(admin, nonce)
+  const capacity = await couponCapacity(config.solanaRpcUrl, eventAddress)
+  assertCouponAllowed(capacity, combinations)
+  const index = capacity.count
+  const archive = await slipApi.get(eventAddress).catch(() => ({ entries: [] }))
+  const leaves = leavesForIndex(archive.entries || [], index, wallet, event.id)
+  const commitmentBytes = commitment instanceof Uint8Array ? commitment : hexToBytes(commitment)
+  let sent
+  try {
+    sent = await sendProgramTransaction(config.solanaRpcUrl, wallet, [
+      placeSlipIx({ player: wallet, admin, nonce, commitment: commitmentBytes, combinations, proof: sparseProof(leaves, index) })
+    ])
+  } catch (error) {
+    if (/already in use/i.test(error.message)) {
+      throw new Error('Another player took this coupon number at the same moment. Nothing was paid; please submit again.', { cause: error })
+    }
+    throw error
+  }
+  const { signature, lastValidBlockHeight } = sent
+  const coupon = {
+    signature, programId: PROGRAM_ID, eventId: event.id, eventTitle: event.title, admin, nonce, index, slip: true,
+    address: `slip:${eventAddress}:${index}`, revealNonce: revealNonce.toString(), commitment: hexBytes(commitmentBytes),
+    system, combinations, lamports: event.couponPriceLamports * combinations, placedAt: Date.now(), revealed: false
+  }
+  rememberCoupon(wallet, coupon)
+  onStep('confirm')
+  try {
+    await waitForConfirmation(config.solanaRpcUrl, signature, lastValidBlockHeight)
+    await slipApi.ingest(signature).catch(() => {})
+  } catch (error) {
+    if (/No SOL was sent|failed on chain/.test(error.message)) {
+      saveChainCoupons(wallet, loadChainCoupons(wallet).filter(item => item.signature !== signature))
+    }
+    throw error
+  }
+  onStep('schedule')
+  try {
+    const { deadline, revealDeadline } = vaultSchedule(event)
+    await armCouponReveal({ wallet, coupon, deadline, revealDeadline })
+  } catch (error) {
+    coupon.armError = error.message
+    rememberCoupon(wallet, coupon)
+  }
+  window.dispatchEvent(new Event(COUPON_PLACED))
+  return coupon
+}
+
+function sealPiece (wallet, key, system) {
+  const picks = picksFromSystem(system)
+  const revealNonce = crypto.getRandomValues(new BigUint64Array(1))[0]
+  const commitment = couponCommitment(wallet, picks, revealNonce)
+  const sealed = sealCoupon(key, commitment, picks, revealNonce)
+  if (!unsealCoupon(key, { owner: wallet, commitment, sealed })) throw new Error('The coupon backup could not be verified')
+  const combinations = combinationCount(system)
+  if (combinations < 1) throw new Error('A coupon in this reduction has no rows')
+  return {
+    system, picks, revealNonce, commitment, sealed, combinations,
+    stored: { commitment: hexBytes(commitment), sealed: hexBytes(sealed), combinations }
+  }
+}
+
+function openPiece (wallet, key, piece, gameCount) {
+  const commitment = hexToBytes(piece.commitment)
+  const sealed = hexToBytes(piece.sealed)
+  const opened = unsealCoupon(key, { owner: wallet, commitment, sealed })
+  if (!opened) throw new Error('This reduction could not be opened with this wallet')
+  return {
+    picks: opened.picks,
+    revealNonce: opened.revealNonce,
+    commitment,
+    system: systemFromPicks(opened.picks, gameCount),
+    combinations: piece.combinations
+  }
+}
+
+// Saves the sealed pieces, then asks for one signature per coupon. A later call with the
+// same group continues at the first piece that is not signed yet.
+export async function placeReduction ({ config, wallet, event, pieces, group, onStep = () => {}, onProgress = () => {} }) {
+  const key = await couponKey(wallet)
+  let saved = group
+  let prepared = null
+  if (!saved) {
+    prepared = pieces.map(system => sealPiece(wallet, key, system))
+    saved = await reductionApi.create(event.id, prepared.map(piece => piece.stored))
+  }
+  const total = saved.pieces.length
+  let signed = saved.pieces.filter(piece => piece.status === 'signed').length
+  for (let index = 0; index < total; index += 1) {
+    const piece = saved.pieces[index]
+    onProgress(signed, total)
+    if (piece.status === 'signed') continue
+    const local = loadChainCoupons(wallet).find(coupon => coupon.commitment === piece.commitment && coupon.eventId === event.id && coupon.signature)
+    if (local) {
+      saved = await reductionApi.mark(saved.id, index, local.signature, local.index)
+      signed += 1
+      continue
+    }
+    const opened = prepared
+      ? prepared[index]
+      : openPiece(wallet, key, piece, event.gameCount)
+    if (combinationCount(opened.system) !== piece.combinations) throw new Error('A saved coupon does not match its row count')
+    let placed
+    try {
+      placed = await placePreparedSlip({
+        config, wallet, event, system: opened.system, combinations: opened.combinations,
+        revealNonce: opened.revealNonce, commitment: opened.commitment, onStep
+      })
+    } catch (error) {
+      error.placed = signed
+      error.group = saved
+      throw error
+    }
+    try {
+      saved = await reductionApi.mark(saved.id, index, placed.signature, placed.index)
+    } catch (error) {
+      error.placed = signed + 1
+      error.group = saved
+      throw error
+    }
+    signed += 1
+  }
+  onProgress(signed, total)
+  return saved
 }
 
 const armedKey = wallet => `sol.revealArmed.v2.${wallet}`
@@ -199,7 +369,8 @@ export async function armCouponReveal ({ wallet, coupon, deadline, revealDeadlin
   if (!coupon.system || coupon.revealNonce == null) throw new Error('This browser does not have the picks for that coupon')
   const payload = new TextEncoder().encode(JSON.stringify({
     revealNonce: coupon.revealNonce.toString(),
-    picks: [...picksFromSystem(coupon.system)]
+    picks: [...picksFromSystem(coupon.system)],
+    ...(coupon.colors?.length ? { colors: coupon.colors } : {})
   }))
   await revealApi.arm(coupon.address, await lockUntil(payload, deadline))
   rememberArmed(wallet, coupon.address)
@@ -313,7 +484,7 @@ async function revealSlipInstruction (caller, coupon, picks) {
   return revealSlipIx({
     caller, admin: coupon.admin, nonce: coupon.nonce, index: coupon.index, owner: caller,
     combinations: coupon.combinations, picks, revealNonce: BigInt(coupon.revealNonce), commitment,
-    proof: sparseProof(reveals, coupon.index)
+    colors: colorsBytes(coupon.colors), proof: sparseProof(reveals, coupon.index)
   })
 }
 
@@ -333,11 +504,12 @@ async function claimSlipInstruction (owner, coupon) {
   const { leaves, reveals, claimed } = await slipProofs(event, coupon.index)
   const picks = picksFromSystem(coupon.system)
   const commitment = hexToBytes(coupon.commitment)
+  const colors = colorsBytes(coupon.colors)
   const reveal = {
     index: coupon.index, owner, combinations: coupon.combinations, picks,
-    revealNonce: BigInt(coupon.revealNonce), commitment
+    revealNonce: BigInt(coupon.revealNonce), commitment, colors
   }
-  reveals[coupon.index] = slipRevealLeaf(coupon.index, owner, coupon.combinations, commitment, picks)
+  reveals[coupon.index] = slipRevealLeaf(coupon.index, owner, coupon.combinations, commitment, picks, colors)
   return claimSlipIx({
     owner, admin: coupon.admin, nonce: coupon.nonce, reveal,
     entryProof: sparseProof(leaves, coupon.index),
@@ -375,12 +547,13 @@ export async function scoreNextSlip ({ config, wallet, admin, event }) {
   if (!row) throw new Error('The coupon list is still catching up. Try the count again.')
   const revealedRow = (archive.reveals || []).find(entry => entry.index === index)
   const picks = revealedRow ? hexToBytes(revealedRow.picks) : new Uint8Array(13)
+  const colors = hexToBytes(revealedRow?.colors || '')
   const commitment = hexToBytes(row.commitment)
-  if (revealedRow) reveals[index] = slipRevealLeaf(index, row.owner, row.combinations, commitment, picks)
+  if (revealedRow) reveals[index] = slipRevealLeaf(index, row.owner, row.combinations, commitment, picks, colors)
   const scored = Array.from({ length: index }, () => slipMark())
   const reveal = {
     index, owner: row.owner, combinations: row.combinations, picks,
-    revealNonce: 0n, commitment
+    revealNonce: 0n, commitment, colors
   }
   const { signature, lastValidBlockHeight } = await sendProgramTransaction(config.solanaRpcUrl, wallet, [
     scoreSlipIx({
@@ -454,6 +627,11 @@ export async function submitPending (wallet, pending) {
 // onStep receives 'sign', 'confirm' and 'submit' so the UI can show progress.
 export async function payAndEnter ({ config, wallet, event, system, combinations, onStep = () => {} }) {
   onStep('sign')
+  assertCouponAllowed({
+    minRows: event.minRows || 1,
+    maxCoupons: event.maxCoupons || (1 << 20),
+    count: event.entryCount || 0
+  }, combinations)
   const lamports = event.couponPriceLamports * combinations
   const memo = await paymentMemo(event.id, system)
   const { signature, lastValidBlockHeight } = await sendPayment(config.solanaRpcUrl, wallet, config.treasuryWallet, lamports, memo)
