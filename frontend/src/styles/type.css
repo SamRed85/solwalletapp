@@ -1,45 +1,146 @@
+/* Every size in the app comes from these tokens. Six type sizes, a 4px spacing
+   grid, four radii, two control heights. Add to the scale here, never inline. */
+:root {
+  --font-sans: Geist, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, Consolas, monospace;
+
+  --fs-display: 32px;
+  --lh-display: 36px;
+  --fs-title: 22px;
+  --lh-title: 28px;
+  --fs-heading: 17px;
+  --lh-heading: 24px;
+  --fs-body: 15px;
+  --lh-body: 22px;
+  --fs-small: 13px;
+  --lh-small: 18px;
+  --fs-label: 11px;
+  --lh-label: 14px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+
+  --control-sm: 32px;
+  --control-md: 40px;
+  --control-lg: 48px;
+  --tile: 36px;
+  --tile-sm: 28px;
+  --row: 64px;
+
+  --stroke: rgba(var(--v-border-color), var(--v-border-opacity));
+}
+
 html {
-  font-family: "Source Sans 3", "Segoe UI", sans-serif;
-  font-variant-numeric: tabular-nums;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-feature-settings: "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 .v-application,
+.v-application [class*="text-"],
+.v-application .v-btn {
+  font-family: var(--font-sans) !important;
+}
+
+.v-application code,
+.v-application .mono {
+  font-family: var(--font-mono) !important;
+  font-size: var(--fs-small);
+}
+
 .v-application .text-h1,
 .v-application .text-h2,
 .v-application .text-h3,
+.t-display {
+  font-size: var(--fs-display) !important;
+  line-height: var(--lh-display) !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.02em !important;
+}
+
 .v-application .text-h4,
 .v-application .text-h5,
+.t-title {
+  font-size: var(--fs-title) !important;
+  line-height: var(--lh-title) !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.01em !important;
+}
+
 .v-application .text-h6,
-.v-application .text-body-1,
-.v-application .text-body-2,
 .v-application .text-subtitle-1,
+.v-application .v-card-title,
+.v-application .v-toolbar-title,
+.v-application .v-expansion-panel-title,
+.t-heading {
+  font-size: var(--fs-heading) !important;
+  line-height: var(--lh-heading) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0 !important;
+}
+
+.v-application .text-body-1,
+.v-application .v-list-item-title,
+.t-body {
+  font-size: var(--fs-body) !important;
+  line-height: var(--lh-body) !important;
+  font-weight: 500;
+  letter-spacing: 0 !important;
+}
+
+.v-application .text-body-2,
 .v-application .text-subtitle-2,
 .v-application .text-caption,
+.v-application .v-card-subtitle,
+.v-application .v-list-item-subtitle,
+.v-application .v-table,
+.t-small {
+  font-size: var(--fs-small) !important;
+  line-height: var(--lh-small) !important;
+  letter-spacing: 0 !important;
+}
+
+.v-application .text-subtitle-2 {
+  font-weight: 600 !important;
+}
+
 .v-application .text-overline,
-.v-application .text-button,
-.v-application .v-btn {
-  font-family: "Source Sans 3", "Segoe UI", sans-serif;
-}
-
-.v-application .text-h1,
-.v-application .text-h2,
-.v-application .text-h3,
-.v-application .text-h4,
-.v-application .text-h5,
-.v-application .text-h6,
-.v-application .v-card-title,
-.v-application .v-toolbar-title {
-  font-weight: 500;
+.t-label {
+  font-size: var(--fs-label) !important;
+  line-height: var(--lh-label) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.04em !important;
+  text-transform: uppercase;
 }
 
 .v-application .v-btn {
-  letter-spacing: 0.01em;
+  font-weight: 600;
+  letter-spacing: 0;
   text-indent: 0;
   text-transform: none;
 }
 
 .v-application .wordmark {
-  font-family: Outfit, "Source Sans 3", sans-serif;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  display: inline-block;
+  font-size: var(--fs-heading);
+  font-weight: 800;
+  letter-spacing: -0.045em;
+  line-height: 1;
+  transform: skewX(-11deg);
+}
+
+.v-application .wordmark.home-mark {
+  font-size: var(--fs-display);
+  line-height: var(--lh-display);
 }

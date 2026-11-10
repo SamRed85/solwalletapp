@@ -54,6 +54,7 @@ export const userApi = {
 
 export const eventApi = {
   list: () => data(api.get('/api/events')),
+  leaderboard: span => data(api.get('/api/leaderboard', { params: { span } })),
   get: id => data(api.get(`/api/events/${id}`)),
   create: event => data(api.post('/api/events', event)),
   remove: id => api.delete(`/api/events/${id}`),
@@ -89,6 +90,13 @@ export const reductionApi = {
   create: (eventId, pieces) => data(api.post('/api/reductions', { eventId, pieces })),
   mark: (id, piece, signature, slipIndex) => data(api.patch(`/api/reductions/${id}`, { piece, signature, slipIndex })),
   remove: id => api.delete(`/api/reductions/${id}`)
+}
+
+export const couponApi = {
+  list: () => data(api.get('/api/coupons')),
+  save: coupon => data(api.put('/api/coupons', coupon)),
+  saveMany: coupons => data(api.put('/api/coupons/batch', { coupons })),
+  remove: id => data(api.delete('/api/coupons', { params: { id } }))
 }
 
 export const slipApi = {

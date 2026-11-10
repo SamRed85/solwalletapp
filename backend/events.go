@@ -27,7 +27,32 @@ const (
 	defaultMaxCoupons = 250_000
 	hardMaxCoupons    = 1_000_000
 	legacyMaxCoupons  = 1 << 20
+
+	eventTypeSaturday = "saturday"
+	eventTypeWildcard = "wildcard"
+	eventTypeSprint   = "sprint"
+	sprintGameCount   = 8
+	sprintMaxGames    = 12
 )
+
+// eventTypeOrSaturday is how an event saved before types existed is read.
+func eventTypeOrSaturday(eventType string) string {
+	switch eventType {
+	case eventTypeWildcard, eventTypeSprint:
+		return eventType
+	default:
+		return eventTypeSaturday
+	}
+}
+
+func normalizeEventType(raw string) (string, string) {
+	switch strings.TrimSpace(raw) {
+	case "", eventTypeSaturday, eventTypeWildcard, eventTypeSprint:
+		return eventTypeOrSaturday(strings.TrimSpace(raw)), ""
+	default:
+		return "", "event type must be saturday, wildcard or sprint"
+	}
+}
 
 // Game results and coupon picks use the same encoding: home win, draw, away win.
 var validOutcomes = map[byte]bool{'1': true, 'X': true, '2': true}
@@ -48,19 +73,21 @@ type Game struct {
 // Event status is derived, never stored:
 // draft (no games yet) -> open (entries allowed until startTime) -> closed -> completed (results set).
 type Event struct {
-	ID                  bson.ObjectID `json:"id" bson:"_id,omitempty"`
-	Title               string        `json:"title" bson:"title"`
-	Description         string        `json:"description" bson:"description"`
-	GameCount           int           `json:"gameCount" bson:"gameCount"`
-	CouponPriceLamports uint64        `json:"couponPriceLamports" bson:"couponPriceLamports"`
-	Tiers               []Tier        `json:"tiers" bson:"tiers"`
-	RolloverInLamports  uint64        `json:"rolloverInLamports" bson:"rolloverInLamports"`
-	StartTime           time.Time     `json:"startTime" bson:"startTime"`
-	EndTime             time.Time     `json:"endTime" bson:"endTime"`
-	Games               []Game        `json:"games" bson:"games"`
-	CreatedBy           string        `json:"createdBy" bson:"createdBy"`
-	CreatedAt           time.Time     `json:"createdAt" bson:"createdAt"`
-	AutoResolve         bool          `json:"autoResolve" bson:"autoResolve"`
+	ID          bson.ObjectID `json:"id" bson:"_id,omitempty"`
+	Title       string        `json:"title" bson:"title"`
+	Description string        `json:"description" bson:"description"`
+	// Type is saturday, wildcard or sprint. Events saved before types existed read as saturday.
+	Type                string    `json:"type" bson:"type,omitempty"`
+	GameCount           int       `json:"gameCount" bson:"gameCount"`
+	CouponPriceLamports uint64    `json:"couponPriceLamports" bson:"couponPriceLamports"`
+	Tiers               []Tier    `json:"tiers" bson:"tiers"`
+	RolloverInLamports  uint64    `json:"rolloverInLamports" bson:"rolloverInLamports"`
+	StartTime           time.Time `json:"startTime" bson:"startTime"`
+	EndTime             time.Time `json:"endTime" bson:"endTime"`
+	Games               []Game    `json:"games" bson:"games"`
+	CreatedBy           string    `json:"createdBy" bson:"createdBy"`
+	CreatedAt           time.Time `json:"createdAt" bson:"createdAt"`
+	AutoResolve         bool      `json:"autoResolve" bson:"autoResolve"`
 	// League events are entered with RAD. Their prize is the SOL collected in the league vault.
 	League bool `json:"league" bson:"league,omitempty"`
 	// MinRows is the kept rows a coupon must have. MaxCoupons is how many coupons the event accepts.
@@ -142,6 +169,7 @@ func (e *Event) results() string {
 // prepare fills derived fields and defaults for events created before per-event rules existed.
 func (a *App) prepare(e *Event, now time.Time) {
 	e.Status = e.statusAt(now)
+	e.Type = eventTypeOrSaturday(e.Type)
 	if e.CouponPriceLamports == 0 {
 		e.CouponPriceLamports = a.cfg.CouponPriceLamports
 	}
@@ -329,15 +357,25 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		League              bool   `json:"league"`
 		MinRows             int    `json:"minRows"`
 		MaxCoupons          int    `json:"maxCoupons"`
+		Type                string `json:"type"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	req.Title = strings.TrimSpace(req.Title)
 	req.Description = strings.TrimSpace(req.Description)
+	eventType, typeMsg := normalizeEventType(req.Type)
+	if typeMsg != "" {
+		writeError(w, http.StatusBadRequest, typeMsg)
+		return
+	}
 	now := time.Now()
 	if req.GameCount == 0 {
-		req.GameCount = defaultGameCount
+		if eventType == eventTypeSprint {
+			req.GameCount = sprintGameCount
+		} else {
+			req.GameCount = defaultGameCount
+		}
 	}
 	special := req.GameCount != defaultGameCount
 	if req.League {
@@ -372,6 +410,12 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	case req.GameCount < minGames || req.GameCount > maxGames:
 		writeError(w, http.StatusBadRequest, "an event must have between 7 and 13 games")
 		return
+	case eventType != eventTypeSprint && req.GameCount != defaultGameCount:
+		writeError(w, http.StatusBadRequest, "Saturday and Wildcard events have 13 games")
+		return
+	case eventType == eventTypeSprint && req.GameCount > sprintMaxGames:
+		writeError(w, http.StatusBadRequest, "a Sprint event has between 7 and 12 games")
+		return
 	case !req.StartTime.After(now):
 		writeError(w, http.StatusBadRequest, "start time must be in the future")
 		return
@@ -395,12 +439,13 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	pendingRollover := uint64(0)
 	if !req.League {
-		pendingRollover = a.takePendingRollover(ctx)
+		pendingRollover = a.takePendingRollover(ctx, eventType)
 	}
 	e := Event{
 		ID:                  bson.NewObjectID(),
 		Title:               req.Title,
 		Description:         req.Description,
+		Type:                eventType,
 		GameCount:           req.GameCount,
 		CouponPriceLamports: req.CouponPriceLamports,
 		Tiers:               req.Tiers,
@@ -416,7 +461,7 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		AutoResolve:         wantAutoResolve(req.AutoResolve),
 	}
 	if _, err := a.events.InsertOne(ctx, e); err != nil {
-		_ = a.applyRollover(ctx, nil, e.RolloverInLamports)
+		_ = a.applyRollover(ctx, nil, e.RolloverInLamports, e.Type)
 		writeError(w, http.StatusInternalServerError, "failed to create event")
 		return
 	}
@@ -481,7 +526,7 @@ func (a *App) handleDeleteEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if e.RolloverInLamports > 0 {
-		target, targetErr := a.rolloverTarget(ctx, e.ID, time.Now())
+		target, targetErr := a.rolloverTarget(ctx, e.ID, time.Now(), e.Type)
 		if targetErr != nil || a.applyRolloverFrom(ctx, e.ID, target, e.RolloverInLamports) != nil {
 			if _, insErr := a.events.InsertOne(ctx, e); insErr != nil {
 				log.Printf("event %s was deleted but %d lamports of rollover could not be returned or restored: %v", e.ID.Hex(), e.RolloverInLamports, insErr)
@@ -706,7 +751,7 @@ func (a *App) handleSetChain(w http.ResponseWriter, r *http.Request) {
 		bson.M{"_id": e.ID, "rolloverInLamports": bson.M{"$gt": 0}},
 		bson.M{"$set": bson.M{"rolloverInLamports": 0}},
 	).Decode(&before); err == nil {
-		if err := a.applyRollover(ctx, nil, before.RolloverInLamports); err != nil {
+		if err := a.applyRollover(ctx, nil, before.RolloverInLamports, before.Type); err != nil {
 			log.Printf("event %s: failed to return %d lamports of treasury rollover: %v", e.ID.Hex(), before.RolloverInLamports, err)
 		}
 	}
@@ -785,7 +830,7 @@ func (a *App) handleSetResults(w http.ResponseWriter, r *http.Request) {
 
 	settlement := settleEntries(entries, e.results(), sales, e.RolloverInLamports, e.Tiers)
 	if settlement.RolloverOutLamports > 0 {
-		target, err := a.rolloverTarget(ctx, e.ID, now)
+		target, err := a.rolloverTarget(ctx, e.ID, now, e.Type)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to find the rollover event")
 			return

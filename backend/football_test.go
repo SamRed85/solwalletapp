@@ -140,6 +140,36 @@ func TestOrderFixturesIsByKickoff(t *testing.T) {
 	}
 }
 
+func TestUpcomingFixturesDropStartedMatches(t *testing.T) {
+	now := time.Date(2026, 11, 9, 18, 0, 0, 0, time.UTC)
+	hits := []footballHit{
+		{ID: 1, Status: "FT", Kickoff: now.Add(-2 * time.Hour)},
+		{ID: 2, Status: "1H", Kickoff: now.Add(-time.Hour)},
+		{ID: 3, Status: "NS", Kickoff: now.Add(-time.Minute)},
+		{ID: 4, Status: "NS", Kickoff: now.Add(time.Hour)},
+		{ID: 5, Status: "PST", Kickoff: now.Add(2 * time.Hour)},
+		{ID: 6, Status: "CANC", Kickoff: now.Add(3 * time.Hour)},
+	}
+	open := upcomingFixtures(hits, now)
+	if len(open) != 2 || open[0].ID != 4 || open[1].ID != 5 {
+		t.Fatalf("upcoming = %+v", open)
+	}
+}
+
+func TestOrderFixturesPutsPopularLeaguesFirst(t *testing.T) {
+	noon := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	hits := []footballHit{
+		{ID: 1, LeagueID: 999, Kickoff: noon},
+		{ID: 2, LeagueID: 39, Kickoff: noon.Add(3 * time.Hour)},
+		{ID: 3, LeagueID: 2, Kickoff: noon.Add(5 * time.Hour)},
+		{ID: 4, LeagueID: 39, Kickoff: noon.Add(time.Hour)},
+	}
+	ordered := orderFixtures(hits)
+	if ordered[0].ID != 3 || ordered[1].ID != 4 || ordered[2].ID != 2 || ordered[3].ID != 1 {
+		t.Fatalf("order = %+v", ordered)
+	}
+}
+
 func TestFootballErrorIsShownToTheAdmin(t *testing.T) {
 	if got := footballError([]byte(`{"season":"The Season field is required."}`)); got != "The Season field is required." {
 		t.Fatalf("season = %s", got)

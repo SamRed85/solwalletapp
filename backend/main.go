@@ -29,6 +29,7 @@ type App struct {
 	scores     *mongo.Collection
 	odds       *mongo.Collection
 	reductions *mongo.Collection
+	coupons    *mongo.Collection
 	feed       *footballFeed
 
 	rpc                *solanaRPC
@@ -79,6 +80,7 @@ func main() {
 		scores:                db.Collection("fixtureScores"),
 		odds:                  db.Collection("fixtureOdds"),
 		reductions:            db.Collection("reductions"),
+		coupons:               db.Collection("walletCoupons"),
 		rpc:                   rpc,
 		feed:                  newFootballFeed(cfg.APIFootballKey),
 		verifyPayment:         rpc.verifyPayment,
@@ -128,9 +130,14 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/me", a.requireAuth(a.handleMe))
 	mux.HandleFunc("PUT /api/me", a.requireAuth(a.handleUpdateMe))
 	mux.HandleFunc("GET /api/events", a.withSession(a.handleListEvents))
+	mux.HandleFunc("GET /api/leaderboard", a.withSession(a.handleLeaderboard))
 	mux.HandleFunc("GET /api/events/{id}", a.withSession(a.handleGetEvent))
 	mux.HandleFunc("POST /api/events/{id}/entries", a.requireAuth(a.limitRequests("entry", 20, time.Minute, walletRateKey, a.handleCreateEntry)))
 	mux.HandleFunc("GET /api/entries", a.requireAuth(a.handleMyEntries))
+	mux.HandleFunc("GET /api/coupons", a.requireAuth(a.handleListCoupons))
+	mux.HandleFunc("PUT /api/coupons/batch", a.requireAuth(a.limitRequests("coupon-batch", 30, time.Minute, walletRateKey, a.handleSaveCoupons)))
+	mux.HandleFunc("PUT /api/coupons", a.requireAuth(a.limitRequests("coupon-save", 120, time.Minute, walletRateKey, a.handleSaveCoupon)))
+	mux.HandleFunc("DELETE /api/coupons", a.requireAuth(a.limitRequests("coupon-delete", 60, time.Minute, walletRateKey, a.handleDeleteCoupon)))
 	mux.HandleFunc("GET /api/lottery", a.requireAuth(a.handleLottery))
 	mux.HandleFunc("GET /api/slip-archive", a.requireAuth(a.handleSlipArchive))
 	mux.HandleFunc("POST /api/slip-archive", a.requireAuth(a.limitRequests("slip-archive", 600, time.Minute, walletRateKey, a.handleIngestSlip)))
@@ -201,6 +208,13 @@ func (a *App) ensureIndexes() error {
 	}
 	_, err = a.reductions.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "owner", Value: 1}, {Key: "eventId", Value: 1}, {Key: "createdAt", Value: -1}},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = a.coupons.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "walletAddress", Value: 1}, {Key: "couponId", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{Key: "walletAddress", Value: 1}, {Key: "placedAt", Value: -1}}},
 	})
 	return err
 }

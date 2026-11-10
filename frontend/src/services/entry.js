@@ -1,14 +1,14 @@
-import { entryApi, reductionApi, revealApi, slipApi } from './api'
+import { couponApi, entryApi, reductionApi, revealApi, slipApi } from './api'
 import { lockUntil } from './timelock'
 import {
   COUPON_KEY_MESSAGE, claimIx, claimSlipIx, colorsBytes, couponCapacity, couponCommitment, couponCount, couponKeyFromSignature, couponPda, eventPda,
-  fetchEvent, picksFromSystem, placeSlipIx, PROGRAM_ID, refundIx, refundSlipIx, revealCouponIx, revealSlipIx, scoreSlipIx, sealCoupon,
+  fetchEvent, picksFromSystem, placeSlipIx, PROGRAM_ID, refundIx, refundSlipIx, revealCouponIx, revealNonceFromInstruction, revealSlipIx, scoreSlipIx, sealCoupon,
   sendProgramTransaction, slipCommitment, systemFromPicks, unsealCoupon, vaultSchedule, walletCoupons
 } from './program'
 import { combinationCount } from '../utils/coupons.js'
 import { publishedSlipPatch, slipFromArchive } from './slipStatus'
 import { hexToBytes, slipLeaf, slipMark, slipRevealLeaf, sparseProof } from './slipTree'
-import { sendPayment, signMessageBytes, waitForConfirmation } from './solana'
+import { base58Decode, getTransaction, sendPayment, signMessageBytes, waitForConfirmation } from './solana'
 
 // Payments are kept here until the backend has accepted the entry, so a closed tab or a
 // failed request does not lose a paid coupon. The backend accepts payments up to 1 hour old.
@@ -104,9 +104,86 @@ async function submitWithRetry (eventId, system, signature) {
 
 const chainKey = wallet => `sol.chainCoupons.${wallet}`
 
-export function loadChainCoupons (wallet) {
+function readChain (wallet) {
   try {
     const saved = JSON.parse(localStorage.getItem(chainKey(wallet))) || []
+    return Array.isArray(saved) ? saved : []
+  } catch {
+    return []
+  }
+}
+
+function writeChain (wallet, list) {
+  if (list.length) localStorage.setItem(chainKey(wallet), JSON.stringify(list))
+  else localStorage.removeItem(chainKey(wallet))
+}
+
+const couponText = value => value == null ? '' : String(value)
+const couponNum = value => value ? String(value) : ''
+const couponFlag = value => value ? '1' : '0'
+
+function couponChanged (left, right) {
+  const fields = ['signature', 'programId', 'eventId', 'eventTitle', 'admin', 'address', 'revealNonce', 'commitment', 'armError']
+  if (fields.some(field => couponText(left[field]) !== couponText(right[field]))) return true
+  const numbers = ['nonce', 'index', 'combinations', 'lamports', 'placedAt']
+  if (numbers.some(field => couponNum(left[field]) !== couponNum(right[field]))) return true
+  if (['slip', 'revealed', 'claimed', 'refunded'].some(field => couponFlag(left[field]) !== couponFlag(right[field]))) return true
+  return JSON.stringify(left.system || []) !== JSON.stringify(right.system || [])
+    || JSON.stringify(left.colors || []) !== JSON.stringify(right.colors || [])
+}
+
+// The server copy is the one another device will see. Picks already stored there stay,
+// and a coupon only moves forward: revealed, claimed, or refunded.
+function mergeCoupon (remote, local) {
+  const next = { ...remote, ...local }
+  if (remote.system?.length) {
+    next.system = remote.system
+    if (remote.revealNonce) next.revealNonce = remote.revealNonce
+    if (remote.colors?.length) next.colors = remote.colors
+  }
+  if (!next.signature) next.signature = remote.signature
+  if (!next.eventId) next.eventId = remote.eventId
+  if (!next.eventTitle) next.eventTitle = remote.eventTitle
+  if (!next.admin) next.admin = remote.admin
+  if (!next.commitment) next.commitment = remote.commitment
+  if (!next.nonce) next.nonce = remote.nonce
+  if (!next.index) next.index = remote.index
+  if (!next.combinations) next.combinations = remote.combinations
+  if (!next.lamports) next.lamports = remote.lamports
+  if (remote.placedAt > 0 && (!next.placedAt || next.placedAt > remote.placedAt)) next.placedAt = remote.placedAt
+  next.revealed = !!(next.revealed || remote.revealed)
+  next.claimed = !!(next.claimed || remote.claimed)
+  next.refunded = !!(next.refunded || remote.refunded)
+  next.slip = !!(next.slip || remote.slip)
+  if (remote.address) next.address = remote.address
+  return next
+}
+
+function pushCoupons (coupons) {
+  const batches = []
+  for (let start = 0; start < coupons.length; start += 50) batches.push(coupons.slice(start, start + 50))
+  return batches.reduce((chain, batch) => chain.then(() => couponApi.saveMany(batch)), Promise.resolve())
+}
+
+function publishCouponDiff (previous, list) {
+  const before = new Map(previous.map(coupon => [couponId(coupon), coupon]))
+  const afterIds = new Set()
+  const changed = []
+  for (const coupon of list) {
+    const id = couponId(coupon)
+    afterIds.add(id)
+    const prior = before.get(id)
+    if (!prior || couponChanged(prior, coupon)) changed.push(coupon)
+  }
+  if (changed.length) pushCoupons(changed).catch(() => {})
+  for (const id of before.keys()) {
+    if (!afterIds.has(id)) couponApi.remove(id).catch(() => {})
+  }
+}
+
+export function loadChainCoupons (wallet) {
+  try {
+    const saved = readChain(wallet)
     const current = saved.filter(coupon => coupon.programId === PROGRAM_ID)
     if (current.length !== saved.length) saveChainCoupons(wallet, current)
     return current
@@ -116,8 +193,39 @@ export function loadChainCoupons (wallet) {
 }
 
 function saveChainCoupons (wallet, list) {
-  if (list.length) localStorage.setItem(chainKey(wallet), JSON.stringify(list))
-  else localStorage.removeItem(chainKey(wallet))
+  const previous = readChain(wallet)
+  writeChain(wallet, list)
+  publishCouponDiff(previous, list)
+}
+
+// Loads this wallet's coupons from the server and uploads any that exist only in this browser.
+export async function pullChainCoupons (wallet) {
+  let remote = []
+  try {
+    remote = await couponApi.list()
+  } catch {
+    return
+  }
+  if (!Array.isArray(remote)) return
+  const local = loadChainCoupons(wallet)
+  const remoteById = new Map(remote.map(coupon => [couponId(coupon), coupon]))
+  const merged = []
+  const seen = new Set()
+  const upload = []
+  for (const coupon of local) {
+    const id = couponId(coupon)
+    seen.add(id)
+    const have = remoteById.get(id)
+    const next = have ? mergeCoupon(have, coupon) : coupon
+    merged.push(next)
+    if (!have || couponChanged(have, next)) upload.push(next)
+  }
+  for (const coupon of remote) {
+    if (seen.has(couponId(coupon))) continue
+    merged.push(coupon)
+  }
+  writeChain(wallet, merged)
+  if (upload.length) await pushCoupons(upload).catch(() => {})
 }
 
 // Coupons are identified by their on-chain address; the entry signature is only known for
@@ -460,8 +568,8 @@ function withPublishedPicks (coupon) {
   return next
 }
 
-// Pulls this wallet's slips out of the server archive. The placing browser is the only
-// one that stored the rows locally, so another device would otherwise show an empty list.
+// Pulls this wallet's slips out of the server archive. Coupons saved with the wallet
+// already include their picks. The archive fills slips that were published without one.
 export async function adoptArchiveSlips (wallet, events) {
   let adopted = 0
   for (const event of events || []) {
@@ -567,7 +675,7 @@ async function revealSlipInstruction (caller, coupon, picks) {
 export async function claimOnChain ({ config, wallet, coupon }) {
   const event = eventPda(coupon.admin, coupon.nonce)
   const instructions = coupon.slip
-    ? [await claimSlipInstruction(wallet, coupon)]
+    ? [await claimSlipInstruction(wallet, coupon, config.solanaRpcUrl)]
     : [claimIx({ owner: wallet, event, coupon: couponPda(event, coupon.index) })]
   const { signature, lastValidBlockHeight } = await sendProgramTransaction(config.solanaRpcUrl, wallet, instructions)
   await waitForConfirmation(config.solanaRpcUrl, signature, lastValidBlockHeight)
@@ -575,15 +683,39 @@ export async function claimOnChain ({ config, wallet, coupon }) {
   patchCoupon(wallet, coupon, { claimed: true })
 }
 
-async function claimSlipInstruction (owner, coupon) {
+// The claim checks the nonce against the commitment. A slip adopted from the archive does not
+// have it saved locally; the reveal transaction that published the picks still carries it.
+async function revealNonceForClaim (owner, coupon, archive, rpcUrl) {
+  if (coupon.revealNonce != null && coupon.revealNonce !== '') return BigInt(coupon.revealNonce)
+  const published = (archive.reveals || []).find(row => Number(row.index) === Number(coupon.index))
+  if (!published?.signature) throw new Error('This browser does not have the reveal nonce for that coupon, and its reveal transaction is not in the archive.')
+  const tx = await getTransaction(rpcUrl, published.signature)
+  const lists = [
+    tx?.transaction?.message?.instructions || [],
+    ...(tx?.meta?.innerInstructions || []).map(group => group.instructions || [])
+  ]
+  for (const list of lists) {
+    for (const instruction of list) {
+      if (!instruction?.data) continue
+      const nonce = revealNonceFromInstruction(base58Decode(instruction.data))
+      if (nonce != null) {
+        patchCoupon(owner, coupon, { revealNonce: nonce.toString() })
+        return nonce
+      }
+    }
+  }
+  throw new Error('The reveal transaction does not contain the nonce for that coupon.')
+}
+
+async function claimSlipInstruction (owner, coupon, rpcUrl) {
   const event = eventPda(coupon.admin, coupon.nonce)
-  const { leaves, reveals, claimed } = await slipProofs(event, coupon.index)
+  const { archive, leaves, reveals, claimed } = await slipProofs(event, coupon.index)
   const picks = picksFromSystem(coupon.system)
   const commitment = hexToBytes(coupon.commitment)
   const colors = colorsBytes(coupon.colors)
   const reveal = {
     index: coupon.index, owner, combinations: coupon.combinations, picks,
-    revealNonce: BigInt(coupon.revealNonce), commitment, colors
+    revealNonce: await revealNonceForClaim(owner, coupon, archive, rpcUrl), commitment, colors
   }
   reveals[coupon.index] = slipRevealLeaf(coupon.index, owner, coupon.combinations, commitment, picks, colors)
   return claimSlipIx({
@@ -664,7 +796,7 @@ export async function recoverFromChain ({ wallet, onChain, events }) {
     restored++
   }
   if (restored < missing.length) {
-    throw new Error(`Restored ${restored} of ${missing.length} coupons. The rest need a backup file from the browser that placed them.`)
+    throw new Error(`Restored ${restored} of ${missing.length} coupons. The rest were not saved with this wallet.`)
   }
   return restored
 }

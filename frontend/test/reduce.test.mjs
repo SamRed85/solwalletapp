@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { colorReduction, colorView, keptCounts, missedColorGames, ReductionError } from '../src/utils/reduce.js'
+import { colorPaint, colorReduction, colorView, keptCounts, missedColorGames, ReductionError } from '../src/utils/reduce.js'
 
 const full = count => Array.from({ length: count }, () => ['1', 'X', '2'])
 const OUTCOMES = ['1', 'X', '2']
@@ -25,6 +25,20 @@ function survivors (frame, colors) {
     return hits >= color.min && hits <= color.max
   }))
 }
+
+test('a pick shows every color that was put on it', () => {
+  assert.equal(colorPaint([]), undefined)
+  assert.equal(colorPaint(['yellow']).background, '#F9A825')
+  assert.equal(colorPaint(['yellow']).color, '#1a1a1a')
+  const two = colorPaint(['purple', 'red'])
+  assert.match(two.background, /#6A1B9A 0% 50%/)
+  assert.match(two.background, /#C62828 50% 100%/)
+  assert.match(two.background, /border-box$/)
+  const three = colorPaint(['purple', 'yellow', 'green'])
+  assert.match(three.background, /#6A1B9A 0% 33\.333/)
+  assert.match(three.background, /#F9A825 33\.333/)
+  assert.match(three.background, /#2E7D32 66\.666/)
+})
 
 test('only the color that lands outside its range marks its games', () => {
   const purple = { signs: 0b001001n, min: 2, max: 2 }

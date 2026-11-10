@@ -111,7 +111,12 @@ fn signers_of(event: &Pubkey) -> Pubkey {
 }
 
 fn create_ix(admin: Pubkey, other: Pubkey, nonce: u64, deadline: i64) -> (Instruction, Pubkey, Pubkey) {
+    create_kind_ix(admin, other, nonce, deadline, predictions::KIND_SOL)
+}
+
+fn create_kind_ix(admin: Pubkey, other: Pubkey, nonce: u64, deadline: i64, kind: u8) -> (Instruction, Pubkey, Pubkey) {
     let mut args = event_args(nonce, deadline);
+    args.kind = kind;
     args.signers = vec![admin, other];
     let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
     let vault = pda(&[b"vault", event.as_ref()]);
@@ -1536,4 +1541,72 @@ async fn a_league_event_pays_the_collected_pool_in_rad() {
     assert!(claim_after > claim_before, "the league vault pays the winner in SOL");
     let left = context.banks_client.get_account(league_event_vault).await.unwrap().unwrap();
     assert_eq!(left.lamports, league_settled.rent_reserve);
+}
+
+fn packed_pending(amount: u64, kind: u8) -> u64 {
+    amount | ((kind as u64) << 56)
+}
+
+#[tokio::test]
+async fn rollover_stays_with_its_event_type() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    fund(&mut context, &player.pubkey(), 4_000_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+
+    // Both Wildcard events and the Saturday event are settled before anything is parked,
+    // so creating them does not sweep the escrow and parking does not find a future event.
+    let (create_w1, event_w1, _) = create_kind_ix(admin.pubkey(), other.pubkey(), 40, now + 10, predictions::KIND_WILDCARD);
+    send(&mut context, &admin, create_w1).await.unwrap();
+    let (place_w1, coupon_w1) = place_ix(player.pubkey(), admin.pubkey(), 40, 0);
+    send(&mut context, &player, place_w1).await.unwrap();
+    let (create_s1, event_s1, _) = create_kind_ix(admin.pubkey(), other.pubkey(), 41, now + 20, predictions::KIND_SATURDAY);
+    send(&mut context, &admin, create_s1).await.unwrap();
+    let (place_s1, coupon_s1) = place_ix(player.pubkey(), admin.pubkey(), 41, 0);
+    send(&mut context, &player, place_s1).await.unwrap();
+    let (create_w2, event_w2, _) = create_kind_ix(admin.pubkey(), other.pubkey(), 42, now + 40, predictions::KIND_WILDCARD);
+    send(&mut context, &admin, create_w2).await.unwrap();
+    let (place_w2, coupon_w2) = place_ix(player.pubkey(), admin.pubkey(), 42, 0);
+    send(&mut context, &player, place_w2).await.unwrap();
+
+    set_clock(&mut context, now + 11);
+    send(&mut context, &player, reveal_ix(player.pubkey(), admin.pubkey(), 40, 0)).await.unwrap();
+    set_clock(&mut context, now + 21);
+    send(&mut context, &player, reveal_ix(player.pubkey(), admin.pubkey(), 41, 0)).await.unwrap();
+    set_clock(&mut context, now + 35);
+    resolve(&mut context, &admin, &other, event_w1, vec![b'2'; 7], &[coupon_w1]).await;
+    set_clock(&mut context, now + 41);
+    send(&mut context, &player, reveal_ix(player.pubkey(), admin.pubkey(), 42, 0)).await.unwrap();
+    set_clock(&mut context, now + 70);
+    resolve(&mut context, &admin, &other, event_s1, vec![b'2'; 7], &[coupon_s1]).await;
+    resolve(&mut context, &admin, &other, event_w2, vec![b'2'; 7], &[coupon_w2]).await;
+
+    send(&mut context, &admin, park_ix(admin.pubkey(), 40)).await.unwrap();
+    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, packed_pending(180_000_000, predictions::KIND_WILDCARD));
+    assert!(send(&mut context, &admin, park_ix(admin.pubkey(), 41)).await.is_err(), "Saturday cannot park while Wildcard rollover is waiting");
+    send(&mut context, &admin, park_ix(admin.pubkey(), 42)).await.unwrap();
+    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, packed_pending(360_000_000, predictions::KIND_WILDCARD));
+
+    let (create_s2, event_s2, _) = create_kind_ix(admin.pubkey(), other.pubkey(), 43, now + 5_000, predictions::KIND_SATURDAY);
+    send(&mut context, &admin, create_s2).await.unwrap();
+    assert_eq!(load_event(&mut context, event_s2).await.rollover_in, 0, "Saturday must not take parked Wildcard rollover");
+    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, packed_pending(360_000_000, predictions::KIND_WILDCARD));
+
+    let (create_w3, event_w3, _) = create_kind_ix(admin.pubkey(), other.pubkey(), 44, now + 8_000, predictions::KIND_WILDCARD);
+    send(&mut context, &admin, create_w3).await.unwrap();
+    assert_eq!(load_event(&mut context, event_w3).await.rollover_in, 360_000_000);
+    assert_eq!(load_event(&mut context, event_s2).await.rollover_in, 0);
+    assert_eq!(load_escrow(&mut context, &admin.pubkey()).await.pending, 0);
+
+    let (create_w4, event_w4, _) = create_kind_ix(admin.pubkey(), other.pubkey(), 45, now + 120, predictions::KIND_WILDCARD);
+    send(&mut context, &admin, create_w4).await.unwrap();
+    let (place_w4, coupon_w4) = place_ix(player.pubkey(), admin.pubkey(), 45, 0);
+    send(&mut context, &player, place_w4).await.unwrap();
+    set_clock(&mut context, now + 121);
+    send(&mut context, &player, reveal_ix(player.pubkey(), admin.pubkey(), 45, 0)).await.unwrap();
+    set_clock(&mut context, now + 150);
+    resolve(&mut context, &admin, &other, event_w4, vec![b'2'; 7], &[coupon_w4]).await;
+    assert!(send(&mut context, &admin, forward_ix(admin.pubkey(), 45, 43)).await.is_err(), "Wildcard rollover cannot move to a Saturday event");
 }

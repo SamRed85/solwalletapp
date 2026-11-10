@@ -724,7 +724,43 @@ One coupon per colored entry:
 
 ---
 
-## Phase 17: Canopy for large events
+## Phase 17 Event types and type-aware rollover
+
+In progress (Nov 2026). The backend and frontend parts ship now. The program part goes into the next devnet build.
+
+**Goal:** the admin picks one of three event types when creating an event. The type decides the icon in the event list, the default game count and start day, and where an unclaimed jackpot goes: always to the next event of the same type, never to another type.
+
+The three types, with their working names and the alternatives that were considered:
+
+| Type | Code | Runs | Games | Icon | Name options |
+|------|------|------|-------|------|--------------|
+| Saturday 13 | `saturday` | Every Saturday, fixed slot. Entries close 15:59. | 13, locked | Star | — |
+| Wildcard 13 | `wildcard` | Any day of the week. Entries close at the first kickoff. | 13, locked | Bolt | — |
+| Sprint 8 | `sprint` | Any day of the week. Entries close at the first kickoff. | 8 by default, 7 to 12 allowed | Dice | — |
+
+A jackpot overrides the type colour with gold in the list, as it does today. League stays a separate checkbox, because it changes the currency, not the schedule. The design mockups are in the canvas `event-types-icons-rollover`.
+
+How rollover already works, and what changes:
+
+- A settled event keeps its unclaimed tiers as `rollover_out` in its own vault until the admin presses rollover. Nothing moves on its own. Two or more settled events can wait with a rollover each, of the same type or of different types, and none of the amounts mix, because each stays in its own vault.
+- Pressing rollover does one of two things. If an event of the same type exists that has not started, `forward_rollover` moves the amount straight into that event's vault; the escrow is not involved. If none exists, `park_rollover` moves it into the admin's escrow, and the next event of that type the admin creates takes it as `rollover_in`.
+- The program keeps one `kind` byte per scheduled event in `ScheduleKinds`, and `earliest_future` and `forward_rollover` already route by that byte. Today it is `0` for SOL and `1` for League. The type becomes part of that byte, so the same code routes by type with no new instruction.
+- The escrow stays one account per admin with one balance, and the account does not grow. The kind rides in the top byte of `pending` (the low 56 bits are the lamports). An escrow written before types has those bits at zero, so it reads as Saturday. A park of another kind while the balance is above zero is refused, and `create_event` only sweeps the escrow when the new event's kind matches. Two parks of the same type add up and go to the next event of that type together. The admin's flow is "press rollover, then create the next event of that type", and the list offers that as one transaction.
+
+Rules:
+
+- [x] **Type on the event.** `backend/events.go` gets `Type string`, one of `saturday`, `wildcard`, `sprint`, checked on create. An event saved before the field existed reads as `saturday`. The on-chain `kind` byte encodes it: `0` Saturday, `2` Wildcard, `3` Sprint; `1` stays League. Vault events already on chain read as Saturday.
+- [x] **Rollover target by type.** `rolloverTarget` in `backend/payouts.go` adds the type to its filter, so a treasury event's rollover only lands on an event of the same type. The parked bucket in the `rollover` collection is one document per type (`pending:saturday`, `pending:wildcard`, `pending:sprint`). A new treasury event drains only its own type's bucket, and a Saturday event also drains the old `pending` document. The repair loop replays the stored target, so it follows the type chosen when the event was settled.
+- [x] **Escrow guard.** The kind is the top byte of `Escrow.pending`. The account stays the same size, so no realloc and no migration. `park_rollover` refuses a second kind while the balance is above zero. `create_event` sweeps only when the new event's kind matches. An escrow from before the upgrade reads as Saturday, so a parked amount at upgrade time goes to the next Saturday event, which is what it does today.
+- [x] **Rollover in one transaction.** The vault panel has "Park and create the next {type} event" next to the plain park button. It opens the create form for that type, and publishing sends `park_rollover` and `create_event` in one transaction. The plain park button stays for the case where the next event is not ready yet.
+- [x] **Admin create form.** The type selector is the first field in `Admin.vue` and replaces the "standard or special" split inferred from the game count. Saturday 13 and Wildcard 13 lock the game count at 13. Sprint 8 defaults to 8 and allows 7 to 12, and opens the custom price and tier editor. Saturday preselects the next Saturday 15:59 as the start time. The form says where this event's rollover will go.
+- [x] **Event list icon.** `Home.vue` replaces the game-count circle with a type mark: star, bolt or dice in a rounded tile, with the game count in a small corner badge. Gold when a jackpot is attached. The filter chips under the tabs stay All and Jackpot. The type is shown by the icon, not by a filter.
+- [x] **Copy.** `Event.vue` and `VaultPanel.vue` say "the next Saturday event" (or Wildcard, or Sprint, or league) instead of "the next event", and link to it once it exists.
+- [x] **Tests.** Go tests: a Wildcard rollover never lands on a Saturday event, each type has its own pending bucket, and the old `pending` bucket is drained only by Saturday. Program test: a park of a second kind is refused while the escrow holds another kind, two parks of the same kind add up, `create_event` of another kind leaves the escrow alone, and a forward to an event of another kind is refused.
+
+**Done when:** the admin creates one event of each type from the form, the list shows a different icon for each, a settled Wildcard event's jackpot reaches the next Wildcard event and only that one, and a parked Sprint jackpot waits in the escrow until the next Sprint event is created while a Saturday event created in between takes none of it. The program change is in the source and ships with the next devnet upgrade. Until that upgrade, Saturday vaults work as before and a Wildcard or Sprint vault cannot be published.
+---
+## Phase 18: Canopy for large events
 
 **Goal:** placing, counting, and claiming one coupon still fit in a Solana transaction at 1,000,000 coupons, and the program refuses another one. The tree stays depth 20, which could hold 1,048,576. The event stops at 1,000,000.
 
@@ -741,9 +777,9 @@ Empty proof hashes are already left out. Above a few hundred coupons the upper h
 
 ---
 
-## Phase 18: Signed totals and a challenge window
+## Phase 19: Signed totals and a challenge window
 
-Do not start this phase until the user asks for it. Its program change ships in the same build as "Fixes before the final phase", so the deployer key signs one upgrade, not two.
+Do not start this phase until the user asks for it. 
 
 **Goal:** an event with 1,000,000 coupons settles in hours, not weeks. Counting moves off chain. Each claim is still checked on chain. A wrong total can be thrown out by anyone during a short window, and the vault can never pay out more than the pool.
 
@@ -851,9 +887,10 @@ Do not start this phase until the user says "start final phase", and not before 
 | 14 | Players keep 95% of every pool, and there is no season event funded by play |
 | 15 | Players can only buy every row of a system, or a colored entry asks them to sign once per pattern |
 | 16 | Players pick without seeing the odds, the probabilities, or how everyone else picked once the event has started |
-| 17 | An event past a few hundred coupons cannot be counted or claimed, or it keeps accepting coupons after 1,000,000 |
-| 18 | A 1,000,000-coupon event takes about 23 days to count before anyone can claim |
+| 17 | Every 13-game event looks the same in the list, and a Wildcard jackpot can land on Saturday, or the other way round |
+| 18 | An event past a few hundred coupons cannot be counted or claimed, or it keeps accepting coupons after 1,000,000 |
+| 19 | A 1,000,000-coupon event takes about 23 days to count before anyone can claim |
 | Fixes | One key can replace the program and take every vault, one server approves both sides of a result, and a wrong result cannot be undone |
 | Final | Real users lose real money |
 
-**Next step:** Phase 15 is done: a colored entry is one coupon and one signature, and the devnet program counts only its kept rows. Groups split before the upgrade still finish through the old queue. Phase 16 game details are on the event page. Phase 17 is the canopy and does not start until the user asks for it. Phase 18 replaces the coupon-by-coupon count with signed totals, a 6-hour challenge window and an on-chain recount on challenge. It does not start until the user asks for it, and its program change ships with the fixes build. "Fixes before the final phase" covers the upgrade authority, the result signers, the dispute window and unclaimed prizes, and does not start until the user asks for it. Do not start the final phase until the user says "start final phase". The old lottery vault is not paid by this program.
+**Next step:** Phase 15 is done: a colored entry is one coupon and one signature, and the devnet program counts only its kept rows. Groups split before the upgrade still finish through the old queue. Phase 16 game details are on the event page. Phase 17 is the canopy and does not start until the user asks for it. Phase 18 (event types and type-aware rollover) is built: Saturday 13, Wildcard 13 and Sprint 8. The backend and the pages are in this tree. The program change ships with the next devnet upgrade; until then a Wildcard or Sprint vault cannot be published. Phase 19 replaces the coupon-by-coupon count with signed totals, a 6-hour challenge window and an on-chain recount on challenge. It does not start until the user asks for it, and its program change ships with the fixes build. "Fixes before the final phase" covers the upgrade authority, the result signers, the dispute window and unclaimed prizes, and does not start until the user asks for it. Do not start the final phase until the user says "start final phase". The old lottery vault is not paid by this program.

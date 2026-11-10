@@ -168,6 +168,14 @@ function fromBase64 (encoded) {
   return out
 }
 
+export async function getTransaction (rpcUrl, signature) {
+  return rpc(rpcUrl, 'getTransaction', [signature, {
+    encoding: 'json',
+    commitment: 'confirmed',
+    maxSupportedTransactionVersion: 0
+  }])
+}
+
 export async function getAccount (rpcUrl, address) {
   const result = await rpc(rpcUrl, 'getAccountInfo', [address, { encoding: 'base64', commitment: 'confirmed' }])
   if (!result?.value?.data?.[0]) return null

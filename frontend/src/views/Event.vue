@@ -1,97 +1,84 @@
 <template>
-  <v-container class="py-6" max-width="1100">
-    <v-btn variant="text" prepend-icon="mdi-arrow-left" to="/" class="mb-2">Events</v-btn>
-    <v-progress-linear v-if="loading && !event" indeterminate />
+  <v-container class="event-page py-6" max-width="480">
+    <div class="topbar">
+      <router-link to="/" class="back">
+        <v-icon icon="mdi-arrow-left" size="18" />
+        Events
+      </router-link>
+      <button type="button" class="info-btn" aria-label="How this event works" @click="infoOpen = true">
+        <v-icon icon="mdi-information-outline" size="18" />
+      </button>
+      <v-dialog v-model="infoOpen" max-width="420">
+        <v-card>
+          <v-card-title class="d-flex align-center">
+            How this works
+            <v-spacer />
+            <v-btn icon="mdi-close" variant="text" size="small" aria-label="Close" @click="infoOpen = false" />
+          </v-card-title>
+          <v-card-text class="text-body-2">
+            <p v-if="event?.description" class="mb-3">{{ event.description }}</p>
+            <p class="text-caption text-medium-emphasis mb-1">Picks</p>
+            <p class="mb-3">1 is a home win, X a draw, 2 an away win. Pick one or more on every game. Every combination is its own paid row. 1 and X on one game, and a single pick on the rest, is 2 rows. Two games with two outcomes is 4 rows.</p>
+            <template v-if="event?.chain">
+              <p class="text-caption text-medium-emphasis mb-1">Reduce</p>
+              <p class="mb-3">Choose a color, then tap signs to group them. A row is kept only when every color lands between its min and max. You sign once and pay only for the rows it keeps.</p>
+            </template>
+            <p class="text-caption text-medium-emphasis mb-1">Pool</p>
+            <p v-if="event?.league" class="mb-3">This round is paid in RAD. You earn 1 RAD for every row on a SOL event.<span v-if="radBalance !== null"> You have {{ radBalance }} RAD.</span></p>
+            <p v-else class="mb-3">You pay the row price only, plus a small Solana network fee. The row earns 1 RAD toward the league event. A losing coupon keeps its stake in the pool. The house keeps {{ houseCut }}% and the league vault keeps {{ leagueCut }}% of ticket sales.</p>
+            <p class="text-caption text-medium-emphasis mb-1">Prize rows</p>
+            <p v-for="tier in allocationTiers" :key="tier.correct" class="mb-1">
+              {{ tier.correct }} correct receives {{ tier.percent }}% of ticket sales<span v-if="tier.correct === event?.gameCount">, plus any jackpot</span>.
+            </p>
+            <p class="mt-2 mb-3">A prize row with nobody on it, or one that would pay under 0.01 SOL, rolls into the jackpot of the next {{ typeName }} event.</p>
+            <p v-if="settlement?.rolloverOutLamports" class="mb-3">
+              {{ formatSol(settlement.rolloverOutLamports) }} rolled over to
+              <router-link v-if="settlement.rolloverToEventId" :to="`/events/${settlement.rolloverToEventId}`">the next {{ typeName }} event</router-link>
+              <span v-else>the next {{ typeName }} event that is created</span>.
+            </p>
+            <template v-if="event?.chain">
+              <p class="text-caption text-medium-emphasis mb-1">Entries</p>
+              <p class="mb-3">The on-chain vault holds the entries. Reveal your picks in My Coupons after entries close. A coupon that is not revealed before {{ formatDate(event.endTime) }} cannot win, and its stake stays in the pool.</p>
+            </template>
+            <p v-if="event && event.status !== 'open'" class="mb-3">A live score is what the match shows now. It is not the settled result. Standing payouts are counted from revealed coupons until the event is settled.</p>
+            <p v-if="auth.isAdmin" class="mb-0">Scores also refresh 45 and 90 minutes after entries close. Fetch odds reads the Match Winner line once and saves it.</p>
+          </v-card-text>
+        </v-card>
+      </v-dialog>
+    </div>
+    <v-progress-linear v-if="loading && !event" indeterminate class="mt-4" />
 
     <template v-if="event">
-      <v-card class="mb-4">
-        <v-card-title class="d-flex align-center flex-wrap ga-2">
-          <span class="event-title">{{ event.title }}</span>
-          <v-icon v-if="jackpotLamports" color="amber" :size="28" title="Jackpot event">mdi-trophy</v-icon>
-          <v-chip :color="statusColors[event.status]" size="small" variant="flat">{{ event.status }}</v-chip>
-          <v-chip v-if="jackpotLamports" color="amber" size="small" variant="flat" prepend-icon="mdi-trophy">
-            Jackpot {{ formatSol(jackpotLamports) }}
-          </v-chip>
-        </v-card-title>
-        <v-card-subtitle class="text-wrap">
-          {{ event.gameCount }} games · {{ event.league ? `${event.couponPriceLamports} RAD` : formatSol(event.couponPriceLamports) }} per coupon ·
-          at least {{ limits.minRows.toLocaleString() }} row{{ limits.minRows === 1 ? '' : 's' }} ·
-          {{ limits.count.toLocaleString() }} of {{ limits.maxCoupons.toLocaleString() }} coupons ·
-          entries close {{ formatDate(event.startTime) }}
-        </v-card-subtitle>
-        <v-card-text v-if="auth.isAdmin && event.status !== 'completed'" class="pt-2 pb-0">
-          <div class="d-flex flex-wrap ga-2">
-            <v-btn size="small" variant="tonal" prepend-icon="mdi-refresh" :loading="refreshingScores" @click="refreshScores">
-              Refresh scores
-            </v-btn>
-            <v-btn size="small" variant="tonal" prepend-icon="mdi-percent" :loading="fetchingOdds" @click="fetchOdds">
-              Fetch odds
-            </v-btn>
-          </div>
-          <div class="text-caption text-medium-emphasis mt-1">
-            Scores refresh on their own 45 and 90 minutes after entries close. This button reads them now.
-            Fetch odds reads the Match Winner line once and saves it.
-          </div>
-        </v-card-text>
-        <v-card-text>
-          <p v-if="event.description" class="mb-4">{{ event.description }}</p>
-          <p v-if="event.chain" class="text-body-2">
-            Entries are held by the on-chain vault. Reveal your picks in My Coupons after entries close; a coupon that
-            is not revealed before {{ formatDate(event.endTime) }} cannot win and its stake stays in the prize pool.
-          </p>
-          <template v-if="!event.chain">
-            <div class="sales-block mb-2">
-              <div class="sales-label">Total pot</div>
-              <div class="sales-amount">{{ formatSol(salesLamports + jackpotLamports) }}</div>
-            </div>
-            <p class="text-caption text-medium-emphasis mb-3">
-              {{ formatSol(salesLamports) }} from {{ event.couponsSold }} coupon{{ event.couponsSold === 1 ? '' : 's' }}<template v-if="jackpotLamports"> + {{ formatSol(jackpotLamports) }} jackpot</template>.
-              The house keeps {{ houseCut }}% and the league vault keeps {{ leagueCut }}% of ticket sales.
-            </p>
-            <v-expansion-panels>
-              <v-expansion-panel>
-                <v-expansion-panel-title>{{ settlement ? 'Winnings' : 'Pot so far' }}</v-expansion-panel-title>
-                <v-expansion-panel-text>
-                  <v-table density="compact">
-                    <thead>
-                      <tr>
-                        <th>Correct picks</th><th>Share</th><th>{{ settlement ? 'Pot' : 'Pot so far' }}</th>
-                        <th v-if="settlement">Winning coupons</th><th v-if="settlement">Each wins</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr v-for="tier in tierRows" :key="tier.correct">
-                        <td>{{ tier.correct }}</td>
-                        <td>{{ tier.percent }}%</td>
-                        <td>{{ formatSol(tier.potLamports) }}</td>
-                        <template v-if="settlement">
-                          <td>{{ tier.winners }}</td>
-                          <td>{{ tier.perWinnerLamports ? formatSol(tier.perWinnerLamports) : 'rolls over' }}</td>
-                        </template>
-                      </tr>
-                    </tbody>
-                  </v-table>
-                  <p class="text-caption text-medium-emphasis mt-2 mb-0">
-                    A prize tier rolls over to the jackpot (all games correct) of the next event when nobody hits it, or when each winning row would receive less than 0.01 SOL.
-                  </p>
-                  <p v-if="settlement?.rolloverOutLamports" class="text-caption mt-1 mb-0">
-                    {{ formatSol(settlement.rolloverOutLamports) }} rolled over to
-                    <router-link v-if="settlement.rolloverToEventId" :to="`/events/${settlement.rolloverToEventId}`">the next event</router-link>
-                    <span v-else>the next event that is created</span>.
-                  </p>
-                </v-expansion-panel-text>
-              </v-expansion-panel>
-            </v-expansion-panels>
-          </template>
-        </v-card-text>
-        <VaultPanel v-if="event.chain" embedded :event="event" @changed="refreshEvent" />
-      </v-card>
+      <div class="hero">
+        <div>
+          <div class="balance">{{ event.league ? `${potLamports} RAD` : formatSol(potLamports) }}</div>
+          <p class="balance-note">Total pot</p>
+          <span v-if="jackpotLamports" class="event-tag is-jackpot">Jackpot {{ event.league ? `${jackpotLamports} RAD` : formatSol(jackpotLamports) }}</span>
+        </div>
+        <span class="type-mark" :class="{ jackpot: jackpotLamports }">
+          <v-icon :icon="event.league ? 'mdi-ticket' : eventType.icon" :color="jackpotLamports ? '#F5B800' : eventType.color" size="22" />
+          <span class="type-count">{{ event.gameCount }}</span>
+        </span>
+      </div>
 
-      <v-card v-if="event.status !== 'open'" class="mb-4" title="Games">
-        <v-card-subtitle v-if="event.status !== 'completed'" class="text-wrap">
-          A live score is what the match shows now. It is not the settled result.
-        </v-card-subtitle>
-        <GameCardOptions :event="event" class="games-options" />
+      <div class="identity">
+        <div class="event-title">
+          {{ event.title }}
+          <span class="event-tag" :class="statusTagClass">{{ statusTag }}</span>
+        </div>
+        <div class="event-meta">
+          Closes {{ formatDate(event.startTime) }}
+        </div>
+      </div>
+
+      <div v-if="auth.isAdmin && event.status !== 'completed'" class="chips">
+        <button type="button" class="chip" :disabled="refreshingScores" title="Read the scores now" @click="refreshScores">Refresh scores</button>
+        <button type="button" class="chip" :disabled="fetchingOdds" title="Save the Match Winner odds" @click="fetchOdds">Fetch odds</button>
+      </div>
+
+      <section v-if="event.status !== 'open'" class="block">
+        <h2 class="section-title">Games</h2>
+        <GameCardOptions :event="event" />
         <div v-for="(game, index) in event.games" :key="index" class="game-row">
           <div class="game-top">
             <div class="game-name-line">
@@ -119,176 +106,149 @@
             <a :href="explorerBlock(game.draw.slot)" target="_blank" rel="noopener">block {{ game.draw.slot }}</a>
           </div>
         </div>
-        <v-card-text v-if="officialResults || showStanding">
-          <div class="text-subtitle-2">All rows</div>
-          <div v-if="!allRows.length" class="text-caption text-medium-emphasis">
-            The totals appear once every match has a score.
-          </div>
+        <div v-if="allRows.length || (showStanding && !officialResults)" class="rows-block">
+          <div class="section-title">All rows</div>
+          <p v-if="!allRows.length" class="balance-note">The totals appear once every match has a score.</p>
           <template v-else>
-            <div class="text-caption text-medium-emphasis mb-1">
-              <template v-if="officialResults">Every revealed row in this event.</template>
-              <template v-else-if="projection?.maximum">If these scores stand. Other coupons are still hidden, so this is the most one row could win.</template>
-              <template v-else>If these scores stand. Counted from revealed coupons. This is not the settled payout.</template>
+            <p class="balance-note">{{ rowsCaption }}</p>
+            <div v-for="row in allRows" :key="row.correct" class="result-row">
+              <span>{{ row.correct }} correct</span>
+              <span class="result-rows">{{ Number(row.rows).toLocaleString() }}</span>
+              <span class="result-pay">{{ row.each ? formatSol(row.each) : 'rolls over' }}</span>
             </div>
-            <v-table>
-              <thead><tr><th>Correct picks</th><th>Rows</th><th>Payout</th></tr></thead>
-              <tbody>
-                <tr v-for="row in allRows" :key="row.correct">
-                  <td>{{ row.correct }}</td>
-                  <td>{{ Number(row.rows).toLocaleString() }}</td>
-                  <td>{{ row.each ? formatSol(row.each) : 'rolls over' }}</td>
-                </tr>
-              </tbody>
-            </v-table>
           </template>
-        </v-card-text>
-        <v-card-actions v-if="event.status === 'completed' && auth.wallet">
-          <v-btn color="primary" prepend-icon="mdi-ticket" to="/coupons">See my coupons</v-btn>
-        </v-card-actions>
-      </v-card>
+        </div>
+        <v-btn v-if="event.status === 'completed' && auth.wallet" color="primary" size="large" class="play coupons-link" prepend-icon="mdi-ticket" to="/coupons">
+          See my coupons
+        </v-btn>
+      </section>
 
-      <v-card v-if="event.status === 'open'" class="coupon-entry">
-        <v-card-title>Your coupon</v-card-title>
-        <v-card-subtitle class="text-wrap">
-          Select one or more of 1 (home win), X (draw) and 2 (away win) for every game.
-          Every combination becomes its own paid row.
-        </v-card-subtitle>
-        <v-card-text>
-          <v-alert type="info" variant="tonal" class="mb-4">
-            Example: 1 and X on one game, and only 2 on the others, makes 2 combinations.
-            Selecting two outcomes on two games makes 4.
-          </v-alert>
-          <v-alert v-if="isTreasury" type="warning" variant="tonal" class="mb-4">
-            This wallet is the treasury wallet and cannot pay itself. Sign in with another wallet to play.
-          </v-alert>
-          <v-alert v-if="pendingGroup" type="warning" variant="tonal" class="mb-4">
-            {{ signedPieceCount }} of {{ pendingGroup.pieces.length }} coupons from your reduction are signed.
-            The rest are saved. Resume signs only the ones that are not paid yet.
-            <div class="mt-2 d-flex flex-wrap ga-2">
-              <v-btn size="small" variant="text" :disabled="paying" @click="discardReduction">
-                Drop the unsigned coupons
-              </v-btn>
-            </div>
-          </v-alert>
-          <div v-if="event.chain && !pendingGroup" class="reduce-panel mb-4">
-            <div class="text-subtitle-2 mb-1">Reduce with colors</div>
-            <p class="text-caption text-medium-emphasis mb-2">
-              Choose a color, then tap signs to group them. A row is kept only when every color lands between its min and max.
-              The reduction is one coupon with one signature, and you pay only for the rows it keeps.
-            </p>
-            <div class="d-flex flex-wrap ga-2 mb-2">
-              <v-btn
-                v-for="id in colorIds" :key="id" size="small" class="color-choice" :class="id"
-                :variant="activeColor === id ? 'flat' : 'outlined'"
-                @click="activeColor = activeColor === id ? '' : id"
-              >
-                {{ colorLabels[id] }}
-                <span v-if="colorMarks[id].length" class="ml-1">{{ colorMarks[id].length }}</span>
-              </v-btn>
-            </div>
-            <div v-for="id in usedColorIds" :key="id" class="color-limit">
-              <span class="swatch" :class="id" />
-              <span class="color-name">{{ colorLabels[id] }}</span>
-              <label>Min <input type="number" min="0" :max="colorMarks[id].length" :value="colorLimits[id].min" :disabled="paying" @change="setLimit(id, 'min', $event)"></label>
-              <label>Max <input type="number" min="0" :max="event.gameCount" :value="colorLimits[id].max" :disabled="paying" @change="setLimit(id, 'max', $event)"></label>
-            </div>
+      <section v-if="event.status === 'open'" class="block">
+        <div class="picks-head">
+          <h2 class="section-title">Your picks</h2>
+          <button v-if="event.chain && !pendingGroup" type="button" class="chip" :class="{ on: showReduce }" @click="showReduce = !showReduce">
+            Reduce
+          </button>
+        </div>
+        <v-alert v-if="isTreasury" type="warning" variant="tonal" class="mb-3">
+          This wallet is the treasury wallet and cannot pay itself. Sign in with another wallet to play.
+        </v-alert>
+        <v-alert v-if="pendingGroup" type="warning" variant="tonal" class="mb-3">
+          {{ signedPieceCount }} of {{ pendingGroup.pieces.length }} coupons from your reduction are signed. Resume signs the rest.
+          <div class="mt-2">
+            <v-btn size="small" variant="text" :disabled="paying" @click="discardReduction">Drop the unsigned coupons</v-btn>
           </div>
-          <GameCardOptions :event="event" />
-          <div v-if="event.games.length" class="game-row fill-row">
-            <div class="game-top">
-              <div class="fill-spacer">
-                <v-btn class="pick-btn" variant="text" :disabled="paying" title="Clear every pick" @click="clearPicks">
-                  <v-icon icon="mdi-close" size="16" />
-                </v-btn>
+        </v-alert>
+        <div v-if="showReduce && event.chain && !pendingGroup" class="reduce-panel">
+          <div class="d-flex flex-wrap ga-2">
+            <v-btn
+              v-for="id in colorIds" :key="id" size="small" class="color-choice" :class="id"
+              :variant="activeColor === id ? 'flat' : 'outlined'"
+              @click="activeColor = activeColor === id ? '' : id"
+            >
+              {{ colorLabels[id] }}
+              <span v-if="colorMarks[id].length" class="ml-1">{{ colorMarks[id].length }}</span>
+            </v-btn>
+          </div>
+          <div v-for="id in usedColorIds" :key="id" class="color-limit">
+            <span class="swatch" :class="id" />
+            <span class="color-name">{{ colorLabels[id] }}</span>
+            <span class="stepper">
+              <span class="step-label">Min</span>
+              <button type="button" class="step-btn" :disabled="paying || colorLimits[id].min <= 0" :aria-label="`Lower ${colorLabels[id]} minimum`" @click="stepLimit(id, 'min', -1)">
+                <v-icon icon="mdi-chevron-down" size="16" />
+              </button>
+              <span class="step-value">{{ colorLimits[id].min }}</span>
+              <button type="button" class="step-btn" :disabled="paying || colorLimits[id].min >= colorMarks[id].length" :aria-label="`Raise ${colorLabels[id]} minimum`" @click="stepLimit(id, 'min', 1)">
+                <v-icon icon="mdi-chevron-up" size="16" />
+              </button>
+            </span>
+            <span class="stepper">
+              <span class="step-label">Max</span>
+              <button type="button" class="step-btn" :disabled="paying || colorLimits[id].max <= 0" :aria-label="`Lower ${colorLabels[id]} maximum`" @click="stepLimit(id, 'max', -1)">
+                <v-icon icon="mdi-chevron-down" size="16" />
+              </button>
+              <span class="step-value">{{ colorLimits[id].max }}</span>
+              <button type="button" class="step-btn" :disabled="paying || colorLimits[id].max >= colorMarks[id].length" :aria-label="`Raise ${colorLabels[id]} maximum`" @click="stepLimit(id, 'max', 1)">
+                <v-icon icon="mdi-chevron-up" size="16" />
+              </button>
+            </span>
+          </div>
+        </div>
+        <GameCardOptions :event="event" />
+        <div v-if="event.games.length" class="game-row fill-row">
+          <div class="game-top">
+            <div class="fill-spacer">
+              <v-btn class="pick-btn" variant="text" :disabled="paying" title="Clear every pick" @click="clearPicks">
+                <v-icon icon="mdi-close" size="16" />
+              </v-btn>
+            </div>
+            <v-btn
+              v-for="o in outcomes" :key="o.value" class="pick-btn" variant="text" :disabled="paying"
+              :title="`${o.label} on every game`" @click="selectAll(o.value)"
+            >
+              <v-icon icon="mdi-arrow-down" size="16" />
+            </v-btn>
+          </div>
+        </div>
+        <div v-for="(game, g) in event.games" :key="g" class="game-row">
+          <div class="game-top">
+            <div class="game-name-line">
+              <div
+                class="font-weight-medium team-names" :class="{ expanded: expandedNames.has(`p${g}`) }"
+                :title="`${game.homeTeam} vs ${game.awayTeam}`" @click="toggleName(`p${g}`)"
+              >
+                <span class="game-no">{{ g + 1 }}.</span>{{ game.homeTeam }} vs {{ game.awayTeam }}
               </div>
-              <v-btn
-                v-for="o in outcomes" :key="o.value" class="pick-btn" variant="text" :disabled="paying"
-                :title="`${o.label} on every game`" @click="selectAll(o.value)"
-              >
-                <v-icon icon="mdi-arrow-down" size="16" />
-              </v-btn>
+              <MatchScore v-if="projection?.games?.[g]?.linked" :game="projection.games[g]" :kickoff="game.kickoff" />
             </div>
+            <v-btn
+              v-for="o in outcomes" :key="o.value" class="pick-btn" :title="o.label" :disabled="paying"
+              :color="isSelected(g, o.value) && !signColors(g, o.value).length ? 'primary' : undefined"
+              :variant="isSelected(g, o.value) ? 'flat' : 'outlined'"
+              :class="signColors(g, o.value)"
+              :style="signStyle(g, o.value)"
+              @click="onPick(g, o.value)"
+            >
+              {{ o.value }}
+            </v-btn>
           </div>
-          <div v-for="(game, g) in event.games" :key="g" class="game-row">
-            <div class="game-top">
-              <div class="game-name-line">
-                <div
-                  class="font-weight-medium team-names" :class="{ expanded: expandedNames.has(`p${g}`) }"
-                  :title="`${game.homeTeam} vs ${game.awayTeam}`" @click="toggleName(`p${g}`)"
-                >
-                  <span class="game-no">{{ g + 1 }}.</span>{{ game.homeTeam }} vs {{ game.awayTeam }}
-                </div>
-                <MatchScore v-if="projection?.games?.[g]?.linked" :game="projection.games[g]" :kickoff="game.kickoff" />
-              </div>
-              <v-btn
-                v-for="o in outcomes" :key="o.value" class="pick-btn" :title="o.label" :disabled="paying"
-                :color="isSelected(g, o.value) && !signColors(g, o.value).length ? 'primary' : undefined"
-                :variant="isSelected(g, o.value) ? 'flat' : 'outlined'"
-                :class="signColors(g, o.value)"
-                :style="signStyle(g, o.value)"
-                @click="onPick(g, o.value)"
-              >
-                {{ o.value }}
-              </v-btn>
-            </div>
-            <GameFacts :game="game" :share="shareAt(g)" :started="started" />
+          <GameFacts :game="game" :share="shareAt(g)" :started="started" />
+        </div>
+        <div v-if="preview.length" class="combos">
+          <div class="section-title">Combinations</div>
+          <div class="d-flex flex-column ga-2">
+            <CouponPicks v-for="coupon in preview" :key="coupon" :coupon="coupon" :games="event.games" />
           </div>
-          <div v-if="preview.length" class="mt-4">
-            <div class="text-subtitle-2 mb-2">Combinations</div>
-            <div class="d-flex flex-column ga-2">
-              <CouponPicks v-for="coupon in preview" :key="coupon" :coupon="coupon" :games="event.games" />
+        </div>
+        <ProjectedPayout :system="systemRows(picks)" :colors="reductionState?.ok ? reductionState.colors : []" :projection="projection" />
+        <v-alert v-if="paying" type="info" variant="tonal" density="compact" class="mt-3">{{ stepLabels[step] }}</v-alert>
+        <div class="pay-dock">
+          <div class="pay-hero">
+            <div class="pay-copy">
+              <p class="pay-total">{{ event.league ? `${totalLamports} RAD` : formatSol(totalLamports) }}</p>
+              <p class="pay-line">{{ paidRows.toLocaleString() }} × {{ priceLabel }}</p>
+              <p class="pay-line" :class="{ 'is-short': lowBalance }">Balance = {{ walletBalance }}</p>
             </div>
+            <v-btn
+              v-if="!auth.wallet"
+              color="primary" variant="flat" size="large" class="play"
+              :loading="auth.busy" @click="onLogin"
+            >
+              Connect
+            </v-btn>
+            <v-btn
+              v-else
+              color="primary" variant="flat" size="large" class="play"
+              :disabled="!canSubmit || isTreasury" :loading="paying" @click="pay"
+            >
+              {{ payLabel }}
+            </v-btn>
           </div>
-        </v-card-text>
-        <v-divider />
-        <v-card-actions class="pay-bar flex-wrap ga-2 pa-4">
-          <div>
-            <div class="text-subtitle-1">
-              <template v-if="reductionState?.ok && reductionState.rows !== combinationTotal">
-                {{ combinationTotal.toLocaleString() }} reduced to {{ reductionState.rows.toLocaleString() }}
-                ({{ removedPercent }}% removed) · 1 coupon ·
-              </template>
-              <template v-else-if="overRows">
-                <span class="text-error">
-                  {{ combinationTotal.toLocaleString() }} reduced to {{ overRows.toLocaleString() }}, over the
-                  {{ maxCombinations.toLocaleString() }} limit
-                </span>
-                ·
-              </template>
-              <template v-else>
-                {{ paidRows.toLocaleString() }} combination{{ paidRows === 1 ? '' : 's' }} ×
-              </template>
-              {{ event.league ? `${event.couponPriceLamports} RAD` : formatSol(event.couponPriceLamports) }} =
-              <strong>{{ event.league ? `${totalLamports} RAD` : formatSol(totalLamports) }}</strong>
-            </div>
-            <div class="text-caption text-medium-emphasis">
-              {{ statusText }}
-            </div>
-            <div class="text-caption text-medium-emphasis mt-1">
-              <template v-if="event.league">This round is paid in RAD. You earn 1 RAD for every row on a SOL event. <span v-if="radBalance !== null">You have {{ radBalance }} RAD.</span></template>
-              <template v-else>You pay the coupon price only, and this row earns 1 RAD toward the league event. A losing coupon keeps its stake in the pool. There is no account deposit and no monthly draw.</template>
-            </div>
-            <ProjectedPayout :system="systemRows(picks)" :colors="reductionState?.ok ? reductionState.colors : []" :projection="projection" />
-            <div v-if="lowBalance" class="text-caption text-error">Your devnet balance looks too low for this payment.</div>
-          </div>
-          <v-spacer />
-          <v-btn
-            v-if="!auth.wallet"
-            color="primary" variant="flat" size="large" prepend-icon="mdi-wallet"
-            :loading="auth.busy" @click="onLogin"
-          >
-            Connect wallet to play
-          </v-btn>
-          <v-btn
-            v-else
-            color="primary" variant="flat" size="large" prepend-icon="mdi-wallet"
-            :disabled="!canSubmit || isTreasury" :loading="paying" @click="pay"
-          >
-            {{ payLabel }}
-          </v-btn>
-        </v-card-actions>
-        <v-alert v-if="paying" type="info" variant="tonal" class="ma-4 mt-0">{{ stepLabels[step] }}</v-alert>
-      </v-card>
+        </div>
+      </section>
+
+      <VaultPanel v-if="event.chain" brief embedded class="vault-slot" :event="event" @changed="refreshEvent" />
     </template>
   </v-container>
 </template>
@@ -303,15 +263,16 @@ import MatchScore from '@/components/MatchScore.vue'
 import ProjectedPayout from '@/components/ProjectedPayout.vue'
 import VaultPanel from '@/components/VaultPanel.vue'
 import { eventApi, reductionApi } from '@/services/api'
+import { eventTypeOf } from '@/services/eventTypes'
 import { couponCapacity, fetchRad } from '@/services/program'
 import { payAndEnter, placeOnChain, placeReduction } from '@/services/entry'
 import { auth, loadConfig, login, refreshBalance } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { combinationCount, expandCombinations, systemRows } from '@/utils/coupons'
-import { COLOR_IDS, colorReduction } from '@/utils/reduce'
+import { COLOR_IDS, colorPaint, colorReduction } from '@/utils/reduce'
 import { eventStarted } from '@/services/gameCards'
 import { showStandingPayout } from '@/services/projection'
-import { explorerBlock, formatDate, formatSol, outcomes, statusColors } from '@/utils/format'
+import { explorerBlock, formatDate, formatSol, outcomes } from '@/utils/format'
 
 const route = useRoute()
 const router = useRouter()
@@ -333,6 +294,8 @@ const colorLimits = ref({
 const activeColor = ref('')
 const pendingGroup = ref(null)
 const expandedNames = ref(new Set())
+const infoOpen = ref(false)
+const showReduce = ref(false)
 
 function toggleName (key) {
   const next = new Set(expandedNames.value)
@@ -359,6 +322,24 @@ const leagueCut = computed(() => auth.config?.leagueCutPercent ?? 5)
 const radBalance = ref(null)
 const isTreasury = computed(() => auth.config && auth.wallet === auth.config.treasuryWallet)
 const settlement = computed(() => event.value?.settlement)
+const eventType = computed(() => eventTypeOf(event.value))
+const typeName = computed(() => event.value?.league ? 'league' : eventType.value.short)
+const priceLabel = computed(() => event.value?.league ? `${event.value.couponPriceLamports} RAD` : formatSol(event.value?.couponPriceLamports || 0))
+const allocationTiers = computed(() => {
+  const tiers = settlement.value?.tiers || event.value?.tiers || []
+  return [...tiers].sort((a, b) => b.correct - a.correct)
+})
+const statusTag = computed(() => {
+  if (event.value?.status === 'closed') return 'Live'
+  if (event.value?.status === 'completed') return ''
+  return 'Open'
+})
+const statusTagClass = computed(() => event.value?.status === 'closed' ? 'is-live' : '')
+const rowsCaption = computed(() => {
+  if (officialResults.value) return 'Every revealed row.'
+  if (projection.value?.maximum) return 'Most one row could win if these scores stand.'
+  return 'If these scores stand. Not the settled payout.'
+})
 const combinationTotal = computed(() => combinationCount(picks.value))
 const preview = computed(() => expandCombinations(picks.value))
 const missingGames = computed(() => picks.value.filter(game => game.length === 0).length)
@@ -411,42 +392,28 @@ const payLabel = computed(() => {
     const left = pendingGroup.value.pieces.length - signedPieceCount.value
     return `Resume ${left} coupon${left === 1 ? '' : 's'}`
   }
-  return event.value?.league ? 'Enter with RAD' : 'Pay with Phantom'
+  return event.value?.league ? 'Enter' : 'Pay'
 })
 const lowBalance = computed(() => !event.value?.league && auth.balance !== null && auth.balance * 1e9 < totalLamports.value + 10000)
-const statusText = computed(() => {
-  if (eventFull.value) return `This event is full at ${limits.value.maxCoupons.toLocaleString()} coupons.`
-  if (pendingGroup.value) return 'The coupons already signed stay in the pool. Resume continues with the next one.'
-  if (missingGames.value) return `${missingGames.value} game${missingGames.value === 1 ? '' : 's'} still need a pick`
-  if (belowMin.value) return `This event requires at least ${limits.value.minRows.toLocaleString()} rows on a coupon. Add picks or loosen the colors.`
-  if (reductionState.value?.ok === false) return reductionState.value.error
-  if (tooMany.value) return `${combinationTotal.value.toLocaleString()} rows. A coupon can hold at most ${maxCombinations.value.toLocaleString()} kept rows. Use the colors to reduce it, or remove some picks.`
-  if (reductionState.value?.ok && removedPercent.value === 0) return 'Min 0 and a max that covers every sign keeps every row. Lower the max or raise the min to remove rows.'
-  if (activeColor.value) return `${colorLabels[activeColor.value]} is on. Tap a sign to add or remove it from that color.`
-  return 'Plus a small Solana network fee, paid from your wallet.'
+const walletBalance = computed(() => {
+  if (event.value?.league) return radBalance.value === null ? '—' : `${radBalance.value} RAD`
+  if (!auth.wallet || auth.balance === null) return '—'
+  return formatSol(Math.round(auth.balance * 1e9))
 })
 
 const salesLamports = computed(() => {
   const e = event.value
   if (!e) return 0
+  if (e.chain && chainCapacity.value) return Number(chainCapacity.value.sales || 0)
   return e.couponsSold * e.couponPriceLamports
 })
+const potLamports = computed(() => salesLamports.value + jackpotLamports.value)
 
 // A vault event's carried-over jackpot is only on chain. The database copy is returned to the
 // treasury when the vault is attached.
 const jackpotLamports = computed(() => {
   if (event.value?.chain) return Number(chainCapacity.value?.rolloverIn ?? 0n)
   return event.value?.rolloverInLamports || 0
-})
-
-const tierRows = computed(() => {
-  const e = event.value
-  if (settlement.value) return settlement.value.tiers
-  const sales = salesLamports.value
-  return e.tiers.map(t => ({
-    ...t,
-    potLamports: Math.floor(sales * t.percent / 100) + (t.correct === e.gameCount ? e.rolloverInLamports : 0)
-  }))
 })
 
 const started = computed(() => eventStarted(event.value))
@@ -559,17 +526,16 @@ function signColors (game, outcome) {
 }
 
 function signStyle (game, outcome) {
-  const marks = signColors(game, outcome)
-  if (!marks.length) return undefined
-  const ink = { purple: '#6A1B9A', yellow: '#F9A825', red: '#C62828', green: '#2E7D32' }
-  return { background: ink[marks[0]], color: marks[0] === 'yellow' ? '#1a1a1a' : '#fff', borderColor: 'transparent' }
+  return colorPaint(signColors(game, outcome))
 }
 
-function setLimit (id, field, input) {
-  const raw = Number.parseInt(input.target.value, 10)
-  const value = Number.isInteger(raw) && raw >= 0 ? raw : 0
+// Min and max move one step at a time, between 0 and the number of signs in the color.
+function stepLimit (id, field, delta) {
   const limits = colorLimits.value[id]
-  limits[field] = value
+  const cap = colorMarks.value[id].length
+  const next = limits[field] + delta
+  if (next < 0 || next > cap) return
+  limits[field] = next
   if (limits.min > limits.max) {
     if (field === 'min') limits.max = limits.min
     else limits.min = limits.max
@@ -609,6 +575,7 @@ function toggleColorSign (game, outcome) {
     if (tracking) colorLimits.value[id].max = colorMarks.value[id].length
   }
   const limits = colorLimits.value[id]
+  if (limits.max > colorMarks.value[id].length) limits.max = colorMarks.value[id].length
   if (limits.min > limits.max) limits.min = limits.max
 }
 
@@ -780,14 +747,47 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
 </script>
 
 <style scoped>
-.event-title {
-  font-size: 3.4rem;
-  font-weight: 600;
-  line-height: 1.05;
-  letter-spacing: -0.02em;
-}
+.event-page { padding-bottom: 24px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; }
+.back { display: inline-flex; align-items: center; gap: 4px; color: rgba(var(--v-theme-on-surface), 0.62); text-decoration: none; font-size: var(--fs-small); font-weight: 600; }
+.info-btn { width: 34px; height: 34px; border: 0; border-radius: 10px; background: rgb(var(--v-theme-surface)); color: rgba(var(--v-theme-on-surface), 0.62); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.hero { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 8px; }
+.balance { font-size: var(--fs-display); line-height: var(--lh-display); font-weight: 700; letter-spacing: -0.02em; }
+.balance-note { margin: 2px 0 0; font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.62); }
+.type-mark { width: 44px; height: 44px; border-radius: 14px; background: rgb(var(--v-theme-surface-variant)); display: flex; align-items: center; justify-content: center; position: relative; flex: none; }
+.type-mark.jackpot { background: rgba(245, 184, 0, 0.16); }
+.type-count { position: absolute; right: -4px; bottom: -4px; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 999px; background: rgb(var(--v-theme-background)); color: rgb(var(--v-theme-on-surface)); font-size: 10px; font-weight: 800; display: flex; align-items: center; justify-content: center; }
+.identity { margin-top: 14px; }
+.event-title { font-size: var(--fs-body); font-weight: 600; }
+.event-meta { margin-top: 2px; font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.62); }
+.event-tag { display: inline-block; margin-top: 4px; font-size: var(--fs-small); font-weight: 600; color: rgba(var(--v-theme-warning), 0.62); }
+.event-tag.is-jackpot { color: #F5B800; }
+.event-tag.is-live { color: rgb(var(--v-theme-success)); }
+.chips { display: flex; gap: 8px; margin-top: 12px; }
+.chip { height: 34px; padding: 0 12px; border: 0; border-radius: 10px; background: rgb(var(--v-theme-surface)); color: rgba(var(--v-theme-on-surface), 0.62); font: inherit; font-size: var(--fs-body); font-weight: 600; cursor: pointer; }
+.chip.on { background: rgb(var(--v-theme-surface-variant)); color: rgb(var(--v-theme-on-surface)); }
+.chip:disabled { opacity: 0.5; }
+.block { margin-top: 22px; }
+.block :deep(.card-options) { align-items: flex-start; }
+.block :deep(.option-grid) { justify-content: flex-start; }
+.picks-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.section-title { font-size: var(--fs-heading); line-height: var(--lh-heading); font-weight: 600; margin: 0 0 8px; }
+.rows-block { margin-top: 16px; }
+.result-row { display: flex; align-items: center; gap: 12px; height: 40px; font-size: var(--fs-small); }
+.result-rows { margin-left: auto; color: rgba(var(--v-theme-on-surface), 0.62); }
+.result-pay { font-weight: 700; min-width: 72px; text-align: right; }
+.coupons-link { margin-top: 16px; }
+.combos { margin-top: 16px; }
+.pay-dock { margin-top: 16px; }
+.pay-hero { display: flex; align-items: center; justify-content: space-between; gap: 16px; height: 52px; position: sticky; bottom: 0; z-index: 2; background: rgb(var(--v-theme-background)); border-top: 1px solid var(--stroke); }
+.pay-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 1px; }
+.pay-total { margin: 0; height: 20px; font-size: var(--fs-heading); line-height: 20px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pay-line { margin: 0; height: 14px; font-size: var(--fs-label); line-height: 14px; font-weight: 600; color: rgba(var(--v-theme-on-surface), 0.72); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pay-line.is-short { color: rgb(var(--v-theme-error)); }
+.play { min-width: 128px; border-radius: 14px; }
+.vault-slot { margin-top: 20px; }
 .game-row {
-  --sign: 25px;
+  --sign: 36px;
   --sign-gap: 8px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) repeat(3, var(--sign));
@@ -795,7 +795,6 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
   align-items: center;
   row-gap: 1px;
   padding: 8px 0;
-  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 .game-top {
   display: grid;
@@ -844,17 +843,23 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
   white-space: nowrap;
 }
 .pick-btn {
-  flex: 0 0 25px;
-  width: 25px !important;
-  min-width: 25px !important;
-  height: 25px !important;
-  min-height: 25px !important;
+  flex: 0 0 36px;
+  width: 36px !important;
+  min-width: 36px !important;
+  height: 32px !important;
+  min-height: 32px !important;
   padding: 0 !important;
   font-size: 12px;
   transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease, transform 120ms ease;
 }
 .pick-btn:active {
   transform: scale(0.98);
+}
+.pay-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: rgb(var(--v-theme-surface));
 }
 .reduce-panel {
   padding: 12px;
@@ -868,14 +873,29 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
 .color-limit {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 6px;
+  gap: 12px;
+  margin-top: 8px;
   font-size: 13px;
+  user-select: none;
 }
-.color-limit input {
-  width: 64px;
-  margin-left: 4px;
+.color-name { width: 48px; flex: none; }
+.stepper { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.step-label { margin-right: 2px; color: rgba(var(--v-theme-on-surface), 0.62); }
+.step-value { min-width: 14px; text-align: center; font-weight: 700; }
+.step-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: rgb(var(--v-theme-surface-variant));
+  color: rgb(var(--v-theme-on-surface));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
 }
+.step-btn:disabled { opacity: 0.35; cursor: default; }
 .swatch {
   width: 12px;
   height: 12px;
@@ -896,9 +916,9 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 25px;
-  min-width: 25px;
-  height: 25px;
+  width: 36px;
+  min-width: 36px;
+  height: 32px;
   padding: 0;
   border-radius: 6px;
   border: 1px solid rgba(var(--v-theme-on-surface), 0.16);
@@ -913,12 +933,26 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
   color: rgb(var(--v-theme-on-surface));
 }
 @media (max-width: 959px) {
-  .event-title { font-size: 2rem; }
+  .hero { margin-top: 4px; }
   .game-row { flex-wrap: nowrap; width: 100%; }
-  .game-name-line .font-weight-medium { font-size: 10px; }
-  .coupon-entry .game-name-line .font-weight-medium { font-size: 14px; }
+  .game-name-line .font-weight-medium { font-size: 14px; }
   .game-when { font-size: 9px; }
-  .pay-bar { flex-direction: column; align-items: stretch; }
-  .pay-bar .v-btn { width: 100%; }
+  .event-page:has(.pay-dock) { padding-bottom: 120px !important; }
+  .pay-dock {
+    position: fixed;
+    left: 16px;
+    right: 16px;
+    bottom: calc(16px + var(--nav-height) + 10px + var(--inset-bottom));
+    z-index: 6;
+    box-sizing: border-box;
+    height: 72px;
+    margin: 0;
+    padding: 10px 12px;
+    overflow: hidden;
+    border-radius: var(--radius-lg);
+    background: rgb(var(--v-theme-surface));
+  }
+  .pay-hero { position: static; margin: 0; border: 0; background: transparent; }
+  .play { align-self: center; }
 }
 </style>

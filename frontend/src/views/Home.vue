@@ -1,95 +1,172 @@
 <template>
-  <v-container class="py-8" max-width="900">
-    <div class="text-center mb-6 home-hero">
-      <v-icon :size="mobile ? 48 : 72" color="primary" class="mb-3">mdi-target</v-icon>
-      <h1 class="text-h3 mb-2">Welcome to Sol</h1>
-      <p class="text-h6 text-medium-emphasis">Predict match outcomes with your Solana wallet</p>
+  <v-container class="home py-6" max-width="480">
+    <div class="hero">
+      <div class="hero-copy">
+        <div class="balance" :class="balanceClass">
+          <template v-if="auth.wallet && auth.balance !== null">
+            <SolAmount :lamports="Math.round(auth.balance * 1e9)" />
+          </template>
+          <template v-else-if="auth.wallet">—</template>
+          <template v-else >Connect to play</template>
+        </div>
+        <p v-if="auth.wallet" class="text-medium-emphasis balance-note">Devnet wallet balance</p>
+      </div>
+      <v-btn v-if="auth.wallet" color="primary" size="large" class="play" :loading="auth.busy" :disabled="auth.wallet && !openEvent" @click="onPlay">
+        {{ openEvent ? 'Play' : 'No open round'}}
+      </v-btn>
     </div>
 
-    <v-card>
-        <v-card-title class="d-flex align-center flex-wrap ga-2">
-          <v-icon class="mr-2">mdi-calendar</v-icon>
-          Events
-          <v-spacer />
-          <v-btn v-if="auth.isAdmin" variant="text" color="warning" prepend-icon="mdi-shield-crown" to="/admin">
-            Manage
-          </v-btn>
-        </v-card-title>
-        <v-progress-linear v-if="loading" indeterminate />
-        <v-card-text v-if="!loading && events.length === 0" class="text-center text-medium-emphasis">
-          No events yet.
-        </v-card-text>
-        <v-list v-else lines="three">
-          <v-list-item
-            v-for="event in events" :key="event.id" class="event-link" :to="`/events/${event.id}`"
-            :disabled="event.status === 'draft' && !auth.isAdmin"
-          >
-            <v-list-item-title class="d-flex align-center ga-1">
-              <span class="event-name">{{ event.title }}</span>
-              <v-icon v-if="jackpotOf(event)" color="amber" size="small" title="Jackpot event">mdi-trophy</v-icon>
-            </v-list-item-title>
-            <v-list-item-subtitle>
-              {{ event.gameCount }} games · {{ formatSol(event.couponPriceLamports) }} per coupon · entries close {{ formatDate(event.startTime) }}
-            </v-list-item-subtitle>
-            <div class="d-flex flex-wrap ga-2 mt-2">
-              <v-chip v-if="jackpotOf(event)" color="amber" size="small" variant="flat" prepend-icon="mdi-trophy">
-                Jackpot {{ formatSol(jackpotOf(event)) }}
-              </v-chip>
-              <v-chip :color="statusColors[event.status]" size="small" variant="flat">
-                {{ event.status === 'open' ? 'play' : event.status }}
-              </v-chip>
-            </div>
-          </v-list-item>
-        </v-list>
-      </v-card>
+    <section v-if="wins.length" class="mt-6">
+      <h2 class="section-title d-flex align-center ga-2">
+        <v-icon icon="mdi-lightning-bolt" size="20" />
+        Biggest wins this week
+      </h2>
+      <div class="win-row">
+        <article v-for="win in wins" :key="win.wallet" class="win-card">
+          <div class="d-flex align-center ga-2">
+            <span class="avatar sm">{{ initials(win.name || win.wallet) }}</span>
+            <span class="win-name">{{ win.name || shortAddress(win.wallet) }}</span>
+          </div>
+          <div class="win-amount">+{{ formatSol(win.winningsLamports) }}</div>
+          <div class="win-sub">{{ win.eventTitle }} · {{ win.bestCorrect }} of {{ win.gameCount }}</div>
+        </article>
+      </div>
+    </section>
 
-      <v-card v-if="!auth.wallet" variant="outlined" class="pa-6 text-center mt-4">
+    <div class="tabs" role="tablist">
+      <button v-for="item in tabs" :key="item" type="button" role="tab" class="tab" :class="{ on: tab === item }" :aria-selected="tab === item" @click="tab = item">
+        {{ item }}
+      </button>
+    </div>
+
+    <div class="chips">
+      <v-btn v-if="auth.isAdmin" icon="mdi-shield-crown" variant="text" size="small" to="/admin" aria-label="Manage events" />
+      <button v-for="item in chips" :key="item" type="button" class="chip" :class="{ on: chip === item }" @click="chip = item">
+        {{ item === 'jackpot' ? 'Jackpot' : 'All' }}
+      </button>
+    </div>
+
+    <v-progress-linear v-if="loading" indeterminate class="mt-4" />
+    <p v-else-if="!shown.length" class="empty">Nothing in this list.</p>
+    <router-link v-for="event in shown" :key="event.id" class="event-row" :to="`/events/${event.id}`">
+      <span class="type-mark" :class="{ jackpot: jackpotOf(event) }">
+        <v-icon :icon="eventTypeOf(event).icon" :color="jackpotOf(event) ? '#F5B800' : eventTypeOf(event).color" size="22" />
+        <span class="type-count">{{ event.gameCount }}</span>
+      </span>
+      <span class="event-copy">
+        <span class="event-title">{{ event.title }}</span>
+        <span class="event-meta">{{ meta(event) }}</span>
+      </span>
+      <span class="event-pot">
+        <span>{{ formatSol(potOf(event)) }}</span>
+        <span v-if="jackpotOf(event)" class="event-tag is-jackpot">Jackpot {{ formatSol(jackpotOf(event)) }}</span>
+        <span v-else class="event-tag" :class="tagClass(event)">{{ tagOf(event) }}</span>
+      </span>
+    </router-link>
+
+    <section v-if="!auth.wallet" class="connect-note">
+      <h2 class="section-title">{{ phantomInstalled ? 'Play when you are ready' : 'Phantom wallet required to play' }}</h2>
+      <p class="text-medium-emphasis">
         <template v-if="phantomInstalled">
-          <h2 class="text-h6 mb-2">Play when you are ready</h2>
-          <p class="text-body-1 text-medium-emphasis mb-4">
-            You can look through the events without a wallet. Connect Phantom and sign a message when you want to enter a coupon. Signing is free and sends no transaction.
-          </p>
-          <v-btn color="primary" size="large" prepend-icon="mdi-wallet" :loading="auth.busy" @click="onLogin">
-            Connect wallet
-          </v-btn>
+          You can look through the events without a wallet. Connect Phantom and sign a message when you want to enter a coupon. Signing is free and sends no transaction.
         </template>
         <template v-else>
-          <h2 class="text-h6 mb-2">Phantom wallet required to play</h2>
-          <p class="text-body-1 text-medium-emphasis mb-4">
-            Install the Phantom browser extension and switch it to Devnet in its settings. You can still browse the events first.
-          </p>
-          <v-btn color="primary" href="https://phantom.app/" target="_blank" prepend-icon="mdi-download">
-            Install Phantom
-          </v-btn>
+          Install the Phantom browser extension and switch it to Devnet in its settings. You can still browse the events first.
         </template>
-      </v-card>
-
-      <div v-else class="text-center mt-4">
-        <v-btn variant="text" prepend-icon="mdi-ticket" to="/coupons">My Coupons</v-btn>
-      </div>
+      </p>
+      <v-btn v-if="phantomInstalled" color="primary" size="large" :loading="auth.busy" @click="onPlay">Connect wallet</v-btn>
+      <v-btn v-else color="primary" size="large" href="https://phantom.app/" target="_blank" prepend-icon="mdi-download">Install Phantom</v-btn>
+    </section>
   </v-container>
 </template>
 
 <script setup>
-import { onMounted, onUnmounted, ref, watch } from 'vue'
-import { useDisplay } from 'vuetify'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { eventApi } from '@/services/api'
 import { eventPda, fetchEvent } from '@/services/program'
 import { isPhantomInstalled } from '@/services/solana'
 import { auth, loadConfig, login } from '@/stores/auth'
+import { display } from '@/stores/currency'
 import { notifyError } from '@/stores/notify'
-import { formatDate, formatSol, statusColors } from '@/utils/format'
+import { eventTypeOf } from '@/services/eventTypes'
+import { formatDate, formatSol, shortAddress } from '@/utils/format'
+import SolAmount from '@/components/SolAmount.vue'
 
-const { smAndDown: mobile } = useDisplay()
+const router = useRouter()
 const phantomInstalled = ref(isPhantomInstalled())
 const events = ref([])
 const loading = ref(false)
-const chainJackpots = ref({})
+const chainPots = ref({})
+const wins = ref([])
+const tab = ref('Open')
+const chip = ref('all')
+const tabs = ['Open', 'Live', 'Results']
 
-// A vault event keeps its carried-over jackpot on chain only.
 function jackpotOf (event) {
-  if (event.chain) return chainJackpots.value[event.id] || 0
+  if (event.chain) return chainPots.value[event.id]?.jackpot || 0
   return event.rolloverInLamports || 0
+}
+
+function potOf (event) {
+  const chain = event.chain ? chainPots.value[event.id] : null
+  if (chain) return chain.sales + chain.jackpot
+  return (event.couponsSold || 0) * (event.couponPriceLamports || 0) + (event.rolloverInLamports || 0)
+}
+
+const balanceClass = computed(() => {
+  if (!auth.wallet || auth.balance == null) return ''
+  const code = display.currency
+  const rate = code === 'USD' ? display.rates?.usd : code === 'SEK' ? display.rates?.sek : null
+  const amount = Math.abs(rate ? auth.balance * rate : Number(auth.balance))
+  if (!Number.isFinite(amount)) return ''
+  const figures = Math.floor(amount).toString().length
+  if (figures > 7) return 'is-compact'
+  if (figures > 5) return 'is-tight'
+  return ''
+})
+const openEvent = computed(() => events.value.find(event => event.status === 'open'))
+const grouped = computed(() => ({
+  Open: events.value.filter(event => event.status === 'open'),
+  Live: events.value.filter(event => event.status === 'closed'),
+  Results: events.value.filter(event => event.status === 'completed')
+}))
+const chips = ['all', 'jackpot']
+const shown = computed(() => grouped.value[tab.value].filter(event => {
+  if (chip.value === 'jackpot') return jackpotOf(event) > 0
+  return true
+}))
+const rollover = computed(() => {
+  const event = events.value
+    .filter(item => item.status === 'open' && jackpotOf(item) > 0)
+    .sort((a, b) => jackpotOf(b) - jackpotOf(a))[0]
+  return event ? { title: event.title, amount: jackpotOf(event) } : null
+})
+
+watch(tab, () => { chip.value = 'all' })
+
+function meta (event) {
+  if (event.status === 'completed') return 'Settled'
+  if (event.status === 'closed') return 'In play'
+  return `Closes ${formatDate(event.startTime)}`
+}
+
+function tagOf (event) {
+  if (jackpotOf(event)) return 'Jackpot'
+  if (event.status === 'closed') return 'Live'
+  if (event.status === 'completed') return 'Result'
+  return 'Open'
+}
+
+function tagClass (event) {
+  if (jackpotOf(event)) return 'is-jackpot'
+  if (event.status === 'closed') return 'is-live'
+  return ''
+}
+
+function initials (value) {
+  const name = (value || '').trim()
+  return (name.slice(0, 2) || '•').toUpperCase()
 }
 
 async function loadChainJackpots (list) {
@@ -101,14 +178,23 @@ async function loadChainJackpots (list) {
     await Promise.all(vaults.map(async event => {
       try {
         const state = await fetchEvent(config.solanaRpcUrl, event.chain.address || eventPda(event.chain.admin, event.chain.nonce))
-        if (state.rolloverIn > 0n) found[event.id] = Number(state.rolloverIn)
+        found[event.id] = { sales: Number(state.sales), jackpot: Number(state.rolloverIn) }
       } catch {
-        // An unreadable vault shows no jackpot badge.
+        // An unreadable vault shows the figures saved with the event.
       }
     }))
-    chainJackpots.value = found
+    chainPots.value = found
   } catch {
-    chainJackpots.value = {}
+    chainPots.value = {}
+  }
+}
+
+async function loadWins () {
+  try {
+    const board = await eventApi.leaderboard('week')
+    wins.value = (board.rows || []).slice(0, 2)
+  } catch {
+    wins.value = []
   }
 }
 
@@ -117,6 +203,7 @@ let phantomTimer
 
 onMounted(() => {
   loadEvents()
+  loadWins()
   phantomTimer = setInterval(() => {
     phantomInstalled.value = isPhantomInstalled()
     if (phantomInstalled.value) clearInterval(phantomTimer)
@@ -127,7 +214,7 @@ onUnmounted(() => clearInterval(phantomTimer))
 async function loadEvents () {
   loading.value = true
   try {
-    events.value = (await eventApi.list()).sort(newestFirst)
+    events.value = (await eventApi.list()).filter(event => event.status !== 'draft' || auth.isAdmin).sort(newestFirst)
     loadChainJackpots(events.value)
   } catch (error) {
     notifyError(error)
@@ -136,34 +223,62 @@ async function loadEvents () {
   }
 }
 
-async function onLogin () {
-  try {
-    await login()
-  } catch (error) {
-    notifyError(error)
+async function onPlay () {
+  if (!auth.wallet) {
+    try {
+      await login()
+    } catch (error) {
+      notifyError(error)
+    }
+    return
   }
+  if (openEvent.value) router.push(`/events/${openEvent.value.id}`)
 }
 
-watch(() => auth.wallet, () => loadEvents())
+watch(() => auth.wallet, () => {
+  loadEvents()
+  loadWins()
+})
 </script>
 
 <style scoped>
-.event-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.event-link {
-  transition: transform 180ms ease, box-shadow 180ms ease;
-}
-
-.event-link:not(.v-list-item--disabled):hover {
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-surface);
-}
-
-.event-link:not(.v-list-item--disabled):active {
-  transform: translateY(0);
-}
+.home { padding-bottom: 24px; }
+.hero { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.hero-copy { min-width: 0; flex: 1 1 auto; }
+.balance { font-size: var(--fs-display); line-height: var(--lh-display); font-weight: 700; letter-spacing: -0.02em; white-space: nowrap; }
+.balance.is-tight { font-size: var(--fs-title); line-height: var(--lh-title); }
+.balance.is-compact { font-size: var(--fs-heading); line-height: var(--lh-heading); }
+.balance-note { margin: 2px 0 0; font-size: var(--fs-small); }
+.play { min-width: 128px; flex: none; border-radius: 14px; }
+.win-row { display: flex; gap: 10px; margin-top: 12px; }
+.win-card { flex: 1; min-width: 0; border-radius: 14px; background: rgb(var(--v-theme-surface)); padding: 12px; }
+.win-name { font-size: var(--fs-small); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.win-amount { margin-top: 10px; font-size: var(--fs-heading); font-weight: 700; color: rgb(var(--v-theme-success)); }
+.win-sub { margin-top: 2px; font-size: 11px; color: rgba(var(--v-theme-on-surface), 0.45); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.avatar { display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: rgb(var(--v-theme-primary)); color: #fff; font-weight: 800; flex: none; }
+.avatar.sm { width: 24px; height: 24px; font-size: 10px; }
+.tabs { display: flex; margin: 16px -16px 0; }
+.tab { flex: 1; height: 44px; background: none; border: 0; border-bottom: 2px solid transparent; color: rgba(var(--v-theme-on-surface), 0.45); font: inherit; font-size: var(--fs-body); font-weight: 600; cursor: pointer; }
+.tab.on { color: rgb(var(--v-theme-on-surface)); border-bottom-color: rgb(var(--v-theme-primary)); }
+.chips { display: flex; gap: 8px; margin-top: 12px; overflow-x: auto; }
+.chip { height: 34px; padding: 0 12px; border: 0; border-radius: 10px; background: rgb(var(--v-theme-surface)); color: rgba(var(--v-theme-on-surface), 0.62); font: inherit; font-size: var(--fs-body); font-weight: 600; cursor: pointer; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
+.chip.on { background: rgb(var(--v-theme-surface-variant)); color: rgb(var(--v-theme-on-surface)); }
+.notice { display: flex; align-items: flex-start; gap: 10px; margin-top: 12px; padding: 12px; border-radius: 14px; background: rgb(var(--v-theme-surface)); }
+.notice p { margin: 0; font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.62); }
+.notice-strong { color: rgb(var(--v-theme-primary)); font-weight: 600; }
+.empty { margin-top: 24px; color: rgba(var(--v-theme-on-surface), 0.62); }
+.event-row { display: flex; align-items: center; gap: 12px; height: 64px; color: inherit; text-decoration: none; }
+.type-mark { width: 44px; height: 44px; border-radius: 14px; background: rgb(var(--v-theme-surface-variant)); display: flex; align-items: center; justify-content: center; position: relative; flex: none; }
+.type-mark.jackpot { background: rgba(245, 184, 0, 0.16); }
+.type-count { position: absolute; right: -4px; bottom: -4px; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 999px; background: rgb(var(--v-theme-background)); color: rgb(var(--v-theme-on-surface)); font-size: 10px; font-weight: 800; display: flex; align-items: center; justify-content: center; }
+.event-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+.event-title, .event-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.event-title { font-size: var(--fs-body); font-weight: 600; }
+.event-meta { font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.62); }
+.event-pot { text-align: right; flex: none; display: flex; flex-direction: column; }
+.event-pot span:first-child { font-size: var(--fs-body); font-weight: 700; }
+.event-tag { font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.62); }
+.event-tag.is-jackpot { color: #F5B800; }
+.event-tag.is-live { color: rgb(var(--v-theme-success)); }
+.connect-note { margin-top: 28px; display: flex; flex-direction: column; gap: 12px; }
 </style>

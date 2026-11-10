@@ -1,6 +1,6 @@
 <template>
   <component :is="embedded ? 'div' : VCard" v-bind="embedded ? {} : { variant: 'outlined' }">
-    <v-card-title class="d-flex align-center flex-wrap ga-2">
+    <v-card-title v-if="!brief" class="d-flex align-center flex-wrap ga-2">
       <v-icon class="mr-1">mdi-safe</v-icon>
       On-chain vault
       <v-chip v-if="chain" size="small" variant="flat" :color="statusColor">{{ chain.status }}</v-chip>
@@ -11,7 +11,7 @@
       <v-spacer />
       <v-btn icon="mdi-refresh" size="small" variant="text" :loading="loading" title="Reload from chain" @click="load" />
     </v-card-title>
-    <v-card-subtitle class="text-wrap">
+    <v-card-subtitle v-if="!brief" class="text-wrap">
       <a :href="explorerAddress(address)" target="_blank" rel="noopener">{{ shortAddress(address) }}</a>
       · the program holds the entries and pays claims and refunds directly
     </v-card-subtitle>
@@ -20,49 +20,51 @@
       <v-alert type="warning" variant="tonal">{{ error }}</v-alert>
     </v-card-text>
 
-    <v-card-text v-if="chain">
-      <div class="sales-block mb-2">
-        <div class="sales-label">Total pot</div>
-        <div class="sales-amount">{{ sol(chain.sales + chain.rolloverIn) }}</div>
-      </div>
-      <p class="text-caption text-medium-emphasis mb-3">
-        {{ sol(chain.sales) }} from {{ chain.couponCount }} coupon(s)<template v-if="chain.rolloverIn > 0n"> + {{ sol(chain.rolloverIn) }} jackpot</template>
-      </p>
-      <p class="text-caption text-medium-emphasis">
-        Entries close {{ when(chain.deadline) }} · reveals and results from {{ when(chain.endTime) }} ·
-        anyone can refund the event if it is not resolved by {{ when(chain.resolveTimeout) }}
-      </p>
+    <v-card-text v-if="chain && (!brief || chainStatusVisible)">
+      <template v-if="!brief">
+        <div class="sales-block mb-2">
+          <div class="sales-label">Total pot</div>
+          <div class="sales-amount">{{ sol(chain.sales + chain.rolloverIn) }}</div>
+        </div>
+        <p class="text-caption text-medium-emphasis mb-3">
+          {{ sol(chain.sales) }} from {{ chain.couponCount }} coupon(s)<template v-if="chain.rolloverIn > 0n"> + {{ sol(chain.rolloverIn) }} jackpot</template>
+        </p>
+        <p class="text-caption text-medium-emphasis">
+          Entries close {{ when(chain.deadline) }} · reveals and results from {{ when(chain.endTime) }} ·
+          anyone can refund the event if it is not resolved by {{ when(chain.resolveTimeout) }}
+        </p>
+        <v-expansion-panels class="mt-2">
+          <v-expansion-panel>
+            <v-expansion-panel-title>{{ settled ? 'Winnings' : 'Pot so far' }}</v-expansion-panel-title>
+            <v-expansion-panel-text>
+              <v-table density="compact">
+                <thead>
+                  <tr><th>Correct</th><th>Share</th><th>{{ settled ? 'Rows' : 'Pot so far' }}</th><th v-if="settled">Each row wins</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="tier in tierRows" :key="tier.correct">
+                    <td>{{ tier.correct }} of {{ chain.gameCount }}</td>
+                    <td>{{ tier.percent }}%</td>
+                    <td>{{ settled ? tier.rows : sol(tier.pot) }}</td>
+                    <td v-if="settled">{{ tier.perWinner ? sol(tier.perWinner) : 'rolls over' }}</td>
+                  </tr>
+                </tbody>
+              </v-table>
+              <p class="text-caption text-medium-emphasis mt-2 mb-0">
+                A prize tier rolls over to the jackpot (all games correct) of the next {{ chain.league ? 'league' : (rolloverType?.short || 'Saturday') }} event when nobody hits it, or when each winning row would receive less than 0.01 SOL.
+              </p>
+            </v-expansion-panel-text>
+          </v-expansion-panel>
+        </v-expansion-panels>
+      </template>
       <v-alert v-if="auth.isAdmin && event.autoResolveBlock" type="warning" variant="tonal" density="compact" class="mt-2">
         {{ event.autoResolveBlock }}
       </v-alert>
-      <v-expansion-panels class="mt-2">
-        <v-expansion-panel>
-          <v-expansion-panel-title>{{ settled ? 'Winnings' : 'Pot so far' }}</v-expansion-panel-title>
-          <v-expansion-panel-text>
-            <v-table density="compact">
-              <thead>
-                <tr><th>Correct</th><th>Share</th><th>{{ settled ? 'Rows' : 'Pot so far' }}</th><th v-if="settled">Each row wins</th></tr>
-              </thead>
-              <tbody>
-                <tr v-for="tier in tierRows" :key="tier.correct">
-                  <td>{{ tier.correct }} of {{ chain.gameCount }}</td>
-                  <td>{{ tier.percent }}%</td>
-                  <td>{{ settled ? tier.rows : sol(tier.pot) }}</td>
-                  <td v-if="settled">{{ tier.perWinner ? sol(tier.perWinner) : 'rolls over' }}</td>
-                </tr>
-              </tbody>
-            </v-table>
-            <p class="text-caption text-medium-emphasis mt-2 mb-0">
-              A prize tier rolls over to the jackpot (all games correct) of the next event when nobody hits it, or when each winning row would receive less than 0.01 SOL.
-            </p>
-          </v-expansion-panel-text>
-        </v-expansion-panel>
-      </v-expansion-panels>
       <p v-if="settled">
         House {{ sol(chain.house) }}{{ chain.houseWithdrawn ? ' (withdrawn)' : '' }} · to winners {{ sol(chain.paid) }} ·
         rollover out {{ sol(chain.rolloverOut) }}{{ chain.rolloverForwarded ? ' (passed on)' : '' }}
       </p>
-      <p v-if="settled" class="text-body-2 mt-2 mb-0">
+      <p v-if="settled && !brief" class="text-body-2 mt-2 mb-0">
         <router-link to="/coupons">My Coupons</router-link> shows each coupon you played, the games it hit, and what it won.
       </p>
       <p v-if="chain.status === 'cancelled'">
@@ -136,7 +138,10 @@
       <v-btn v-if="chain.status === 'tallying'" color="primary" variant="flat" :loading="busy === 'tally'" @click="tally">Count coupons and settle</v-btn>
       <v-btn v-if="canExpire" color="warning" variant="flat" :loading="busy === 'expire'" @click="expire">Refund the whole event (timeout)</v-btn>
       <v-btn v-if="canPassRollover" color="primary" variant="tonal" :loading="busy === 'rollover'" @click="passRollover">
-        {{ chain.league ? 'Park the jackpot for the next league event' : (destination ? 'Pass rollover to the next event' : 'Park rollover for the next event') }}
+        {{ rolloverLabel }}
+      </v-btn>
+      <v-btn v-if="canPassRollover && rolloverType && !destination" variant="text" @click="parkAndCreate">
+        Park and create the next {{ rolloverType.short }} event
       </v-btn>
       <template v-if="isAdmin">
         <v-btn v-if="canWithdrawHouse" color="success" variant="tonal" :loading="busy === 'house'" @click="withdrawHouse">Withdraw house share {{ sol(chain.house) }}</v-btn>
@@ -149,14 +154,16 @@
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { VCard } from 'vuetify/components'
 import MatchScore from '@/components/MatchScore.vue'
+import { typeFromKind } from '@/services/eventTypes'
 import { kickoffStamp } from '@/services/projection'
 import { eventApi } from '@/services/api'
 import { scoreNextSlip } from '@/services/entry'
 import {
   RESULT_COSIGNER, TALLY_BATCH, approveCancelIx, approveResolutionIx, computeBudgetIx, eventCoupons, eventPda,
-  expireEventIx, fetchEvent, fetchGatePaused, fetchSchedule, fetchSigners, forwardRolloverIx, parkRolloverIx,
+  expireEventIx, fetchEvent, fetchGatePaused, fetchKinds, fetchSchedule, fetchSigners, forwardRolloverIx, parkRolloverIx,
   sendProgramTransaction, setPauseIx, slipsPda, tallyIx, withdrawHouseIx
 } from '@/services/program'
 import { getAccount, waitForConfirmation } from '@/services/solana'
@@ -166,14 +173,22 @@ import { explorerAddress, formatDate, formatSol, shortAddress } from '@/utils/fo
 
 const props = defineProps({
   event: { type: Object, required: true },
-  embedded: { type: Boolean, default: false }
+  embedded: { type: Boolean, default: false },
+  brief: { type: Boolean, default: false }
 })
 const emit = defineEmits(['changed'])
 
 const chain = ref(null)
 const signers = ref(null)
 const paused = ref(false)
+const router = useRouter()
 const destination = ref(null)
+const rolloverType = computed(() => chain.value && !chain.value.league ? typeFromKind(chain.value.kind) : null)
+const rolloverLabel = computed(() => {
+  if (chain.value?.league) return 'Park the jackpot for the next league event'
+  const name = rolloverType.value?.short || 'event'
+  return destination.value ? `Pass rollover to the next ${name} event` : `Park rollover for the next ${name} event`
+})
 const loading = ref(false)
 const busy = ref(null)
 const progress = ref('')
@@ -207,6 +222,11 @@ const canExpire = computed(() => chain.value.status === 'open' && now.value >= c
 const canPassRollover = computed(() => ['resolved', 'cancelled'].includes(chain.value.status) && chain.value.rolloverOut > 0n && !chain.value.rolloverForwarded)
 const cosignerMissing = computed(() => signers.value?.members.includes(RESULT_COSIGNER) && !approvedBy.value.includes(RESULT_COSIGNER))
 const canWithdrawHouse = computed(() => settled.value && chain.value.house > 0n && !chain.value.houseWithdrawn)
+const chainStatusVisible = computed(() => {
+  const state = chain.value
+  if (!state) return false
+  return settled.value || state.status === 'cancelled' || state.status === 'tallying' || state.proposalKind !== 'none' || !!(auth.isAdmin && props.event.autoResolveBlock)
+})
 
 const tierRows = computed(() => chain.value.tiers.map(tier => {
   const pot = chain.value.sales * BigInt(tier.percent) / 100n + (tier.correct === chain.value.gameCount ? chain.value.rolloverIn : 0n)
@@ -264,15 +284,17 @@ async function load () {
   try {
     await loadConfig()
     now.value = Math.floor(Date.now() / 1000)
-    const [state, signerList, gate, schedule] = await Promise.all([
+    const [state, signerList, gate, schedule, kinds] = await Promise.all([
       fetchEvent(rpcUrl(), address.value), fetchSigners(rpcUrl(), address.value),
-      fetchGatePaused(rpcUrl(), admin.value), fetchSchedule(rpcUrl(), admin.value)
+      fetchGatePaused(rpcUrl(), admin.value), fetchSchedule(rpcUrl(), admin.value), fetchKinds(rpcUrl(), admin.value)
     ])
     chain.value = state
     signers.value = signerList
     paused.value = gate
-    const future = schedule.entries.filter(entry => entry.deadline > now.value && entry.event !== address.value)
-    // A league jackpot only returns to the league vault. It is never forwarded into a SOL event.
+    const future = schedule.entries
+      .map((entry, index) => ({ ...entry, kind: kinds[index] ?? 0 }))
+      .filter(entry => entry.deadline > now.value && entry.event !== address.value && entry.kind === state.kind)
+    // A league jackpot only returns to the league vault. A SOL rollover only moves to the same event type.
     destination.value = state.league ? null : (future.sort((a, b) => a.deadline - b.deadline)[0]?.event ?? null)
     if (draft.value.length !== state.gameCount) {
       draft.value = state.proposalKind === 'resolve' ? [...state.proposalResults] : Array(state.gameCount).fill(null)
@@ -356,6 +378,12 @@ const tally = () => run('tally', async () => {
 }, 'Coupons counted and the event is settled')
 
 const expire = () => run('expire', () => send([expireEventIx({ caller: auth.wallet, admin: admin.value, event: address.value })]), 'The event is refundable')
+
+function parkAndCreate () {
+  const type = rolloverType.value
+  if (!type) return
+  router.push({ path: '/admin', query: { type: type.id, park: address.value } })
+}
 
 const passRollover = () => run('rollover', () => send([
   destination.value

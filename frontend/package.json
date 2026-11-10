@@ -11,6 +11,8 @@
     "test": "node --test ./test/scoring.test.mjs ./test/slipTree.test.mjs ./test/projection.test.mjs ./test/slipStatus.test.mjs ./test/reduce.test.mjs"
   },
   "dependencies": {
+    "@fontsource/geist": "^5.3.0",
+    "@fontsource/geist-mono": "^5.3.0",
     "@mdi/font": "^7.4.47",
     "@noble/curves": "^1.9.7",
     "@noble/hashes": "^1.8.0",

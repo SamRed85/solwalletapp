@@ -1,91 +1,213 @@
-.v-application {
-  --gradient-appbar: linear-gradient(90deg,
-    rgb(var(--v-theme-appbar)) 0%,
-    rgb(var(--v-theme-appbarMid)) 22%,
-    rgb(var(--v-theme-appbarCenter)) 50%,
-    rgb(var(--v-theme-appbarMid)) 78%,
-    rgb(var(--v-theme-appbar)) 100%);
-  --gradient-background: linear-gradient(90deg,
-    rgb(var(--v-theme-backgroundEdge)) 0%,
-    rgb(var(--v-theme-backgroundMid)) 22%,
-    rgb(var(--v-theme-backgroundCenter)) 50%,
-    rgb(var(--v-theme-backgroundMid)) 78%,
-    rgb(var(--v-theme-backgroundEdge)) 100%);
-  --gradient-surface: linear-gradient(90deg,
-    rgb(var(--v-theme-surfaceEdge)) 0%,
-    rgb(var(--v-theme-surfaceMid)) 22%,
-    rgb(var(--v-theme-surfaceCenter)) 50%,
-    rgb(var(--v-theme-surfaceMid)) 78%,
-    rgb(var(--v-theme-surfaceEdge)) 100%);
-  --gradient-panel: linear-gradient(90deg,
-    rgb(var(--v-theme-panel)) 0%,
-    rgb(var(--v-theme-panelMid)) 22%,
-    rgb(var(--v-theme-panelCenter)) 50%,
-    rgb(var(--v-theme-panelMid)) 78%,
-    rgb(var(--v-theme-panel)) 100%);
-  background-color: rgb(var(--v-theme-background)) !important;
-  background-image: var(--gradient-background) !important;
+:root {
+  --inset-top: env(safe-area-inset-top, 0px);
+  --inset-bottom: env(safe-area-inset-bottom, 0px);
+  --nav-height: 60px;
 }
 
-.v-theme--light {
-  --shadow-bar: 20px rgba(13, 71, 161, 0.22);
-  --shadow-surface: 0 1px 2px rgba(13, 71, 161, 0.06), 0 8px 24px rgba(13, 71, 161, 0.08);
+/* A wallet's in-app browser draws its own bars around the page, and still reports the
+   phone's safe area. Padding for it there doubles the bar height. */
+:root.in-wallet {
+  --inset-top: 0px;
+  --inset-bottom: 0px;
 }
 
 .v-theme--dark {
-  --shadow-bar: 24px rgba(0, 0, 0, 0.45);
-  --shadow-surface: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --v-border-color: 255, 255, 255;
+  --v-border-opacity: 0.08;
+  --v-medium-emphasis-opacity: 0.62;
+  --page-glow: radial-gradient(120% 55vh at 50% 0%, rgba(91, 108, 255, 0.38) 0%, transparent 70%);
 }
 
-.v-application .v-footer {
-  background-color: transparent !important;
-  background-image: var(--gradient-background) !important;
+.v-theme--light {
+  --v-border-color: 18, 18, 26;
+  --v-border-opacity: 0.1;
+  --page-glow: radial-gradient(120% 55vh at 50% 0%, rgba(91, 108, 255, 0.2) 0%, transparent 70%);
 }
 
-.v-application .v-card {
-  background-color: rgb(var(--v-theme-surface)) !important;
-  background-image: var(--gradient-surface) !important;
-}
-
-.v-theme--dark .v-expansion-panel {
-  background-color: rgb(var(--v-theme-panel)) !important;
-  background-image: var(--gradient-panel) !important;
-}
-
-.v-theme--dark .v-list {
-  background-color: transparent !important;
+.v-application {
+  background-color: rgb(var(--v-theme-background)) !important;
   background-image: none !important;
 }
 
-.sales-label {
-  font-family: Outfit, "Source Sans 3", sans-serif;
-  font-size: 0.875rem;
+/* Soft light from the top center, fading out before the middle of the screen.
+   Fixed so it stays put while the page scrolls. The bar stays clear so the
+   light shows through the header. */
+.v-application::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: var(--page-glow);
+}
+
+.v-application .v-application__wrap {
+  position: relative;
+  z-index: 1;
+}
+
+.v-application .v-main,
+.v-application .v-footer {
+  background: transparent !important;
+}
+
+.v-application .v-card {
+  background: rgb(var(--v-theme-surface));
+  border: none;
+  border-radius: var(--radius-lg) !important;
+  box-shadow: none !important;
+}
+
+.v-application.glow-band {
+  --page-glow: linear-gradient(180deg, rgba(91, 108, 255, 0.42) 0%, rgba(44, 48, 120, 0.22) 16%, transparent 28%);
+}
+
+.v-application .v-card .v-card {
+  border-radius: var(--radius-md) !important;
+}
+
+.v-application .v-card-title {
+  padding: var(--space-4) var(--space-4) 0;
+}
+
+.v-application .v-card-subtitle {
+  padding: var(--space-1) var(--space-4) 0;
+  opacity: 1;
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+}
+
+.v-application .v-card-text {
+  padding: var(--space-4);
+}
+
+.v-application .v-card-actions {
+  padding: var(--space-3) var(--space-4) var(--space-4);
+}
+
+.v-application .v-card-title + .v-card-text,
+.v-application .v-card-subtitle + .v-card-text {
+  padding-top: var(--space-3);
+}
+
+.v-application .v-btn {
+  border-radius: var(--radius-md);
+}
+
+.v-application .v-btn--size-x-small { height: 24px; font-size: var(--fs-label); }
+.v-application .v-btn--size-small { height: var(--control-sm); font-size: var(--fs-small); }
+.v-application .v-btn--size-default { height: var(--control-md); font-size: var(--fs-body); }
+.v-application .v-btn--size-large { height: var(--control-lg); font-size: var(--fs-body); padding: 0 var(--space-6); }
+.v-application .v-btn--icon { border-radius: var(--radius-pill); }
+.v-application .v-btn--icon.v-btn--density-default { width: var(--control-md); height: var(--control-md); }
+
+.v-application .v-chip {
+  border-radius: var(--radius-pill);
+  font-weight: 600;
+}
+
+.v-application .v-chip--size-x-small { height: 20px; font-size: var(--fs-label); }
+.v-application .v-chip--size-small { height: 24px; font-size: var(--fs-label); letter-spacing: 0.02em; }
+.v-application .v-chip--size-default { height: var(--control-sm); font-size: var(--fs-small); }
+.v-application .v-chip.v-chip--label { border-radius: var(--radius-sm); }
+
+.v-application .v-field {
+  border-radius: var(--radius-md);
+  font-size: var(--fs-body);
+}
+
+.v-application .v-alert {
+  border-radius: var(--radius-md);
+  font-size: var(--fs-small);
+  line-height: var(--lh-small);
+}
+
+.v-application .v-alert-title {
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  font-weight: 600;
+}
+
+.v-application .v-expansion-panels {
+  border-radius: var(--radius-md);
+}
+
+.v-application .v-expansion-panel {
+  background: rgb(var(--v-theme-surface-variant));
+  color: rgb(var(--v-theme-on-surface));
+}
+
+.v-application .v-expansion-panel__shadow { display: none; }
+
+.v-application .v-table {
+  background: transparent;
+}
+
+.v-application .v-table > .v-table__wrapper > table > thead > tr > th {
+  font-size: var(--fs-label);
   font-weight: 600;
   letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+}
+
+.v-application .v-list {
+  background: transparent;
+}
+
+.v-application .v-snackbar__wrapper {
+  border-radius: var(--radius-md);
+}
+
+.v-application .v-overlay__content > .v-card {
+  border-radius: var(--radius-lg) !important;
+}
+
+.v-application .v-progress-linear {
+  border-radius: var(--radius-pill);
+}
+
+.v-application a {
+  color: rgb(var(--v-theme-primary));
+}
+
+/* Hero amount: the largest type in the app, used once per screen. */
+.sales-label {
+  font-size: var(--fs-label);
+  line-height: var(--lh-label);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
 }
 
 .sales-amount {
-  font-family: Outfit, "Source Sans 3", sans-serif;
-  font-size: 3rem;
-  font-weight: 600;
-  line-height: 1.05;
+  margin-top: var(--space-1);
+  font-size: var(--fs-display);
+  line-height: var(--lh-display);
+  font-weight: 700;
   letter-spacing: -0.02em;
 }
 
-.v-application .sol-bar.v-toolbar {
-  background-color: rgb(var(--v-theme-appbar)) !important;
-  background-image: var(--gradient-appbar) !important;
-  box-shadow: 0 8px var(--shadow-bar) !important;
+.page-title {
+  font-size: var(--fs-title);
+  line-height: var(--lh-title);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
 }
 
-.v-application .phone-nav.v-bottom-navigation {
-  background-color: rgb(var(--v-theme-appbar)) !important;
-  background-image: var(--gradient-appbar) !important;
-  box-shadow: 0 -8px var(--shadow-bar) !important;
+.page-subtitle {
+  margin: var(--space-1) 0 0;
+  font-size: var(--fs-small);
+  line-height: var(--lh-small);
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
 }
 
-.v-application .v-main .v-card {
-  box-shadow: var(--shadow-surface);
+.section-title {
+  font-size: var(--fs-heading);
+  line-height: var(--lh-heading);
+  font-weight: 600;
+  margin: 0;
 }
 
 .page-enter-active,
@@ -110,25 +232,17 @@
 
 .cell-label { display: none; }
 
-:root {
-  --sol-inset-top: env(safe-area-inset-top, 0px);
-  --sol-inset-bottom: env(safe-area-inset-bottom, 0px);
-}
-
-/* A wallet's in-app browser draws its own bars around the page, and still reports the
-   phone's safe area. Padding for it there doubles the bar height. */
-:root.in-wallet {
-  --sol-inset-top: 0px;
-  --sol-inset-bottom: 0px;
-}
-
 @media (max-width: 959px) {
-  .v-application .v-main.has-phone-nav {
-    padding-bottom: calc(60px + var(--sol-inset-bottom)) !important;
+  .v-application .v-main .v-container {
+    padding-top: 0 !important;
   }
 
-  .v-application .sol-bar.v-toolbar {
-    padding-top: var(--sol-inset-top);
+  .v-application .v-main.has-phone-nav {
+    padding-bottom: calc(16px + var(--nav-height) + 16px + var(--inset-bottom)) !important;
+  }
+
+  .v-application .app-bar.v-toolbar {
+    padding-top: var(--inset-top);
   }
 
   .v-application .v-card-title,
@@ -140,28 +254,8 @@
   }
 
   .v-application .v-container {
-    padding-left: 12px;
-    padding-right: 12px;
-  }
-
-  .v-application .text-h3 {
-    font-size: 1.75rem !important;
-  }
-
-  .v-application .text-h4 {
-    font-size: 1.5rem !important;
-  }
-
-  .v-application .text-h5 {
-    font-size: 1.25rem !important;
-  }
-
-  .v-application .text-h6 {
-    font-size: 1.05rem !important;
-  }
-
-  .sales-amount {
-    font-size: 1.75rem;
+    padding-left: var(--space-4);
+    padding-right: var(--space-4);
   }
 
   .v-application code {
@@ -169,10 +263,10 @@
   }
 
   .v-dialog > .v-overlay__content {
-    width: calc(100vw - 24px);
-    max-width: calc(100vw - 24px) !important;
-    max-height: calc(100dvh - 24px);
-    margin: 12px;
+    width: calc(100vw - 32px);
+    max-width: calc(100vw - 32px) !important;
+    max-height: calc(100dvh - 32px);
+    margin: var(--space-4);
   }
 
   .v-card-actions {
@@ -219,13 +313,12 @@
     height: auto !important;
     min-width: 0 !important;
     padding: 6px 4px !important;
-    font-size: 12px;
-    line-height: 1.25;
+    font-size: var(--fs-small);
+    line-height: var(--lh-small);
     white-space: normal !important;
     word-break: break-word;
     overflow-wrap: anywhere;
   }
-
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -235,7 +328,7 @@
   .fixture-list,
   .event-link,
   .pick-btn,
-  .bar-link {
+  .nav-link {
     animation: none !important;
     transition: none !important;
   }

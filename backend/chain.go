@@ -27,21 +27,24 @@ const maxOpenVaultEvents = 16
 
 // Byte offsets in the program's Event account, including the 8-byte Anchor discriminator.
 const (
-	eventAdminOffset        = 8
-	eventNonceOffset        = 40
-	eventGameCountOffset    = 48
-	eventPriceOffset        = 49
-	eventTierCountOffset    = 57
-	eventTiersOffset        = 58
-	eventDeadlineOffset     = 84
-	eventRevealOffset       = 92
-	eventEndOffset          = 100
-	eventTimeoutOffset      = 108
-	eventStatusOffset       = 116
-	eventResultsOffset      = 117
-	eventCouponCountOffset  = 130
-	eventSalesOffset        = 134
-	eventRolloverOffset     = 142
+	eventAdminOffset       = 8
+	eventNonceOffset       = 40
+	eventGameCountOffset   = 48
+	eventPriceOffset       = 49
+	eventTierCountOffset   = 57
+	eventTiersOffset       = 58
+	eventDeadlineOffset    = 84
+	eventRevealOffset      = 92
+	eventEndOffset         = 100
+	eventTimeoutOffset     = 108
+	eventStatusOffset      = 116
+	eventResultsOffset     = 117
+	eventCouponCountOffset = 130
+	eventSalesOffset       = 134
+	eventRolloverOffset    = 142
+	// per_winner follows rollover_in, house, paid, rollover_out, and the forwarded flag.
+	// per_winner[n-1] is the lamports paid for one row with n correct picks.
+	perWinnerOffset         = 175
 	eventMinRowsOffset      = 430
 	eventMaxCouponsOffset   = 434
 	eventAccountMinimumSize = 421
@@ -136,6 +139,26 @@ func decodeChainEvent(account *chainAccount, programID string) (*chainEvent, err
 		ev.MaxCoupons = binary.LittleEndian.Uint32(d[eventMaxCouponsOffset:])
 	}
 	return ev, nil
+}
+
+// payoutSettlement reads the winner table written when a vault resolved.
+// Events settled before that table was copied into MongoDB still have it on the account.
+func payoutSettlement(data []byte, gameCount int) *Settlement {
+	if gameCount < 1 || gameCount > 13 || len(data) < perWinnerOffset+gameCount*8 {
+		return nil
+	}
+	settlement := Settlement{}
+	for correct := 1; correct <= gameCount; correct++ {
+		amount := binary.LittleEndian.Uint64(data[perWinnerOffset+(correct-1)*8:])
+		if amount == 0 {
+			continue
+		}
+		settlement.Tiers = append(settlement.Tiers, TierPayout{Correct: correct, PerWinnerLamports: amount})
+	}
+	if len(settlement.Tiers) == 0 {
+		return nil
+	}
+	return &settlement
 }
 
 type chainSigners struct {

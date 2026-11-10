@@ -50,15 +50,15 @@ func testApp(t *testing.T, db *mongo.Database) *App {
 			CouponPriceLamports: 1_000_000,
 			SessionSecret:       []byte("test-secret"),
 		},
-		db:       db,
-		nonces:   newNonceStore(db.Collection("nonces")),
-		limiter:  rateLimiter{coll: db.Collection("limits")},
-		users:    db.Collection("users"),
-		events:   db.Collection("events"),
-		entries:  db.Collection("entries"),
-		payments: db.Collection("payments"),
-		rollover: db.Collection("rollover"),
-		reveals:  db.Collection("reveals"),
+		db:         db,
+		nonces:     newNonceStore(db.Collection("nonces")),
+		limiter:    rateLimiter{coll: db.Collection("limits")},
+		users:      db.Collection("users"),
+		events:     db.Collection("events"),
+		entries:    db.Collection("entries"),
+		payments:   db.Collection("payments"),
+		rollover:   db.Collection("rollover"),
+		reveals:    db.Collection("reveals"),
 		sessions:   db.Collection("sessions"),
 		reductions: db.Collection("reductions"),
 		verifyRecoveryPayment: func(context.Context, string, string, string, uint64, string) error {
@@ -372,10 +372,59 @@ func TestRolloverAppliesOnceAndRepairFinishesIt(t *testing.T) {
 	var pending struct {
 		Lamports uint64 `bson:"lamports"`
 	}
-	if err := app.rollover.FindOne(ctx, bson.M{"_id": pendingRolloverID}).Decode(&pending); err != nil {
+	if err := app.rollover.FindOne(ctx, bson.M{"_id": pendingRolloverID(eventTypeSaturday)}).Decode(&pending); err != nil {
 		t.Fatal(err)
 	}
 	if pending.Lamports != 40 {
 		t.Fatalf("pending rollover = %d, want 40", pending.Lamports)
+	}
+}
+
+func TestRolloverStaysWithItsType(t *testing.T) {
+	app := testApp(t, testDatabase(t))
+	ctx := context.Background()
+	now := time.Now()
+	saturdayRes, err := app.events.InsertOne(ctx, Event{Title: "saturday", Type: eventTypeSaturday, StartTime: now.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wildcardRes, err := app.events.InsertOne(ctx, Event{Title: "wildcard", Type: eventTypeWildcard, StartTime: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	saturdayID := saturdayRes.InsertedID.(bson.ObjectID)
+	wildcardID := wildcardRes.InsertedID.(bson.ObjectID)
+
+	got, err := app.rolloverTarget(ctx, bson.NewObjectID(), now, eventTypeWildcard)
+	if err != nil || got == nil || *got != wildcardID {
+		t.Fatalf("wildcard target %v %v, want %s", got, err, wildcardID.Hex())
+	}
+	got, err = app.rolloverTarget(ctx, bson.NewObjectID(), now, eventTypeSaturday)
+	if err != nil || got == nil || *got != saturdayID {
+		t.Fatalf("saturday target %v %v, want %s", got, err, saturdayID.Hex())
+	}
+
+	sourceRes, err := app.events.InsertOne(ctx, Event{Title: "settled wildcard", Type: eventTypeWildcard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID := sourceRes.InsertedID.(bson.ObjectID)
+	if err := app.applyRolloverFrom(ctx, sourceID, nil, 70); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.applyRolloverFrom(ctx, sourceID, nil, 70); err != nil {
+		t.Fatal(err)
+	}
+	if got := app.takePendingRollover(ctx, eventTypeSaturday); got != 0 {
+		t.Fatalf("saturday took wildcard rollover: %d", got)
+	}
+	if _, err := app.rollover.UpdateByID(ctx, legacyPendingRolloverID, bson.M{"$set": bson.M{"lamports": 15}}, options.UpdateOne().SetUpsert(true)); err != nil {
+		t.Fatal(err)
+	}
+	if got := app.takePendingRollover(ctx, eventTypeWildcard); got != 70 {
+		t.Fatalf("wildcard pending = %d, want 70", got)
+	}
+	if got := app.takePendingRollover(ctx, eventTypeSaturday); got != 15 {
+		t.Fatalf("legacy saturday pending = %d, want 15", got)
 	}
 }

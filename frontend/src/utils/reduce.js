@@ -4,6 +4,20 @@ export const MAX_COMBINATIONS = 44000
 export const MAX_COLOR_STATES = 64
 export const COLOR_IDS = ['purple', 'yellow', 'red', 'green']
 export const COLOR_LABELS = { purple: 'Purple', yellow: 'Yellow', red: 'Red', green: 'Green' }
+export const COLOR_INK = { purple: '#6A1B9A', yellow: '#F9A825', red: '#C62828', green: '#2E7D32' }
+
+// A pick with one color is a solid fill. Several colors share the button in equal bands,
+// in the same order on the coupon and on the receipt. The bands are measured from the
+// border edge, so a button with a border does not repeat the fill under it.
+export function colorPaint (ids) {
+  const ink = ids.map(id => COLOR_INK[id]).filter(Boolean)
+  if (!ink.length) return undefined
+  const text = ink.length === 1 && ids[0] === 'yellow' ? '#1a1a1a' : '#fff'
+  if (ink.length === 1) return { background: ink[0], borderColor: ink[0], color: text }
+  const step = 100 / ink.length
+  const stops = ink.map((color, index) => `${color} ${index * step}% ${(index + 1) * step}%`).join(', ')
+  return { background: `linear-gradient(135deg, ${stops}) border-box`, borderColor: 'transparent', color: '#fff' }
+}
 
 // The colors saved on a coupon, in display order. `signs` is the program's bitset:
 // game g outcome k (1, X, 2) is bit 3g+k. The program does not store which color the

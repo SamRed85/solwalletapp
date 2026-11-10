@@ -1,27 +1,36 @@
 <template>
-  <v-app>
-    <v-app-bar class="sol-bar" :class="{ 'is-phone': mobile }" color="primary" elevation="0" :height="mobile ? 48 : 64">
-      <v-app-bar-title class="wordmark">
-        Sol
+  <v-app :class="{ 'glow-band': route.name === 'Leaderboard' }">
+    <v-app-bar class="sol-bar" :class="{ 'is-phone': mobile }" color="transparent" elevation="0" :height="mobile ? 56 : 64">
+      <v-app-bar-title>
+        <button v-if="couponOpen" type="button" class="bar-back" aria-label="Back to my coupons" @click="closeCoupon">
+          <v-icon icon="mdi-arrow-left" size="22" />
+          Back
+        </button>
+        <span v-else class="wordmark">Edge</span>
         <v-icon
-          v-if="mobile" class="health-dot" size="8"
+          v-if="mobile && !couponOpen" class="health-dot" size="8"
           :color="healthy === false ? 'error' : 'success'"
           :title="healthy === null ? 'Checking the backend' : healthy ? 'Backend healthy' : 'Backend unreachable'"
         >mdi-circle</v-icon>
       </v-app-bar-title>
 
       <nav v-show="!mobile" class="bar-nav" aria-label="Pages">
-        <router-link
-          v-for="item in menuItems"
-          :key="item.to"
-          :to="item.to"
-          class="bar-link"
-          active-class=""
-          exact-active-class="is-here"
-        >
-          <v-icon :icon="item.icon" size="small" />
-          {{ item.title }}
-        </router-link>
+        <template v-for="item in menuItems" :key="item.to">
+          <router-link
+            v-if="!item.auth || auth.wallet"
+            :to="item.to"
+            class="bar-link"
+            active-class=""
+            exact-active-class="is-here"
+          >
+            <v-icon :icon="item.icon" size="small" />
+            {{ item.title }}
+          </router-link>
+          <button v-else type="button" class="bar-link" @click="onLogin">
+            <v-icon :icon="item.icon" size="small" />
+            {{ item.title }}
+          </button>
+        </template>
       </nav>
 
       <div class="bar-end">
@@ -33,13 +42,6 @@
           <v-icon>{{ isDark ? 'mdi-weather-night' : 'mdi-weather-sunny' }}</v-icon>
         </v-btn>
         <template v-if="auth.wallet">
-          <v-chip
-            v-if="auth.balance !== null" class="balance-chip" :class="mobile ? 'mr-1' : 'mr-2'"
-            :size="mobile ? 'x-small' : 'small'" :prepend-icon="mobile ? undefined : 'mdi-wallet'" variant="flat" color="secondary"
-            title="Wallet balance"
-          >
-            <SolAmount :lamports="Math.round(auth.balance * 1e9)" />
-          </v-chip>
           <v-chip
             to="/profile"
             class="name-chip" :class="mobile ? 'mr-1' : 'mr-2'" :size="mobile ? 'x-small' : 'small'" variant="flat" :color="auth.isAdmin ? 'warning' : 'success'"
@@ -57,7 +59,7 @@
       </div>
     </v-app-bar>
 
-    <v-main :class="{ 'has-phone-nav': mobile && menuItems.length > 1 }">
+    <v-main :class="{ 'has-phone-nav': mobile }">
       <router-view v-slot="{ Component }">
         <transition name="page" mode="out-in">
           <component :is="Component" :key="route.path" />
@@ -65,8 +67,8 @@
       </router-view>
     </v-main>
 
-    <v-bottom-navigation v-if="mobile && menuItems.length > 1" :model-value="navValue" class="phone-nav" grow color="white" :height="52">
-      <v-btn v-for="item in menuItems" :key="item.to" :value="item.to" :to="item.to">
+    <v-bottom-navigation v-if="mobile" :model-value="navValue" class="phone-nav" grow :height="60">
+      <v-btn v-for="item in phoneItems" :key="item.to" :value="item.to" :to="item.auth && !auth.wallet ? undefined : item.to" @click="guard(item)">
         <v-icon :icon="item.icon" />
         <span>{{ navLabel(item.title) }}</span>
       </v-btn>
@@ -111,14 +113,12 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDisplay, useTheme } from 'vuetify'
-import { authApi, eventApi, healthApi } from '@/services/api'
-import { featuredEvent } from '@/utils/featuredEvent'
+import { authApi, healthApi } from '@/services/api'
 import { startAutoReveal } from '@/services/autoReveal'
 import { auth, login, logout, setProfile } from '@/stores/auth'
 import { loadRates } from '@/stores/currency'
 import { notify, notifyError, snackbar } from '@/stores/notify'
 import { shortAddress } from '@/utils/format'
-import SolAmount from '@/components/SolAmount.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -134,14 +134,16 @@ const nameRule = value => {
 }
 
 const isDark = computed(() => theme.global.current.value.dark)
-const featured = ref(null)
+
+const phoneItems = [
+  { title: 'Home', icon: 'mdi-home', to: '/' },
+  { title: 'Coupons', icon: 'mdi-ticket', to: '/coupons', auth: true },
+  { title: 'Leaderboard', icon: 'mdi-trophy', to: '/leaderboard' },
+  { title: 'Profile', icon: 'mdi-account', to: '/profile', auth: true }
+]
 
 const menuItems = computed(() => [
-  { title: 'Home', icon: 'mdi-home', to: '/' },
-  ...(featured.value ? [featured.value] : []),
-  ...(auth.wallet
-    ? [{ title: 'My Coupons', icon: 'mdi-ticket', to: '/coupons' }]
-    : []),
+  ...phoneItems,
   ...(auth.isAdmin
     ? [
         { title: 'Admin', icon: 'mdi-shield-crown', to: '/admin' },
@@ -150,13 +152,18 @@ const menuItems = computed(() => [
     : [])
 ])
 
-const navValue = computed(() => {
-  const exact = menuItems.value.find(item => item.to === route.path)
-  if (exact) return exact.to
-  const featuredTo = featured.value?.to
-  if (featuredTo && route.path === featuredTo) return featuredTo
-  return route.path
-})
+const navValue = computed(() => phoneItems.find(item => item.to === route.path)?.to ?? route.path)
+
+const couponOpen = computed(() => route.name === 'MyCoupons' && !!route.query.coupon)
+
+function closeCoupon () {
+  if (window.history.state?.back) router.back()
+  else router.replace({ path: '/coupons' })
+}
+
+function guard (item) {
+  if (item.auth && !auth.wallet) onLogin()
+}
 
 function navLabel (title) {
   if (title === 'Next event') return 'Next'
@@ -171,20 +178,7 @@ watch(() => auth.isAdmin, isAdmin => {
 
 watch(() => auth.wallet, wallet => {
   if (!wallet && route.meta.requiresAuth) router.push('/')
-  loadFeatured()
 })
-
-watch(() => route.path, () => {
-  loadFeatured()
-})
-
-async function loadFeatured () {
-  try {
-    featured.value = featuredEvent(await eventApi.list())
-  } catch {
-    featured.value = null
-  }
-}
 
 function toggleTheme () {
   const next = isDark.value ? 'light' : 'dark'
@@ -233,7 +227,6 @@ let rateTimer
 onMounted(() => {
   startAutoReveal()
   checkHealth()
-  loadFeatured()
   loadRates()
   healthTimer = setInterval(checkHealth, 30000)
   rateTimer = setInterval(loadRates, 5 * 60 * 1000)
@@ -263,29 +256,35 @@ onBeforeUnmount(() => {
 
 .bar-nav::-webkit-scrollbar { display: none; }
 
+button.bar-link {
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
 .bar-link {
   display: inline-flex;
   align-items: center;
   flex: none;
   gap: 6px;
-  padding: 6px 10px;
-  border-radius: 6px;
-  color: #fff;
-  font-size: 14px;
-  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: var(--radius-pill);
+  color: rgb(var(--v-theme-on-surface));
+  font-size: var(--fs-small);
+  font-weight: 600;
   text-decoration: none;
   white-space: nowrap;
-  opacity: 0.85;
+  opacity: 0.62;
   transition: background-color 150ms ease, opacity 150ms ease;
 }
 
 .bar-link.is-here {
   opacity: 1;
-  background: rgba(255, 255, 255, 0.18);
+  background: rgb(var(--v-theme-surface-variant));
 }
 
 .bar-link:focus-visible {
-  outline: 2px solid #fff;
+  outline: 2px solid rgb(var(--v-theme-primary));
   outline-offset: 2px;
 }
 
@@ -314,6 +313,26 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
 }
 
+.bar-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px 6px 4px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: none;
+  color: rgb(var(--v-theme-on-surface));
+  font: inherit;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.bar-back:focus-visible {
+  outline: 2px solid rgb(var(--v-theme-primary));
+  outline-offset: 2px;
+}
+
 .health-dot {
   margin-left: 6px;
   vertical-align: middle;
@@ -323,26 +342,63 @@ onBeforeUnmount(() => {
   grid-template-columns: auto minmax(0, 1fr);
 }
 
+.sol-bar {
+  background-color: rgb(var(--v-theme-background)) !important;
+  background-image: var(--page-glow) !important;
+  background-attachment: fixed !important;
+  border-bottom: none;
+}
+
 .phone-nav {
-  padding-bottom: var(--sol-inset-bottom);
-  height: calc(52px + var(--sol-inset-bottom)) !important;
+  position: fixed;
+  left: 16px !important;
+  right: 16px !important;
+  bottom: calc(16px + var(--inset-bottom)) !important;
+  width: auto !important;
+  height: 60px !important;
+  z-index: 8;
+  border-radius: var(--radius-pill) !important;
+  background: rgb(var(--v-theme-surface-variant)) !important;
+  border: none;
+  overflow: hidden;
 }
 
 .phone-nav :deep(.v-btn) {
   flex: 1 1 0;
   min-width: 0 !important;
   padding-inline: 2px;
-  font-size: 11px;
-  color: rgba(255, 255, 255, 0.85) !important;
+  font-size: var(--fs-label);
+  color: rgba(var(--v-theme-on-surface), 0.62) !important;
 }
 
 .phone-nav :deep(.v-btn--active),
 .phone-nav :deep(.v-btn--selected) {
-  color: #fff !important;
-  background: rgba(255, 255, 255, 0.18);
+  color: rgb(var(--v-theme-primary)) !important;
+  background: transparent !important;
+}
+
+.phone-nav :deep(.v-btn--active .v-btn__overlay),
+.phone-nav :deep(.v-btn--selected .v-btn__overlay) {
+  opacity: 0 !important;
 }
 
 .phone-nav :deep(.v-icon) {
   font-size: 22px;
+  transition: color 180ms ease, transform 180ms ease;
+}
+
+.phone-nav :deep(.v-btn--active .v-icon),
+.phone-nav :deep(.v-btn--selected .v-icon) {
+  animation: nav-pop 320ms ease;
+}
+
+@keyframes nav-pop {
+  0% { transform: scale(0.8); }
+  55% { transform: scale(1.16); }
+  100% { transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .phone-nav :deep(.v-icon) { animation: none !important; }
 }
 </style>

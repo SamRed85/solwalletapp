@@ -65,12 +65,13 @@ type fixtureState struct {
 }
 
 type footballHit struct {
-	ID      int       `json:"id"`
-	Home    string    `json:"home"`
-	Away    string    `json:"away"`
-	Kickoff time.Time `json:"kickoff"`
-	League  string    `json:"league"`
-	Status  string    `json:"status"`
+	ID       int       `json:"id"`
+	Home     string    `json:"home"`
+	Away     string    `json:"away"`
+	Kickoff  time.Time `json:"kickoff"`
+	League   string    `json:"league"`
+	Status   string    `json:"status"`
+	LeagueID int       `json:"-"`
 }
 
 type footballFeed struct {
@@ -617,18 +618,64 @@ func (a *App) handleFixturesByDate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, feedMessage(err))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"fixtures": orderFixtures(hits)})
+	writeJSON(w, http.StatusOK, map[string]any{"fixtures": orderFixtures(upcomingFixtures(hits, time.Now()))})
+}
+
+// upcomingFixtures drops a match that has kicked off or is no longer waiting to start.
+func upcomingFixtures(hits []footballHit, now time.Time) []footballHit {
+	open := make([]footballHit, 0, len(hits))
+	for _, hit := range hits {
+		if fixtureStarted(hit.Status, hit.Kickoff, now) {
+			continue
+		}
+		open = append(open, hit)
+	}
+	return open
+}
+
+// fixtureStarted reports a match the admin should not add. Not started, to be
+// decided, and postponed stay only while the kickoff is still ahead.
+func fixtureStarted(status string, kickoff, now time.Time) bool {
+	switch status {
+	case "NS", "TBD", "PST", "":
+		return !kickoff.IsZero() && !kickoff.After(now)
+	default:
+		return true
+	}
 }
 
 func orderFixtures(hits []footballHit) []footballHit {
 	ordered := append([]footballHit(nil), hits...)
 	sort.SliceStable(ordered, func(i, j int) bool {
-		if ordered[i].Kickoff.Equal(ordered[j].Kickoff) {
-			return ordered[i].ID < ordered[j].ID
-		}
-		return ordered[i].Kickoff.Before(ordered[j].Kickoff)
+		return fixtureLess(ordered[i], ordered[j])
 	})
 	return ordered
+}
+
+func fixtureLess(a, b footballHit) bool {
+	if ra, rb := leagueRank(a.LeagueID), leagueRank(b.LeagueID); ra != rb {
+		return ra < rb
+	}
+	if !a.Kickoff.Equal(b.Kickoff) {
+		return a.Kickoff.Before(b.Kickoff)
+	}
+	return a.ID < b.ID
+}
+
+// popularLeagues lists API-Football competition ids, most followed first.
+// A competition that is not listed sorts after these, by kickoff.
+var popularLeagues = map[int]int{
+	1: 0, 2: 0, 4: 0, 9: 0,
+	39: 1, 140: 1, 135: 1, 78: 1, 61: 1,
+	3: 2, 848: 2, 5: 2, 45: 2, 48: 2, 143: 2, 81: 2, 137: 2,
+	40: 3, 88: 3, 94: 3, 144: 3, 179: 3, 203: 3, 253: 3, 71: 3, 128: 3, 262: 3, 307: 3,
+}
+
+func leagueRank(id int) int {
+	if rank, ok := popularLeagues[id]; ok {
+		return rank
+	}
+	return 100
 }
 
 func (f *footballFeed) searchFixtures(ctx context.Context, team, away, date, timezone string) ([]footballHit, string, error) {
@@ -636,8 +683,12 @@ func (f *footballFeed) searchFixtures(ctx context.Context, team, away, date, tim
 	if err != nil {
 		return nil, "", err
 	}
-	hits := rankFixtures(day, team, away)
+	open := upcomingFixtures(day, time.Now())
+	hits := rankFixtures(open, team, away)
 	message := searchMessage(team, away, date, hits)
+	if len(hits) == 0 && len(rankFixtures(day, team, away)) > 0 {
+		message = fmt.Sprintf("Matches with %s on %s have already kicked off.", team, date)
+	}
 	if len(hits) > 12 {
 		message = fmt.Sprintf("Showing 12 of %d matches on %s. Pick the right one.", len(hits), date)
 		hits = hits[:12]
@@ -663,7 +714,7 @@ func (f *footballFeed) fixturesOnDate(ctx context.Context, date, timezone string
 		kickoff, _ := time.Parse(time.RFC3339, row.Fixture.Date)
 		hits = append(hits, footballHit{
 			ID: row.Fixture.ID, Home: row.Teams.Home.Name, Away: row.Teams.Away.Name,
-			Kickoff: kickoff, League: row.League.Name, Status: row.Fixture.Status.Short,
+			Kickoff: kickoff, League: row.League.Name, LeagueID: row.League.ID, Status: row.Fixture.Status.Short,
 		})
 	}
 	f.mu.Lock()
@@ -724,7 +775,12 @@ func rankFixtures(rows []footballHit, team, away string) []footballHit {
 		}
 		matched = append(matched, scored{hit, rank})
 	}
-	sort.SliceStable(matched, func(i, j int) bool { return matched[i].rank < matched[j].rank })
+	sort.SliceStable(matched, func(i, j int) bool {
+		if matched[i].rank != matched[j].rank {
+			return matched[i].rank < matched[j].rank
+		}
+		return fixtureLess(matched[i].hit, matched[j].hit)
+	})
 	out := make([]footballHit, len(matched))
 	for i, item := range matched {
 		out[i] = item.hit
@@ -1097,6 +1153,7 @@ type apiFixture struct {
 		} `json:"status"`
 	} `json:"fixture"`
 	League struct {
+		ID   int    `json:"id"`
 		Name string `json:"name"`
 	} `json:"league"`
 	Teams struct {

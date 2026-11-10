@@ -34,9 +34,7 @@ import { computed, ref } from 'vue'
 import MatchScore from '@/components/MatchScore.vue'
 import { kickoffStamp } from '@/services/projection'
 import { outcomes } from '@/utils/format'
-import { colorView, missedColorGames } from '@/utils/reduce'
-
-const INK = { purple: '#6A1B9A', yellow: '#F9A825', red: '#C62828', green: '#2E7D32' }
+import { colorPaint, colorView, missedColorGames } from '@/utils/reduce'
 
 const props = defineProps({
   picks: { type: Array, default: () => [] },
@@ -79,12 +77,7 @@ function marksAt (game, outcome) {
 
 function pickStyle (game, selected, outcome) {
   if (!selected.includes(outcome)) return undefined
-  const marks = marksAt(game, outcome)
-  if (!marks.length) return undefined
-  const first = INK[marks[0].id]
-  const text = marks[0].id === 'yellow' && marks.length === 1 ? '#1a1a1a' : '#fff'
-  if (marks.length === 1) return { background: first, borderColor: first, color: text }
-  return { background: `linear-gradient(135deg, ${first} 50%, ${INK[marks[1].id]} 50%)`, borderColor: 'transparent', color: '#fff' }
+  return colorPaint(marksAt(game, outcome).map(mark => mark.id))
 }
 
 function pickClass (selected, outcome, result, game) {
@@ -108,7 +101,6 @@ function pickClass (selected, outcome, result, game) {
   gap: 1px;
   width: 100%;
   padding: 8px 4px;
-  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 .game-top { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; }
 .game-line { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; max-width: 100%; min-width: 0; }

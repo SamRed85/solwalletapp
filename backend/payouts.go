@@ -319,13 +319,22 @@ func settleEntries(entries []Entry, results string, salesLamports, rolloverIn ui
 	return settleCounts(rows, winners, len(results), salesLamports, rolloverIn, tiers)
 }
 
-// rolloverTarget is the next event that has not started yet, earliest first.
-func (a *App) rolloverTarget(ctx context.Context, exclude bson.ObjectID, now time.Time) (*bson.ObjectID, error) {
+// rolloverTarget is the next event of the same type that has not started yet, earliest first.
+// An event with no type is Saturday.
+func (a *App) rolloverTarget(ctx context.Context, exclude bson.ObjectID, now time.Time, eventType string) (*bson.ObjectID, error) {
+	filter := bson.M{
+		"_id":          bson.M{"$ne": exclude},
+		"startTime":    bson.M{"$gt": now},
+		"resultsSetAt": bson.M{"$exists": false},
+		"chain":        bson.M{"$exists": false},
+	}
+	if eventTypeOrSaturday(eventType) == eventTypeSaturday {
+		filter["$or"] = []bson.M{{"type": eventTypeSaturday}, {"type": ""}, {"type": bson.M{"$exists": false}}}
+	} else {
+		filter["type"] = eventType
+	}
 	var next Event
-	err := a.events.FindOne(ctx,
-		bson.M{"_id": bson.M{"$ne": exclude}, "startTime": bson.M{"$gt": now}, "resultsSetAt": bson.M{"$exists": false}, "chain": bson.M{"$exists": false}},
-		options.FindOne().SetSort(bson.M{"startTime": 1}).SetProjection(bson.M{"_id": 1}),
-	).Decode(&next)
+	err := a.events.FindOne(ctx, filter, options.FindOne().SetSort(bson.M{"startTime": 1}).SetProjection(bson.M{"_id": 1})).Decode(&next)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil, nil
 	}
@@ -335,7 +344,13 @@ func (a *App) rolloverTarget(ctx context.Context, exclude bson.ObjectID, now tim
 	return &next.ID, nil
 }
 
-const pendingRolloverID = "pending"
+// pendingRolloverID is one parked bucket per event type. "pending" is the bucket from
+// before types existed, and a new Saturday event drains it too.
+const legacyPendingRolloverID = "pending"
+
+func pendingRolloverID(eventType string) string {
+	return "pending:" + eventTypeOrSaturday(eventType)
+}
 
 // applyRolloverFrom adds lamports once for this source event. A retry sees the source id
 // already recorded and does not add them again, so a crash between the two writes can be repaired.
@@ -363,8 +378,12 @@ func (a *App) applyRolloverFrom(ctx context.Context, source bson.ObjectID, targe
 		}
 		return nil
 	}
-	_, err := a.rollover.UpdateOne(ctx,
-		bson.M{"_id": pendingRolloverID, "sources": bson.M{"$ne": sourceID}},
+	eventType, err := a.sourceEventType(ctx, source)
+	if err != nil {
+		return err
+	}
+	_, err = a.rollover.UpdateOne(ctx,
+		bson.M{"_id": pendingRolloverID(eventType), "sources": bson.M{"$ne": sourceID}},
 		bson.M{"$inc": bson.M{"lamports": int64(lamports)}, "$addToSet": bson.M{"sources": sourceID}},
 		options.UpdateOne().SetUpsert(true),
 	)
@@ -419,7 +438,21 @@ func (a *App) rolloverRepairLoop() {
 	}
 }
 
-func (a *App) applyRollover(ctx context.Context, target *bson.ObjectID, lamports uint64) error {
+func (a *App) sourceEventType(ctx context.Context, id bson.ObjectID) (string, error) {
+	var doc struct {
+		Type string `bson:"type"`
+	}
+	err := a.events.FindOne(ctx, bson.M{"_id": id}, options.FindOne().SetProjection(bson.M{"type": 1})).Decode(&doc)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return eventTypeSaturday, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return eventTypeOrSaturday(doc.Type), nil
+}
+
+func (a *App) applyRollover(ctx context.Context, target *bson.ObjectID, lamports uint64, eventType string) error {
 	if lamports == 0 {
 		return nil
 	}
@@ -428,26 +461,35 @@ func (a *App) applyRollover(ctx context.Context, target *bson.ObjectID, lamports
 		_, err := a.events.UpdateByID(ctx, *target, inc)
 		return err
 	}
-	_, err := a.rollover.UpdateByID(ctx, pendingRolloverID, bson.M{"$inc": bson.M{"lamports": int64(lamports)}}, options.UpdateOne().SetUpsert(true))
+	_, err := a.rollover.UpdateByID(ctx, pendingRolloverID(eventType), bson.M{"$inc": bson.M{"lamports": int64(lamports)}}, options.UpdateOne().SetUpsert(true))
 	return err
 }
 
-// takePendingRollover hands rollover that had no target event to a newly created event.
-func (a *App) takePendingRollover(ctx context.Context) uint64 {
+func (a *App) takeBucket(ctx context.Context, id string) uint64 {
 	var doc struct {
 		Lamports int64 `bson:"lamports"`
 	}
 	err := a.rollover.FindOneAndUpdate(ctx,
-		bson.M{"_id": pendingRolloverID, "lamports": bson.M{"$gt": 0}},
+		bson.M{"_id": id, "lamports": bson.M{"$gt": 0}},
 		bson.M{"$set": bson.M{"lamports": 0}},
 	).Decode(&doc)
 	if err != nil {
 		if !errors.Is(err, mongo.ErrNoDocuments) {
-			log.Printf("failed to take pending rollover: %v", err)
+			log.Printf("failed to take pending rollover %s: %v", id, err)
 		}
 		return 0
 	}
 	return uint64(doc.Lamports)
+}
+
+// takePendingRollover hands rollover that had no target event to a newly created event of the same type.
+func (a *App) takePendingRollover(ctx context.Context, eventType string) uint64 {
+	typ := eventTypeOrSaturday(eventType)
+	got := a.takeBucket(ctx, pendingRolloverID(typ))
+	if typ == eventTypeSaturday {
+		got += a.takeBucket(ctx, legacyPendingRolloverID)
+	}
+	return got
 }
 
 type WalletPayout struct {

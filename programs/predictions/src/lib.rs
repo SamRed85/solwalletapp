@@ -17,8 +17,15 @@ const SLIP_SEED: &[u8] = b"slips";
 const LEAGUE_SEED: &[u8] = b"league";
 const RAD_SEED: &[u8] = b"rad";
 const KINDS_SEED: &[u8] = b"schedule-kinds";
-pub const KIND_SOL: u8 = 0;
+/// Saturday, and every SOL event created before event types existed.
+pub const KIND_SATURDAY: u8 = 0;
+pub const KIND_SOL: u8 = KIND_SATURDAY;
 pub const KIND_LEAGUE: u8 = 1;
+pub const KIND_WILDCARD: u8 = 2;
+pub const KIND_SPRINT: u8 = 3;
+/// The rollover kind shares the `pending` word. Amounts stay below 2^56 lamports,
+/// and an escrow written before types reads as Saturday because those bits are zero.
+const PENDING_KIND_SHIFT: u32 = 56;
 const SLIP_DEPTH: usize = 20;
 /// An admin can cap an event lower. Coupon 1,000,001 is refused on every event.
 const HARD_MAX_COUPONS: u32 = 1_000_000;
@@ -57,7 +64,7 @@ pub mod predictions {
         for (index, signer) in args.signers.iter().enumerate() {
             require!(args.signers[..index].iter().all(|prior| prior != signer), PredError::BadSigners);
         }
-        require!(args.kind == KIND_SOL || args.kind == KIND_LEAGUE, PredError::BadEvent);
+        require!(is_sol_kind(args.kind) || args.kind == KIND_LEAGUE, PredError::BadEvent);
         require!(args.min_rows >= 1 && args.min_rows <= math::MAX_COMBINATIONS, PredError::BadEvent);
         require!(args.max_coupons >= 1 && args.max_coupons <= HARD_MAX_COUPONS, PredError::BadEvent);
         let tiers: Vec<math::Tier> = args
@@ -122,10 +129,10 @@ pub mod predictions {
             event.sales = skim;
             event.rollover_in = jackpot;
             ctx.accounts.league.jackpot = 0;
-        } else if earliest_future(&ctx.accounts.schedule, &ctx.accounts.kinds, now, KIND_SOL) == Some(event_key) {
-            // Parked SOL rollover belongs to the earliest SOL event that has not started.
-            let pending = ctx.accounts.escrow.pending;
-            if pending > 0 {
+        } else if earliest_future(&ctx.accounts.schedule, &ctx.accounts.kinds, now, args.kind) == Some(event_key) {
+            // Parked rollover belongs to the earliest future event of the same type.
+            let (pending, pending_kind) = pending_parts(ctx.accounts.escrow.pending);
+            if pending > 0 && pending_kind == args.kind {
                 transfer_from_vault(
                     &ctx.accounts.escrow.to_account_info(),
                     &ctx.accounts.vault.to_account_info(),
@@ -144,7 +151,7 @@ pub mod predictions {
     pub fn place_coupon(ctx: Context<PlaceCoupon>, commitment: [u8; 32], combinations: u32, sealed: [u8; SEALED_LEN]) -> Result<()> {
         require!(!ctx.accounts.gate.paused, PredError::Paused);
         let event = &mut ctx.accounts.event;
-        require!(event.kind == KIND_SOL, PredError::BadEvent);
+        require!(is_sol_kind(event.kind), PredError::BadEvent);
         require!(event.status == EventStatus::Open, PredError::BadStatus);
         require!(Clock::get()?.unix_timestamp < event.deadline, PredError::DeadlinePassed);
         require_entry_room(event, combinations)?;
@@ -559,7 +566,7 @@ pub mod predictions {
         require!(ctx.accounts.destination.key() != ctx.accounts.source.key(), PredError::WrongEvent);
         let now = Clock::get()?.unix_timestamp;
         require!(ctx.accounts.source.kind == ctx.accounts.destination.kind, PredError::WrongEvent);
-        require!(ctx.accounts.source.kind == KIND_SOL, PredError::WrongEvent);
+        require!(is_sol_kind(ctx.accounts.source.kind), PredError::WrongEvent);
         let earliest = earliest_future(&ctx.accounts.schedule, &ctx.accounts.kinds, now, ctx.accounts.source.kind).ok_or(error!(PredError::DestinationStarted))?;
         require!(ctx.accounts.destination.key() == earliest, PredError::NotEarliestEvent);
         require!(ctx.accounts.destination.status == EventStatus::Open, PredError::BadStatus);
@@ -595,16 +602,19 @@ pub mod predictions {
             ctx.accounts.league.jackpot = ctx.accounts.league.jackpot.checked_add(amount).ok_or(error!(PredError::Overflow))?;
         } else {
             require!(
-                earliest_future(&ctx.accounts.schedule, &ctx.accounts.kinds, Clock::get()?.unix_timestamp, KIND_SOL).is_none(),
+                earliest_future(&ctx.accounts.schedule, &ctx.accounts.kinds, Clock::get()?.unix_timestamp, ctx.accounts.source.kind).is_none(),
                 PredError::FutureEventExists
             );
+            let (parked, parked_kind) = pending_parts(ctx.accounts.escrow.pending);
+            require!(parked == 0 || parked_kind == ctx.accounts.source.kind, PredError::EscrowHoldsOtherKind);
             transfer_from_vault(
                 &ctx.accounts.source_vault.to_account_info(),
                 &ctx.accounts.escrow.to_account_info(),
                 amount,
                 ctx.accounts.source.rent_reserve,
             )?;
-            ctx.accounts.escrow.pending = ctx.accounts.escrow.pending.checked_add(amount).ok_or(error!(PredError::Overflow))?;
+            let kind = if parked == 0 { ctx.accounts.source.kind } else { parked_kind };
+            ctx.accounts.escrow.pending = pack_pending(parked.checked_add(amount).ok_or(error!(PredError::Overflow))?, kind)?;
         }
         ctx.accounts.source.rollover_forwarded = true;
         Ok(())
@@ -1102,7 +1112,7 @@ pub struct Event {
     pub approvals: u8,
     pub tallied: u32,
     pub winners: [u64; math::MAX_GAMES + 1],
-    /// 0 is a SOL event. 1 is a league event entered with RAD. Older accounts read as 0.
+    /// 0 Saturday (and every SOL event from before types), 1 league, 2 Wildcard, 3 Sprint.
     pub kind: u8,
     /// SOL moved into the league vault when this event settled. Zero for legacy and league events.
     pub league_cut: u64,
@@ -1318,6 +1328,8 @@ pub struct Vault {}
 
 #[account]
 pub struct Escrow {
+    /// Low 56 bits are lamports. The top byte is the event kind they belong to.
+    /// Zero is Saturday, which is also how an escrow from before event types reads.
     pub pending: u64,
     pub rent_reserve: u64,
 }
@@ -1629,6 +1641,21 @@ pub enum PredError {
     LotteryFull,
     DrawNotReady,
     WrongWinner,
+    /// The escrow already holds a parked rollover for a different event type.
+    EscrowHoldsOtherKind,
+}
+
+fn is_sol_kind(kind: u8) -> bool {
+    matches!(kind, KIND_SATURDAY | KIND_WILDCARD | KIND_SPRINT)
+}
+
+fn pending_parts(raw: u64) -> (u64, u8) {
+    (raw & ((1u64 << PENDING_KIND_SHIFT) - 1), (raw >> PENDING_KIND_SHIFT) as u8)
+}
+
+fn pack_pending(amount: u64, kind: u8) -> Result<u64> {
+    require!(amount < (1u64 << PENDING_KIND_SHIFT), PredError::Overflow);
+    Ok(amount | ((kind as u64) << PENDING_KIND_SHIFT))
 }
 
 #[account]

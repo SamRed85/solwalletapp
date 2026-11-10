@@ -141,6 +141,15 @@ function discriminator (name) {
   return sha256(text(`global:${name}`)).slice(0, 8)
 }
 
+// The reveal nonce sits after the 8-byte discriminator, the index, owner, combination
+// count and the 13 pick masks. Claim checks it against the commitment, and a published
+// slip does not keep the nonce anywhere else.
+export function revealNonceFromInstruction (data) {
+  const mark = discriminator('reveal_slip')
+  if (data.length < 69 || mark.some((byte, index) => data[index] !== byte)) return null
+  return new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(61, true)
+}
+
 function ix (name, accounts, data) {
   return { programId: PROGRAM_ID, accounts, data: concat([discriminator(name), data]) }
 }
@@ -162,14 +171,14 @@ export const DEFAULT_MIN_ROWS = 1
 export const DEFAULT_MAX_COUPONS = 250_000
 export const HARD_MAX_COUPONS = 1_000_000
 
-export function createEventIx ({ admin, other, nonce, deadline, revealDeadline, endTime, resolveTimeout, gameCount = 7, price = 1_000_000, tiers, league = false, minRows = DEFAULT_MIN_ROWS, maxCoupons = DEFAULT_MAX_COUPONS }) {
+export function createEventIx ({ admin, other, nonce, deadline, revealDeadline, endTime, resolveTimeout, gameCount = 7, price = 1_000_000, tiers, league = false, kind = 0, minRows = DEFAULT_MIN_ROWS, maxCoupons = DEFAULT_MAX_COUPONS }) {
   const event = eventPda(admin, nonce)
   const prizeTiers = tiers?.length ? tiers : [{ correct: gameCount, percent: league ? 100 : 90 }]
   const data = concat([
     u64(nonce), Uint8Array.of(gameCount), u64(price), u64(deadline), u64(revealDeadline), u64(endTime ?? revealDeadline), u64(resolveTimeout ?? revealDeadline + 10_000),
     Uint8Array.of(2), u32(2), base58Decode(admin, 32), base58Decode(other, 32),
     u32(prizeTiers.length), Uint8Array.from(prizeTiers.flatMap(tier => [tier.correct, tier.percent])),
-    Uint8Array.of(league ? 1 : 0), u32(minRows), u32(maxCoupons)
+    Uint8Array.of(league ? 1 : kind), u32(minRows), u32(maxCoupons)
   ])
   return ix('create_event', [
     signer(admin, true), writable(event), writable(vaultPda(event)), writable(escrowPda(admin)),
@@ -302,6 +311,7 @@ export function decodeEvent (data) {
     approvals: data[304],
     tallied: v.getUint32(305, true),
     winners,
+    kind: data.length > 421 ? data[421] : 0,
     league: data.length > 421 && data[421] === 1,
     leagueCut: data.length >= 430 ? v.getBigUint64(422, true) : 0n,
     // Zero means the account was created before these limits. The program then requires 1 row
@@ -364,8 +374,17 @@ export async function fetchEvent (rpcUrl, address) {
   return decodeEvent(data)
 }
 
+export function decodeKinds (data) {
+  if (!data || data.length < 8 + 16) return []
+  return Array.from(data.slice(8, 8 + 16))
+}
+
 export async function fetchSchedule (rpcUrl, admin) {
   return decodeSchedule(await getAccount(rpcUrl, schedulePda(admin)))
+}
+
+export async function fetchKinds (rpcUrl, admin) {
+  return decodeKinds(await getAccount(rpcUrl, kindsPda(admin)))
 }
 
 export async function fetchGatePaused (rpcUrl, admin) {

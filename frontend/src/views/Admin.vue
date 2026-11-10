@@ -97,12 +97,31 @@
       <v-card title="Create event">
         <v-card-text>
           <v-form ref="createForm" v-model="createValid">
+            <div class="text-caption text-medium-emphasis mb-2">Event type</div>
+            <v-row dense>
+              <v-col v-for="item in EVENT_TYPE_LIST" :key="item.id" cols="12" sm="4">
+                <v-card
+                  class="type-choice pa-3" :variant="newEvent.type === item.id ? 'tonal' : 'outlined'"
+                  :color="newEvent.type === item.id ? 'primary' : undefined" @click="selectType(item.id)"
+                >
+                  <v-icon :icon="item.icon" :color="item.color" size="22" />
+                  <div class="text-subtitle-2 mt-2">{{ item.name }}</div>
+                  <div class="text-caption">{{ typeBlurb(item) }}</div>
+                </v-card>
+              </v-col>
+            </v-row>
+            <p class="text-caption text-medium-emphasis mt-2 mb-4">
+              An unclaimed jackpot rolls over to the next {{ eventTypeOf(newEvent).short }} event.
+              <template v-if="newEvent.league"> A league event is the exception: its jackpot returns to the league vault.</template>
+              <template v-if="parkSource"> Creating this event parks the settled rollover into it in the same transaction.</template>
+            </p>
             <v-text-field v-model="newEvent.title" label="Title" :rules="[required, v => v.length <= 120 || 'Max 120 characters']" />
             <v-textarea v-model="newEvent.description" label="Description" rows="3" :rules="[v => v.length <= 1000 || 'Max 1000 characters']" />
             <v-text-field
-              v-model.number="newEvent.gameCount" label="Number of games" type="number" min="7" max="13" step="1"
-              :rules="[v => (v >= 7 && v <= 13) || 'Between 7 and 13 games', integerRule]"
-              :hint="isSpecial ? 'Special event: set the price and prize tiers below' : 'Standard event'" persistent-hint
+              v-model.number="newEvent.gameCount" label="Number of games" type="number"
+              :min="typeSpec.minGames" :max="typeSpec.maxGames" step="1" :disabled="typeSpec.locked"
+              :rules="[v => (v >= typeSpec.minGames && v <= typeSpec.maxGames) || `Between ${typeSpec.minGames} and ${typeSpec.maxGames} games`, integerRule]"
+              :hint="typeSpec.locked ? `${typeSpec.name} always has ${typeSpec.games} games` : 'Sprint: set the price and prize tiers below'" persistent-hint
               @update:model-value="resetTiers"
             />
             <v-switch
@@ -186,7 +205,7 @@
               Kickoffs must be between the event start ({{ formatDate(selected?.startTime) }}) and end. Entries close at the event start.
             </p>
             <p class="text-caption text-medium-emphasis mb-2">
-              Show games lists every match on that date. Tick the ones for this coupon. A game without a fixture has no live score.
+              Show games lists matches on that date that have not kicked off, bigger leagues first. Tick the ones for this coupon. A game without a fixture has no live score.
             </p>
             <v-row dense align="center">
               <v-col cols="12" sm="4">
@@ -375,12 +394,14 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import MatchScore from '@/components/MatchScore.vue'
 import VaultPanel from '@/components/VaultPanel.vue'
 import { eventApi, recoveryApi } from '@/services/api'
 import {
-  MAX_OPEN_VAULT_EVENTS, RESULT_COSIGNER, createEventIx, eventPda, fetchSchedule, sendProgramTransaction, signersPda, vaultSchedule
+  MAX_OPEN_VAULT_EVENTS, RESULT_COSIGNER, createEventIx, eventPda, fetchSchedule, parkRolloverIx, sendProgramTransaction, signersPda, vaultSchedule
 } from '@/services/program'
+import { EVENT_TYPE_LIST, EVENT_TYPES, eventTypeOf, kindOf } from '@/services/eventTypes'
 import { getAccount, sendPayment, waitForConfirmation } from '@/services/solana'
 import { auth, loadConfig } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
@@ -415,8 +436,12 @@ const publishing = ref(null)
 const createDialog = ref(false)
 const createValid = ref(false)
 const newEvent = ref({})
-const defaultGameCount = computed(() => config.value?.defaultGameCount ?? 13)
-const isSpecial = computed(() => newEvent.value.gameCount !== defaultGameCount.value)
+const route = useRoute()
+const router = useRouter()
+const parkSource = ref('')
+const parkKey = id => `sol.parkInto.${id}`
+const typeSpec = computed(() => eventTypeOf(newEvent.value))
+const isSpecial = computed(() => !typeSpec.value.locked)
 const tierTotal = computed(() => (newEvent.value.tiers ?? []).reduce((sum, t) => sum + (Number(t.percent) || 0), 0))
 const tierError = computed(() => {
   if (!isSpecial.value && !newEvent.value.customRules && !newEvent.value.league) return ''
@@ -496,6 +521,7 @@ const pendingVaultKey = (eventId, wallet) => `sol.pendingVault.${eventId}.${wall
 
 async function publishVault (item) {
   publishing.value = item.id
+  let parkedThisVault = false
   try {
     await loadConfig()
     const rpcUrl = config.value.solanaRpcUrl
@@ -507,29 +533,40 @@ async function publishVault (item) {
       if (open >= MAX_OPEN_VAULT_EVENTS) {
         throw new Error(`This wallet already has ${open} unresolved vault events, the program limit. Resolve or cancel one first.`)
       }
-      if (!confirm(`Create the vault with ${shortAddress(cosigner)} as the second result signer? Entries then pay only the program.`)) return
+      const parkFrom = localStorage.getItem(parkKey(item.id)) || ''
+      parkedThisVault = Boolean(parkFrom)
+      const typeName = eventTypeOf(item).short
+      const ask = parkFrom
+        ? `Park the rollover and open the next ${typeName} vault, with ${shortAddress(cosigner)} as the second result signer?`
+        : `Create the vault with ${shortAddress(cosigner)} as the second result signer? Entries then pay only the program.`
+      if (!confirm(ask)) return
       nonce = Date.now()
       localStorage.setItem(pendingVaultKey(item.id, auth.wallet), String(nonce))
-      const sent = await sendProgramTransaction(rpcUrl, auth.wallet, [
-        createEventIx({
-          admin: auth.wallet,
-          other: cosigner,
-          nonce,
-          ...schedule,
-          gameCount: item.gameCount,
-          price: item.couponPriceLamports,
-          tiers: item.tiers,
-          league: !!item.league,
-          minRows: item.minRows || 1,
-          maxCoupons: item.maxCoupons || 250_000
-        })
-      ])
+      const create = createEventIx({
+        admin: auth.wallet,
+        other: cosigner,
+        nonce,
+        ...schedule,
+        gameCount: item.gameCount,
+        price: item.couponPriceLamports,
+        tiers: item.tiers,
+        league: !!item.league,
+        kind: kindOf(item),
+        minRows: item.minRows || 1,
+        maxCoupons: item.maxCoupons || 250_000
+      })
+      const sent = await sendProgramTransaction(rpcUrl, auth.wallet, parkFrom
+        ? [parkRolloverIx({ admin: auth.wallet, source: parkFrom }), create]
+        : [create])
       await waitForConfirmation(rpcUrl, sent.signature, sent.lastValidBlockHeight)
     }
     const address = eventPda(auth.wallet, nonce)
     await eventApi.setChain(item.id, { admin: auth.wallet, cosigner, nonce, address, signers: signersPda(address) })
     localStorage.removeItem(pendingVaultKey(item.id, auth.wallet))
-    notify('On-chain vault opened. Entries now pay the program, not the treasury.')
+    localStorage.removeItem(parkKey(item.id))
+    notify(parkedThisVault
+      ? `On-chain vault opened and the ${eventTypeOf(item).short} rollover was parked into it.`
+      : 'On-chain vault opened. Entries now pay the program, not the treasury.')
     await loadEvents()
   } catch (error) {
     notifyError(error)
@@ -576,18 +613,44 @@ async function save (action, successMessage, closeDialog) {
   }
 }
 
-async function openCreate () {
+function nextSaturdayClose () {
+  const date = new Date()
+  const add = (6 - date.getDay() + 7) % 7 || 7
+  date.setDate(date.getDate() + add)
+  date.setHours(15, 59, 0, 0)
+  const pad = value => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function typeBlurb (item) {
+  if (item.id === 'saturday') return 'Every Saturday · 13 games'
+  if (item.id === 'sprint') return 'Any day · 7 to 12 games'
+  return 'Any day · 13 games'
+}
+
+function selectType (id) {
+  const spec = EVENT_TYPES[id] || EVENT_TYPES.saturday
+  newEvent.value.type = spec.id
+  newEvent.value.gameCount = spec.games
+  newEvent.value.customRules = false
+  resetTiers()
+  if (spec.id === 'saturday') newEvent.value.startTime = nextSaturdayClose()
+}
+
+async function openCreate (type = 'saturday') {
   try {
     await loadConfig()
   } catch (error) {
     notifyError(error)
     return
   }
+  const spec = EVENT_TYPES[type] || EVENT_TYPES.saturday
   newEvent.value = {
     title: '',
     description: '',
-    gameCount: defaultGameCount.value,
-    startTime: '',
+    type: spec.id,
+    gameCount: spec.games,
+    startTime: spec.id === 'saturday' ? nextSaturdayClose() : '',
     endTime: '',
     customRules: false,
     league: false,
@@ -610,7 +673,8 @@ function createEvent () {
     maxCoupons: Math.round(Number(newEvent.value.maxCoupons)),
     startTime: new Date(startTime).toISOString(),
     endTime: new Date(endTime).toISOString(),
-    league: !!league
+    league: !!league,
+    type: newEvent.value.type || 'saturday'
   }
   if (league) {
     body.couponPriceLamports = Math.round(Number(priceSol))
@@ -621,7 +685,15 @@ function createEvent () {
     // with a fractional percent/correct value (e.g. while rebalancing payouts).
     body.tiers = tiers.map(t => ({ correct: Math.round(Number(t.correct)), percent: Math.round(Number(t.percent)) }))
   }
-  return save(() => eventApi.create(body), 'Event created', () => { createDialog.value = false })
+  const park = parkSource.value
+  return save(async () => {
+    const created = await eventApi.create(body)
+    if (park) {
+      localStorage.setItem(parkKey(created.id), park)
+      parkSource.value = ''
+      await publishVault(created)
+    }
+  }, 'Event created', () => { createDialog.value = false })
 }
 
 function openGames (event) {
@@ -671,7 +743,7 @@ async function loadDayFixtures () {
     const found = await eventApi.fixturesOnDate(fixtureDate.value, zone)
     dayFixtures.value = found.fixtures ?? []
     fixtureQuery.value = ''
-    if (!dayFixtures.value.length) fixtureMessage.value = 'No games on that date'
+    if (!dayFixtures.value.length) fixtureMessage.value = 'No games left to kick off on that date'
   } catch (error) {
     dayFixtures.value = []
     fixtureMessage.value = error?.message || 'The score feed could not be read'
@@ -783,10 +855,17 @@ onMounted(() => {
   loadEvents()
   loadRecoveries()
   loadConfig().catch(notifyError)
+  const type = typeof route.query.type === 'string' ? route.query.type : ''
+  if (EVENT_TYPES[type]) {
+    parkSource.value = typeof route.query.park === 'string' ? route.query.park : ''
+    router.replace({ path: '/admin' })
+    openCreate(type)
+  }
 })
 </script>
 
 <style scoped>
+.type-choice { cursor: pointer; height: 100%; }
 .fixture-list {
   max-height: 280px;
   overflow-y: auto;

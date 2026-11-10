@@ -1,166 +1,178 @@
 <template>
   <v-container class="py-6" max-width="1000">
-    <h1 class="text-h4 mb-2">My Coupons</h1>
-    <v-checkbox
-      v-model="hideResults" label="Hide each coupon until I open it"
-      density="compact" hide-details class="mb-4"
-    />
+    <template v-if="selectedId">
+      <v-progress-linear v-if="loading && !selectedRow && !selectedEntry" indeterminate class="mb-4" />
 
-    <v-alert
-      v-for="p in newestPending" :key="p.signature" type="warning" variant="tonal" class="mb-4"
-      title="Payment not registered yet"
-    >
-      You paid {{ formatSol(p.lamports) }} for {{ (p.combinations || p.coupons?.length || 0).toLocaleString() }} combination(s) in {{ p.eventTitle }},
-      but the coupons were not registered.
-      <a :href="explorerTx(p.signature)" target="_blank" rel="noopener">View payment</a>
-      <div v-if="expired(p)" class="mt-2">
-        This payment is more than an hour old and can no longer become an entry. Request a verified refund below.
-      </div>
-      <template #append>
-        <div class="d-flex flex-column ga-2">
-          <v-btn v-if="!expired(p)" color="warning" variant="flat" :loading="retrying === p.signature" @click="retry(p)">Retry</v-btn>
-          <v-btn variant="text" size="small" :loading="recovering === p.signature" @click="recover(p)">Request refund</v-btn>
-          <v-btn variant="text" size="small" @click="dismiss(p)">Dismiss</v-btn>
-        </div>
-      </template>
-    </v-alert>
-
-    <v-card v-if="totalWinnings && !hideResults" color="success" variant="tonal" class="mb-4">
-      <v-card-text class="text-h6">
-        <v-icon class="mr-2">mdi-trophy</v-icon>
-        Total winnings: {{ formatSol(totalWinnings) }}
-        <div class="text-body-2 mt-1">Winnings are paid to your wallet by the admin from the devnet treasury.</div>
-      </v-card-text>
-    </v-card>
-
-    <div class="d-flex flex-wrap align-center ga-2 mb-4">
-      <span class="text-subtitle-1">Vault coupons</span>
-      <v-spacer />
-      <v-btn v-if="unrecovered" size="small" color="warning" variant="flat" :loading="recoveringChain" @click="recoverChain">
-        Recover {{ unrecovered }} coupon(s) from chain
-      </v-btn>
-      <v-btn size="small" variant="text" prepend-icon="mdi-download" @click="exportBackup">Export backup</v-btn>
-      <v-btn size="small" variant="text" prepend-icon="mdi-upload" @click="importInput?.click()">Import backup</v-btn>
-      <input ref="importInput" type="file" accept="application/json" hidden @change="importBackup">
-    </div>
-    <v-alert v-if="chainError" type="warning" variant="tonal" class="mb-4">{{ chainError }}</v-alert>
-
-    <v-card v-for="row in chainRows" :key="row.id" class="mb-4" variant="outlined">
-      <v-card-title class="d-flex align-center flex-wrap ga-2" :class="{ 'open-row': hideResults }" @click="hideResults && toggle(row.id)">
-        <router-link v-if="row.eventId" :to="`/events/${row.eventId}`" class="text-decoration-none" @click.stop>{{ row.eventTitle }}</router-link>
-        <span v-else>{{ row.eventTitle }}</span>
-        <v-spacer />
-        <v-icon v-if="hideResults" size="small">{{ folded(row.id) ? 'mdi-chevron-down' : 'mdi-chevron-up' }}</v-icon>
-        <v-chip size="small" variant="flat" :color="concealed(row.id, hasOutcome(row)) ? 'default' : row.color">{{ chipText(row) }}</v-chip>
-      </v-card-title>
-      <v-card-subtitle class="text-wrap">
-        Coupon #{{ row.index + 1 }} · {{ row.combinations.toLocaleString() }} combination(s)
-        <template v-if="row.address && !row.slip"> · <a :href="explorerAddress(row.address)" target="_blank" rel="noopener">account</a></template>
-      </v-card-subtitle>
-      <v-card-text v-if="folded(row.id)" class="text-medium-emphasis open-row" @click="toggle(row.id)">
-        {{ hasOutcome(row) ? 'Open this coupon to see if it won.' : 'Open this coupon to see how it is going.' }}
-      </v-card-text>
-      <v-card-text v-else>
-        <CouponCompare v-if="row.system?.length" :picks="row.system" :colors="row.colors || []" :results="shownResults(row.results, row.eventId)" :live="liveScores(row.results, row.eventId)" :games="row.games" />
-        <CouponScore v-if="row.score" :best="row.score.best" :games="row.score.games" :lines="row.score.lines" />
-        <ProjectedPayout v-if="row.system?.length && !row.results" :system="row.system" :colors="row.colors || []" :projection="projections[row.eventId]" />
-        <div v-if="row.label === 'Claimed' && row.payout" class="text-body-2 mb-2">Won {{ formatSol(row.payout) }} from the vault.</div>
-        <div v-else-if="row.detail" class="text-body-2 mb-2">{{ row.detail }}</div>
-        <div class="d-flex flex-wrap ga-2">
-          <v-btn v-if="row.canSchedule && !armed.includes(row.address)" color="primary" variant="flat" :loading="acting === row.id" @click="schedule(row)">Arm automatic reveal</v-btn>
-          <v-btn v-if="row.action === 'reveal'" color="primary" variant="tonal" :loading="acting === row.id" @click="act(row, revealOnChain, 'Picks revealed')">Reveal now</v-btn>
-          <v-btn v-if="row.action === 'claim'" color="success" variant="flat" :loading="acting === row.id" @click="act(row, claimOnChain, row.payout ? 'Winnings claimed.' : 'Coupon closed. The account rent was returned.')">
-            {{ row.payout ? `Claim ${formatSol(row.payout)}` : 'Close coupon' }}
-          </v-btn>
-          <v-btn v-if="row.action === 'refund'" color="warning" variant="flat" :loading="acting === row.id" @click="act(row, refundOnChain, 'Entry refunded')">Refund {{ formatSol(row.lamports) }}</v-btn>
-        </div>
-        <p v-if="row.action === 'claim'" class="text-caption text-medium-emphasis mt-2 mb-0">
-          <template v-if="row.payout">
-            {{ formatSol(row.payout) }} is the prize. A slip has no account deposit. An older coupon account returns its rent to this wallet.
-          </template>
-          <template v-else>
-            No prize, so the stake stays in the pool. Closing an older coupon returns its account rent. A slip has nothing further to claim.
-          </template>
-        </p>
-      </v-card-text>
-    </v-card>
-
-    <v-progress-linear v-if="loading" indeterminate class="mb-4" />
-    <v-card v-if="!loading && entries.length === 0 && chainRows.length === 0" variant="outlined" class="pa-6 text-center">
-      <p class="text-medium-emphasis mb-4">You have not placed any coupons yet.</p>
-      <v-btn color="primary" to="/">Browse events</v-btn>
-    </v-card>
-
-    <v-card v-for="entry in entries" :key="entry.id" class="mb-4">
-      <v-card-title
-        class="d-flex align-center flex-wrap ga-2"
-        :class="{ 'open-row': hideResults && !!entry.system?.length }"
-        @click="hideResults && entry.system?.length && toggle(entry.id)"
-      >
-        <router-link :to="`/events/${entry.eventId}`" class="text-decoration-none" @click.stop>{{ entry.eventTitle || 'Event' }}</router-link>
-        <v-chip v-if="entry.event" :color="statusColors[entry.event.status]" size="small" variant="flat">{{ entry.event.status }}</v-chip>
-        <v-spacer />
-        <v-icon v-if="hideResults && entry.system?.length" size="small">{{ folded(entry.id) ? 'mdi-chevron-down' : 'mdi-chevron-up' }}</v-icon>
-        <v-chip v-if="entry.results && !hideResults" :color="entry.winningsLamports ? 'success' : 'default'" variant="flat">
-          {{ entry.winningsLamports ? `Won ${formatSol(entry.winningsLamports)}` : 'No win' }}
-        </v-chip>
-      </v-card-title>
-      <v-card-subtitle class="text-wrap">
-        {{ (entry.combinations || entry.coupons?.length || 0).toLocaleString() }} combination(s) · paid {{ formatSol(entry.lamports) }} · {{ formatDate(entry.createdAt) }} ·
-        <a :href="explorerTx(entry.signature)" target="_blank" rel="noopener">payment</a>
-      </v-card-subtitle>
-      <v-card-text>
-        <template v-if="entry.system?.length">
-          <div v-if="folded(entry.id)" class="text-medium-emphasis open-row" @click="toggle(entry.id)">
-            {{ entrySettled(entry) ? 'Open this coupon to see if it won.' : 'Open this coupon to see how it is going.' }}
+      <v-card v-else-if="selectedRow" class="coupon-detail">
+        <v-card-title class="d-flex align-center flex-wrap ga-2">
+          <router-link v-if="selectedRow.eventId" :to="`/events/${selectedRow.eventId}`" class="text-decoration-none">{{ selectedRow.eventTitle }}</router-link>
+          <span v-else>{{ selectedRow.eventTitle }}</span>
+          <v-spacer />
+          <v-chip size="small" variant="flat" :color="selectedRow.color">{{ chipText(selectedRow) }}</v-chip>
+        </v-card-title>
+        <v-card-subtitle class="text-wrap">
+          Coupon #{{ selectedRow.index + 1 }} · {{ selectedRow.combinations.toLocaleString() }} combination(s)
+          <template v-if="selectedRow.address && !selectedRow.slip"> · <a :href="explorerAddress(selectedRow.address)" target="_blank" rel="noopener">account</a></template>
+        </v-card-subtitle>
+        <v-card-text>
+          <CouponCompare v-if="selectedRow.system?.length" :picks="selectedRow.system" :colors="selectedRow.colors || []" :results="shownResults(selectedRow.results, selectedRow.eventId)" :live="liveScores(selectedRow.results, selectedRow.eventId)" :games="selectedRow.games" />
+          <CouponScore v-if="selectedRow.score" :best="selectedRow.score.best" :games="selectedRow.score.games" :lines="selectedRow.score.lines" />
+          <ProjectedPayout v-if="selectedRow.system?.length && !selectedRow.results" :system="selectedRow.system" :colors="selectedRow.colors || []" :projection="projections[selectedRow.eventId]" />
+          <div v-if="selectedRow.label === 'Claimed' && selectedRow.payout" class="text-body-2 mb-2">Won {{ formatSol(selectedRow.payout) }} from the vault.</div>
+          <div v-else-if="selectedRow.detail" class="text-body-2 mb-2">{{ selectedRow.detail }}</div>
+          <div class="d-flex flex-wrap ga-2">
+            <v-btn v-if="selectedRow.canSchedule && !armed.includes(selectedRow.address)" color="primary" variant="flat" :loading="acting === selectedRow.id" @click="schedule(selectedRow)">Arm automatic reveal</v-btn>
+            <v-btn v-if="selectedRow.action === 'reveal'" color="primary" variant="tonal" :loading="acting === selectedRow.id" @click="act(selectedRow, revealOnChain, 'Picks revealed')">Reveal now</v-btn>
+            <v-btn v-if="selectedRow.action === 'claim'" color="success" variant="flat" :loading="acting === selectedRow.id" @click="act(selectedRow, claimOnChain, selectedRow.payout ? 'Winnings claimed.' : 'Coupon closed. The account rent was returned.')">
+              {{ selectedRow.payout ? `Claim ${formatSol(selectedRow.payout)}` : 'Close coupon' }}
+            </v-btn>
+            <v-btn v-if="selectedRow.action === 'refund'" color="warning" variant="flat" :loading="acting === selectedRow.id" @click="act(selectedRow, refundOnChain, 'Entry refunded')">Refund {{ formatSol(selectedRow.lamports) }}</v-btn>
           </div>
-          <template v-else>
-            <CouponCompare :picks="entry.system" :colors="entry.colors || []" :results="shownResults(resultString(entry.event?.games), entry.eventId)" :live="liveScores(resultString(entry.event?.games), entry.eventId)" :games="entry.event?.games ?? []" />
+          <p v-if="selectedRow.action === 'claim'" class="text-caption text-medium-emphasis mt-2 mb-0">
+            <template v-if="selectedRow.payout">
+              {{ formatSol(selectedRow.payout) }} is the prize. A slip has no account deposit. An older coupon account returns its rent to this wallet.
+            </template>
+            <template v-else>
+              No prize, so the stake stays in the pool. Closing an older coupon returns its account rent. A slip has nothing further to claim.
+            </template>
+          </p>
+        </v-card-text>
+      </v-card>
+
+      <v-card v-else-if="selectedEntry" class="coupon-detail">
+        <v-card-title class="d-flex align-center flex-wrap ga-2">
+          <router-link :to="`/events/${selectedEntry.eventId}`" class="text-decoration-none">{{ selectedEntry.eventTitle || 'Event' }}</router-link>
+          <v-chip v-if="selectedEntry.event" :color="statusColors[selectedEntry.event.status]" size="small" variant="flat">{{ selectedEntry.event.status }}</v-chip>
+          <v-spacer />
+          <v-chip v-if="entrySettled(selectedEntry)" :color="selectedEntry.winningsLamports ? 'success' : 'default'" variant="flat">
+            {{ selectedEntry.winningsLamports ? `Won ${formatSol(selectedEntry.winningsLamports)}` : 'No win' }}
+          </v-chip>
+        </v-card-title>
+        <v-card-subtitle class="text-wrap">
+          {{ (selectedEntry.combinations || selectedEntry.coupons?.length || 0).toLocaleString() }} combination(s) · paid {{ formatSol(selectedEntry.lamports) }} · {{ formatDate(selectedEntry.createdAt) }} ·
+          <a :href="explorerTx(selectedEntry.signature)" target="_blank" rel="noopener">payment</a>
+        </v-card-subtitle>
+        <v-card-text>
+          <template v-if="selectedEntry.system?.length">
+            <CouponCompare :picks="selectedEntry.system" :colors="selectedEntry.colors || []" :results="shownResults(resultString(selectedEntry.event?.games), selectedEntry.eventId)" :live="liveScores(resultString(selectedEntry.event?.games), selectedEntry.eventId)" :games="selectedEntry.event?.games ?? []" />
             <CouponScore
-              v-if="entry.scores?.length" class="mt-3"
-              :best="entry.scores[0].correct" :games="entry.system.length"
-              :lines="entry.scores.filter(item => item.winningsLamports).map(item => scoreLine(entry, item))"
+              v-if="selectedEntry.scores?.length" class="mt-3"
+              :best="selectedEntry.scores[0].correct" :games="selectedEntry.system.length"
+              :lines="selectedEntry.scores.filter(item => item.winningsLamports).map(item => scoreLine(selectedEntry, item))"
             />
-            <div v-else-if="!shownResults(resultString(entry.event?.games), entry.eventId)" class="text-caption text-medium-emphasis mt-2">Waiting for results</div>
-            <ProjectedPayout v-if="!entrySettled(entry)" :system="entry.system" :projection="projections[entry.eventId]" />
+            <div v-else-if="!shownResults(resultString(selectedEntry.event?.games), selectedEntry.eventId)" class="text-caption text-medium-emphasis mt-2">Waiting for results</div>
+            <ProjectedPayout v-if="!entrySettled(selectedEntry)" :system="selectedEntry.system" :projection="projections[selectedEntry.eventId]" />
           </template>
+          <template v-else>
+            <div v-for="(coupon, i) in selectedEntry.coupons" :key="i" class="py-2">
+              <div class="text-medium-emphasis mb-1">Coupon #{{ i + 1 }}</div>
+              <CouponCompare :picks="coupon.split('')" :results="shownResults(resultString(selectedEntry.event?.games), selectedEntry.eventId)" :live="liveScores(resultString(selectedEntry.event?.games), selectedEntry.eventId)" :games="selectedEntry.event?.games ?? []" />
+              <ProjectedPayout v-if="!selectedEntry.results" :system="coupon.split('')" :projection="projections[selectedEntry.eventId]" />
+              <CouponScore
+                v-if="selectedEntry.results" class="mt-2"
+                :best="selectedEntry.results[i].correct" :games="coupon.length"
+                :lines="selectedEntry.results[i].winningsLamports ? [scoreLine(selectedEntry, { correct: selectedEntry.results[i].correct, combinations: 1, winningsLamports: selectedEntry.results[i].winningsLamports })] : []"
+              />
+              <div v-else-if="!shownResults(resultString(selectedEntry.event?.games), selectedEntry.eventId)" class="text-caption text-medium-emphasis mt-1">Waiting for results</div>
+            </div>
+          </template>
+        </v-card-text>
+      </v-card>
+
+      <v-card v-else class="pa-6 text-center">
+        <p class="text-medium-emphasis mb-4">This coupon is not in your list any more.</p>
+        <v-btn color="primary" variant="flat" @click="closeCoupon">Back to my coupons</v-btn>
+      </v-card>
+    </template>
+
+    <template v-else>
+      <h1 class="text-h4 mb-2">My Coupons</h1>
+      <v-checkbox
+        v-model="hideResults" label="Hide each result until I open the coupon"
+        density="compact" hide-details class="mb-4"
+      />
+
+      <v-alert
+        v-for="p in newestPending" :key="p.signature" type="warning" variant="tonal" class="mb-4"
+        title="Payment not registered yet"
+      >
+        You paid {{ formatSol(p.lamports) }} for {{ (p.combinations || p.coupons?.length || 0).toLocaleString() }} combination(s) in {{ p.eventTitle }},
+        but the coupons were not registered.
+        <a :href="explorerTx(p.signature)" target="_blank" rel="noopener">View payment</a>
+        <div v-if="expired(p)" class="mt-2">
+          This payment is more than an hour old and can no longer become an entry. Request a verified refund below.
+        </div>
+        <template #append>
+          <div class="d-flex flex-column ga-2">
+            <v-btn v-if="!expired(p)" color="warning" variant="flat" :loading="retrying === p.signature" @click="retry(p)">Retry</v-btn>
+            <v-btn variant="text" size="small" :loading="recovering === p.signature" @click="recover(p)">Request refund</v-btn>
+            <v-btn variant="text" size="small" @click="dismiss(p)">Dismiss</v-btn>
+          </div>
+        </template>
+      </v-alert>
+
+      <v-card v-if="totalWinnings && !hideResults" color="success" variant="tonal" class="mb-4">
+        <v-card-text class="text-h6">
+          <v-icon class="mr-2">mdi-trophy</v-icon>
+          Total winnings: {{ formatSol(totalWinnings) }}
+          <div class="text-body-2 mt-1">Winnings are paid to your wallet by the admin from the devnet treasury.</div>
+        </v-card-text>
+      </v-card>
+
+      <div class="d-flex flex-wrap align-center ga-2 mb-2">
+        <v-btn v-if="unrecovered" size="small" color="warning" variant="flat" :loading="recoveringChain" @click="recoverChain">
+          Recover {{ unrecovered }} coupon(s) from chain
+        </v-btn>
+        <v-btn size="small" variant="text" prepend-icon="mdi-download" @click="exportBackup">Export backup</v-btn>
+        <v-btn size="small" variant="text" prepend-icon="mdi-upload" @click="importInput?.click()">Import backup</v-btn>
+        <input ref="importInput" type="file" accept="application/json" hidden @change="importBackup">
+      </div>
+      <v-alert v-if="chainError" type="warning" variant="tonal" class="mb-4">{{ chainError }}</v-alert>
+
+      <v-progress-linear v-if="loading" indeterminate class="my-4" />
+      <v-card v-if="!loading && couponList.length === 0" class="pa-6 text-center">
+        <p class="text-medium-emphasis mb-4">You have not placed any coupons yet.</p>
+        <v-btn color="primary" to="/">Browse events</v-btn>
+      </v-card>
+
+      <button v-for="item in couponList" :key="item.key" type="button" class="coupon-row" @click="openCoupon(item.id)">
+        <template v-if="item.kind === 'vault'">
+          <span class="coupon-copy">
+            <span class="coupon-title">{{ item.row.eventTitle }}</span>
+            <span class="coupon-meta">Coupon #{{ item.row.index + 1 }} · {{ item.row.combinations.toLocaleString() }} combination(s)</span>
+          </span>
+          <v-chip size="small" variant="flat" :color="concealed(item.row.id, hasOutcome(item.row)) ? 'default' : item.row.color">{{ chipText(item.row) }}</v-chip>
         </template>
         <template v-else>
-          <div v-for="(coupon, i) in entry.coupons" :key="i" class="py-2">
-            <div class="d-flex align-center" :class="{ 'open-row': hideResults }" @click="hideResults && toggle(`${entry.id}:${i}`)">
-              <span class="text-medium-emphasis">Coupon #{{ i + 1 }}</span>
-              <v-spacer />
-              <v-icon v-if="hideResults" size="small">{{ folded(`${entry.id}:${i}`) ? 'mdi-chevron-down' : 'mdi-chevron-up' }}</v-icon>
-            </div>
-            <div v-if="folded(`${entry.id}:${i}`)" class="text-caption text-medium-emphasis open-row" @click="toggle(`${entry.id}:${i}`)">
-              {{ entry.results ? 'Open this coupon to see if it won.' : 'Open this coupon to see how it is going.' }}
-            </div>
-            <template v-else>
-              <CouponCompare :picks="coupon.split('')" :results="shownResults(resultString(entry.event?.games), entry.eventId)" :live="liveScores(resultString(entry.event?.games), entry.eventId)" :games="entry.event?.games ?? []" />
-              <ProjectedPayout v-if="!entry.results" :system="coupon.split('')" :projection="projections[entry.eventId]" />
-              <CouponScore
-                v-if="entry.results" class="mt-2"
-                :best="entry.results[i].correct" :games="coupon.length"
-                :lines="entry.results[i].winningsLamports ? [scoreLine(entry, { correct: entry.results[i].correct, combinations: 1, winningsLamports: entry.results[i].winningsLamports })] : []"
-              />
-              <div v-else-if="!shownResults(resultString(entry.event?.games), entry.eventId)" class="text-caption text-medium-emphasis mt-1">Waiting for results</div>
-            </template>
-          </div>
+          <span class="coupon-copy">
+            <span class="coupon-title">{{ item.entry.eventTitle || 'Event' }}</span>
+            <span class="coupon-meta">
+              {{ (item.entry.combinations || item.entry.coupons?.length || 0).toLocaleString() }} combination(s) · paid {{ formatSol(item.entry.lamports) }} · {{ formatDate(item.entry.createdAt) }}
+            </span>
+          </span>
+          <v-chip v-if="entrySettled(item.entry) && !concealed(item.entry.id, true)" size="small" variant="flat" :color="item.entry.winningsLamports ? 'success' : 'default'">
+            {{ item.entry.winningsLamports ? `Won ${formatSol(item.entry.winningsLamports)}` : 'No win' }}
+          </v-chip>
+          <v-chip v-else-if="item.entry.event" size="small" variant="flat" :color="entrySettled(item.entry) ? 'default' : statusColors[item.entry.event.status]">
+            {{ entrySettled(item.entry) ? 'Settled' : item.entry.event.status }}
+          </v-chip>
         </template>
-      </v-card-text>
-    </v-card>
+        <v-icon icon="mdi-chevron-right" size="20" class="coupon-chevron" />
+      </button>
+    </template>
   </v-container>
 </template>
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import CouponCompare from '@/components/CouponCompare.vue'
 import CouponScore from '@/components/CouponScore.vue'
 import ProjectedPayout from '@/components/ProjectedPayout.vue'
 import { entryApi, eventApi } from '@/services/api'
 import {
   COUPONS_REVEALED, PAYMENT_MAX_AGE_MS, armCouponReveal, backupMatches, claimOnChain, couponId, exportCouponBackup,
-  adoptArchiveSlips, importCouponBackup, loadArmed, loadChainCoupons, syncPublishedSlips,
+  adoptArchiveSlips, importCouponBackup, loadArmed, loadChainCoupons, pullChainCoupons, syncPublishedSlips,
   loadPending, recoverFromChain, refundOnChain, removePending, revealOnChain, submitPending
 } from '@/services/entry'
 import { couponPayout, couponScore, eventPda, fetchEvent, picksFromSystem, systemFromPicks, walletCoupons } from '@/services/program'
@@ -169,6 +181,8 @@ import { auth, loadConfig } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { explorerAddress, explorerTx, formatDate, formatSol, statusColors } from '@/utils/format'
 
+const route = useRoute()
+const router = useRouter()
 const entries = ref([])
 const openEvent = ref('')
 const projections = ref({})
@@ -190,14 +204,43 @@ const opened = ref({})
 const outcomeLabels = new Set(['Won', 'No win', 'Not revealed', 'Claimed'])
 watch(hideResults, value => localStorage.setItem('sol.hideResults', value ? '1' : '0'))
 
-function toggle (id) {
-  opened.value = { ...opened.value, [id]: !opened.value[id] }
+// The open coupon lives in the URL, so the bar's back button and the browser's back both close it.
+const selectedId = computed(() => typeof route.query.coupon === 'string' ? route.query.coupon : '')
+const selectedRow = computed(() => chainRows.value.find(row => row.id === selectedId.value))
+const selectedEntry = computed(() => entries.value.find(entry => entry.id === selectedId.value))
+const couponList = computed(() => {
+  const vault = chainRows.value.map(row => ({
+    key: `vault:${row.id}`,
+    kind: 'vault',
+    id: row.id,
+    at: row.placedAt || 0,
+    index: row.index ?? 0,
+    row
+  }))
+  const paid = entries.value.map(entry => ({
+    key: `entry:${entry.id}`,
+    kind: 'entry',
+    id: entry.id,
+    at: Date.parse(entry.createdAt) || 0,
+    index: 0,
+    entry
+  }))
+  return [...vault, ...paid].sort((a, b) => b.at - a.at || b.index - a.index)
+})
+
+watch(selectedId, id => {
+  if (id) opened.value = { ...opened.value, [id]: true }
+  window.scrollTo(0, 0)
+}, { immediate: true })
+
+function openCoupon (id) {
+  router.push({ query: { coupon: id } })
 }
-function folded (id) {
-  return hideResults.value && !opened.value[id]
+function closeCoupon () {
+  router.replace({ query: {} })
 }
 function concealed (id, outcome) {
-  return !!outcome && folded(id)
+  return !!outcome && hideResults.value && !opened.value[id]
 }
 function hasOutcome (row) {
   return outcomeLabels.has(row.label)
@@ -246,7 +289,7 @@ function describeSlip (saved, state, now) {
   }
   if (state.status === 'tallying') return { label: 'Counting', color: 'primary', detail: 'Results are locked and coupons are being counted.' }
   if (!saved.system?.length && !saved.revealed) {
-    return { label: 'Entered', color: 'primary', detail: 'This coupon is in the pool. The rows stay on the device that placed it until they are published. Import a backup from that device to see them here.' }
+    return { label: 'Entered', color: 'primary', detail: 'This coupon is in the pool. The picks were not saved with this wallet, so they cannot be shown here.' }
   }
   if (now < state.deadline) return { label: 'Entered', color: 'primary', detail: `Your picks are published automatically when entries close (${formatDate(state.deadline * 1000)}).` }
   if (saved.revealed) return { label: 'Revealed', color: 'primary', detail: 'Waiting for both result signers.' }
@@ -284,13 +327,14 @@ function describe (onChain, saved, state, now) {
   if (onChain.revealed) return { label: 'Revealed', color: 'primary', detail: 'Waiting for both result signers.' }
   if (now >= state.revealDeadline) return { label: 'Not revealed', color: 'error', detail: 'The reveal window has closed; this coupon cannot win.' }
   if (restorable) return { label: 'Reveal now', color: 'warning', action: 'reveal', detail: `Reveal before ${formatDate(state.revealDeadline * 1000)} or the coupon cannot win.` }
-  return { label: 'Picks missing', color: 'error', detail: 'This browser does not have the picks. Recover them from chain or import a backup.' }
+  return { label: 'Picks missing', color: 'error', detail: 'The picks for this coupon were not saved with this wallet.' }
 }
 
 async function loadChain () {
   chainError.value = ''
   await loadConfig()
   const rpcUrl = auth.config.solanaRpcUrl
+  await pullChainCoupons(auth.wallet)
   let saved = loadChainCoupons(auth.wallet)
   let onChain = []
   const events = new Map()
@@ -569,6 +613,28 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
 </script>
 
 <style scoped>
-.open-row { cursor: pointer; }
+.coupon-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 64px;
+  padding: 10px 14px;
+  margin-bottom: 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: rgb(var(--v-theme-surface));
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+.coupon-row:hover { background: rgb(var(--v-theme-surface-variant)); }
+.coupon-row:focus-visible { outline: 2px solid rgb(var(--v-theme-primary)); outline-offset: 2px; }
+.coupon-copy { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.coupon-title { font-size: var(--fs-body); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.coupon-meta { font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.62); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.coupon-chevron { flex: none; opacity: 0.45; }
+.coupon-detail { min-height: calc(100dvh - 200px); }
 </style>
-
