@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { blankHold, shownLimit, stepHold } from '../src/utils/colorMarks.js'
 import { colorPaint, colorReduction, colorView, keptCounts, missedColorGames, ReductionError } from '../src/utils/reduce.js'
 
 const full = count => Array.from({ length: count }, () => ['1', 'X', '2'])
@@ -82,11 +83,68 @@ test('random colors keep exactly the rows inside every range', () => {
       got = colorReduction(frame, colors).rows
     } catch (error) {
       assert.ok(error instanceof ReductionError)
-      if (/no rows/.test(error.message)) assert.equal(want, 0)
-      continue
+      got = error.rows
     }
     assert.equal(got, want, JSON.stringify({ frame, colors }))
   }
+})
+
+test('every overlap of the four colors keeps the rows that pass every range', () => {
+  const frame = full(3)
+  const frameRows = 3 ** 3
+  const ids = ['purple', 'yellow', 'red', 'green']
+  let checked = 0
+  function expectRows (colors) {
+    const want = survivors(frame, colors).length
+    let got
+    try {
+      got = colorReduction(frame, colors).rows
+    } catch (error) {
+      assert.ok(error instanceof ReductionError, error.message)
+      got = error.rows
+    }
+    assert.equal(got, want, JSON.stringify(colors))
+    if (want !== frameRows) assert.notEqual(got, frameRows)
+    checked += 1
+  }
+
+  // Each color marks any subset of the three games, including a second outcome on the first game.
+  for (let packed = 0; packed < 16 ** 4; packed += 1) {
+    const colors = ids.map((id, index) => {
+      const mask = Math.floor(packed / (16 ** index)) % 16
+      const signs = []
+      for (let game = 0; game < 3; game += 1) {
+        if (mask & (1 << game)) signs.push({ game, outcome: '1' })
+      }
+      if (mask & 8) signs.push({ game: 0, outcome: 'X' })
+      const reach = new Set(signs.map(sign => sign.game)).size
+      const min = Math.min(index === 3 ? 1 : 0, reach)
+      const max = index === 1 ? 0 : reach + (index === 2 ? 5 : 0)
+      return { id, signs, min, max: Math.max(max, min) }
+    })
+    expectRows(colors)
+  }
+
+  const overlapping = [
+    { id: 'purple', signs: [0, 1, 2].map(game => ({ game, outcome: '1' })) },
+    { id: 'yellow', signs: [0, 1, 2].map(game => ({ game, outcome: 'X' })) },
+    { id: 'red', signs: [0, 1, 2].map(game => ({ game, outcome: '2' })) },
+    { id: 'green', signs: [{ game: 0, outcome: '1' }, { game: 0, outcome: 'X' }, { game: 1, outcome: '2' }, { game: 2, outcome: '1' }] }
+  ]
+  const limits = []
+  for (let min = 0; min <= 4; min += 1) {
+    for (let max = min; max <= 4; max += 1) limits.push([min, max])
+  }
+  limits.push([0, 20])
+  function walk (index, chosen) {
+    if (index === overlapping.length) {
+      expectRows(overlapping.map((color, i) => ({ ...color, min: chosen[i][0], max: chosen[i][1] })))
+      return
+    }
+    for (const pair of limits) walk(index + 1, [...chosen, pair])
+  }
+  walk(0, [])
+  assert.equal(checked, 16 ** 4 + limits.length ** 4)
 })
 
 test('kept rows by score match every row', () => {
@@ -136,6 +194,36 @@ test('colors past the program state cap are refused', () => {
   assert.throws(() => colorReduction(frame, [{ signs: home, min: 1, max: 8 }, { signs: draw, min: 1, max: 8 }]), /too detailed/)
 })
 
+test('a complex reduction keeps its row count when it cannot be one coupon', () => {
+  const frame = full(6)
+  const colors = [0, 1, 2, 0].map(outcome => ({
+    signs: frame.map((_, game) => ({ game, outcome: ['1', 'X', '2'][outcome] })),
+    min: 1,
+    max: 3
+  }))
+  colors[3] = { signs: [{ game: 0, outcome: '1' }, { game: 1, outcome: 'X' }, { game: 2, outcome: '2' }, { game: 3, outcome: '1' }], min: 1, max: 3 }
+  const want = survivors(frame, colors).length
+  assert.ok(want > 0 && want < 3 ** 6)
+  try {
+    colorReduction(frame, colors)
+    assert.fail('the state table is over 64')
+  } catch (error) {
+    assert.ok(error instanceof ReductionError)
+    assert.match(error.message, /too detailed/)
+    assert.equal(error.rows, want)
+    assert.notEqual(error.rows, 3 ** 6)
+  }
+})
+
+test('a max above the number of games counts the rows it can actually reach', () => {
+  const frame = full(8)
+  const signs = frame.map((_, game) => ({ game, outcome: '1' }))
+  const reduced = colorReduction(frame, [{ signs, min: 1, max: 20 }])
+  assert.equal(reduced.rows, 3 ** 8 - 2 ** 8)
+  assert.equal(reduced.colors[0].max, 8)
+  assert.equal(reduced.rows, survivors(frame, [{ signs, min: 1, max: 20 }]).length)
+})
+
 test('a sign outside the frame cannot be hit', () => {
   const frame = [['1'], ['X'], ['2']]
   assert.throws(
@@ -161,6 +249,103 @@ test('a coupon reduced with yellow only stays yellow', () => {
   const view = colorView(reduced.colors.map(color => ({ ...color, signs: color.signs.toString() })))
   assert.equal(view[0].id, 'yellow')
   assert.equal(view[0].label, 'Yellow')
+})
+
+function signsOf (marks) {
+  return marks.map(key => {
+    const [game, outcome] = key.split(':')
+    return { game: Number(game), outcome }
+  })
+}
+
+function reachOf (marks) {
+  return new Set(marks.map(key => key.split(':')[0])).size
+}
+
+test('a lowered maximum stays put when signs come off and go back on', () => {
+  const frame = full(6)
+  const keys = frame.map((_, game) => `${game}:1`)
+  let marks = []
+  let hold = blankHold()
+  for (const key of keys) marks = [...marks, key]
+  assert.deepEqual(shownLimit(hold, reachOf(marks)), { min: 0, max: 6 })
+  for (let step = 0; step < 4; step += 1) hold = stepHold(hold, reachOf(marks), 'max', -1)
+  assert.equal(shownLimit(hold, reachOf(marks)).max, 2)
+  marks = marks.slice(0, 2)
+  assert.equal(shownLimit(hold, reachOf(marks)).max, 2)
+  marks = [...marks, keys[2], '0:X']
+  assert.equal(reachOf(marks), 3)
+  assert.equal(shownLimit(hold, reachOf(marks)).max, 2)
+  marks = [...keys, '0:X']
+  const shown = shownLimit(hold, reachOf(marks))
+  assert.deepEqual(shown, { min: 0, max: 2 })
+  const colors = [{ signs: signsOf(marks), ...shown }]
+  const reduced = colorReduction(frame, colors)
+  assert.equal(reduced.rows, survivors(frame, colors).length)
+  assert.ok(reduced.rows < 3 ** 6)
+})
+
+test('a minimum comes back when its games are marked again', () => {
+  let hold = blankHold()
+  let marks = ['0:1', '1:1', '2:1', '3:1']
+  for (let step = 0; step < 3; step += 1) hold = stepHold(hold, reachOf(marks), 'min', 1)
+  assert.deepEqual(shownLimit(hold, reachOf(marks)), { min: 3, max: 4 })
+  marks = ['0:1']
+  assert.deepEqual(shownLimit(hold, reachOf(marks)), { min: 1, max: 1 })
+  marks = ['0:1', '1:1', '2:1', '3:1']
+  assert.deepEqual(shownLimit(hold, reachOf(marks)), { min: 3, max: 4 })
+})
+
+test('two signs on one game do not raise the maximum a row can hit', () => {
+  const hold = stepHold(blankHold(), 1, 'max', -1)
+  assert.deepEqual(shownLimit(hold, 1), { min: 0, max: 0 })
+  assert.deepEqual(shownLimit(hold, 2), { min: 0, max: 0 })
+  const frame = full(2)
+  const colors = [{ signs: [{ game: 0, outcome: '1' }, { game: 0, outcome: 'X' }], min: 0, max: 0 }]
+  assert.equal(colorReduction(frame, colors).rows, survivors(frame, colors).length)
+})
+
+test('random edits keep the chosen maximum and the listed rows', () => {
+  let seed = 19
+  const next = limit => {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed % limit
+  }
+  const frame = full(5)
+  const keys = frame.flatMap((outcomes, game) => outcomes.map(outcome => `${game}:${outcome}`))
+  for (let trial = 0; trial < 40; trial += 1) {
+    const holds = [blankHold(), blankHold(), blankHold(), blankHold()]
+    const marks = [[], [], [], []]
+    for (let edit = 0; edit < 30; edit += 1) {
+      const color = next(4)
+      const roll = next(5)
+      const ceiling = reachOf(marks[color])
+      if (roll < 3 && ceiling) {
+        const field = roll === 2 ? 'min' : 'max'
+        holds[color] = stepHold(holds[color], ceiling, field, next(2) ? 1 : -1)
+      } else {
+        const key = keys[next(keys.length)]
+        marks[color] = marks[color].includes(key)
+          ? marks[color].filter(mark => mark !== key)
+          : [...marks[color], key]
+      }
+      const shown = shownLimit(holds[color], reachOf(marks[color]))
+      assert.ok(shown.min <= shown.max)
+      assert.ok(shown.max <= reachOf(marks[color]))
+      if (holds[color].cap != null) assert.ok(shown.max <= holds[color].cap)
+    }
+    const colors = marks
+      .map((list, index) => ({ signs: signsOf(list), ...shownLimit(holds[index], reachOf(list)) }))
+      .filter(color => color.signs.length)
+    if (!colors.length) continue
+    const want = survivors(frame, colors).length
+    try {
+      assert.equal(colorReduction(frame, colors).rows, want)
+    } catch (error) {
+      assert.ok(error instanceof ReductionError)
+      assert.equal(error.rows || 0, want)
+    }
+  }
 })
 
 test('a color that keeps every row is left off the coupon', () => {

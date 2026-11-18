@@ -76,7 +76,7 @@ function activeColors (frame, colors) {
   if (!colors?.length) return []
   if (colors.length > COLOR_IDS.length) throw new ReductionError('At most 4 colors')
   return colors.map(color => {
-    if (!Number.isInteger(color.min) || !Number.isInteger(color.max) || color.min < 0 || color.max < color.min || color.max > frame.length) {
+    if (!Number.isInteger(color.min) || !Number.isInteger(color.max) || color.min < 0 || color.max < color.min) {
       throw new ReductionError('Each color needs a min that is not above its max')
     }
     const signs = new Set()
@@ -156,27 +156,32 @@ export function colorReduction (picks, colors, { maxCombinations = MAX_COMBINATI
   const counted = []
   let states = 1
   for (const color of used) {
+    // A row hits a color at most once per game, however many of that game's outcomes are marked.
     const reach = frame.filter((outcomes, game) => outcomes.some(outcome => color.signs.has(signKey(game, outcome)))).length
     if (color.min > reach) throw new ReductionError('This reduction leaves no rows')
     const cap = Math.min(color.max, reach)
     if (color.min === 0 && cap === reach) continue
     states *= cap + 1
-    if (states > MAX_COLOR_STATES) {
-      throw new ReductionError('These colors are too detailed for one coupon. Narrow a min and max, or use fewer colors.')
-    }
-    counted.push({ signs: signBits(color.signs), min: color.min, max: color.max, ...(COLOR_IDS.includes(color.id) ? { id: color.id } : {}) })
+    counted.push({ signs: signBits(color.signs), min: color.min, max: cap, ...(COLOR_IDS.includes(color.id) ? { id: color.id } : {}) })
   }
+  const frameRows = combinationCount(frame)
   const rows = keptCounts(frame.map(maskOf), counted)[0]
-  if (!rows) throw new ReductionError('This reduction leaves no rows')
+  if (!rows) throw new ReductionError('This reduction leaves no rows', { rows: 0, frameRows })
+  if (states > MAX_COLOR_STATES) {
+    throw new ReductionError(
+      'These colors are too detailed for one coupon. Narrow a min and max, or use fewer colors.',
+      { rows, frameRows }
+    )
+  }
   if (rows > maxCombinations) {
     throw new ReductionError(
       `${rows.toLocaleString()} rows are still kept. A coupon can hold at most ${maxCombinations.toLocaleString()}. Raise a min, lower a max, or remove a pick.`,
-      { rows, frameRows: combinationCount(frame) }
+      { rows, frameRows }
     )
   }
   return {
     rows,
-    frameRows: combinationCount(frame),
+    frameRows,
     system: frame.map(game => game.join('')),
     colors: counted
   }

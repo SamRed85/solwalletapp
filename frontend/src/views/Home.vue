@@ -47,46 +47,45 @@
     </div>
 
     <v-progress-linear v-if="loading" indeterminate class="mt-4" />
-    <p v-else-if="!shown.length" class="empty">Nothing in this list.</p>
-    <router-link v-for="event in shown" :key="event.id" class="event-row" :to="`/events/${event.id}`">
-      <span class="type-mark" :class="{ jackpot: jackpotOf(event) }">
-        <v-icon :icon="eventTypeOf(event).icon" :color="jackpotOf(event) ? '#F5B800' : eventTypeOf(event).color" size="22" />
-        <span class="type-count">{{ event.gameCount }}</span>
-      </span>
-      <span class="event-copy">
-        <span class="event-title">{{ event.title }}</span>
-        <span class="event-meta">{{ meta(event) }}</span>
-      </span>
-      <span class="event-pot">
-        <span>{{ formatSol(potOf(event)) }}</span>
-        <span v-if="jackpotOf(event)" class="event-tag is-jackpot">Jackpot {{ formatSol(jackpotOf(event)) }}</span>
-        <span v-else class="event-tag" :class="tagClass(event)">{{ tagOf(event) }}</span>
-      </span>
-    </router-link>
+    <TabReel v-else :items="tabs" :current="tab" :drag="drag" :dragging="dragging">
+      <template #default="{ item }">
+        <p v-if="!rowsFor(item).length" class="empty">Nothing in this list.</p>
+        <router-link v-for="event in rowsFor(item)" :key="event.id" class="event-row" :to="`/events/${event.id}`">
+          <span class="type-mark" :class="{ jackpot: jackpotOf(event) }">
+            <v-icon :icon="eventTypeOf(event).icon" :color="jackpotOf(event) ? '#F5B800' : eventTypeOf(event).color" size="22" />
+            <span class="type-count">{{ event.gameCount }}</span>
+          </span>
+          <span class="event-copy">
+            <span class="event-title">{{ event.title }}</span>
+            <span class="event-meta">{{ meta(event) }}</span>
+          </span>
+          <span class="event-pot">
+            <span>{{ formatSol(potOf(event)) }}</span>
+            <span v-if="jackpotOf(event)" class="event-tag is-jackpot">Jackpot {{ formatSol(jackpotOf(event)) }}</span>
+            <span v-else class="event-tag" :class="tagClass(event)">{{ tagOf(event) }}</span>
+          </span>
+        </router-link>
+      </template>
+    </TabReel>
 
     <section v-if="!auth.wallet" class="connect-note">
-      <h2 class="section-title">{{ phantomInstalled ? 'Play when you are ready' : 'Phantom wallet required to play' }}</h2>
+      <h2 class="section-title">A wallet signs you in</h2>
       <p class="text-medium-emphasis">
-        <template v-if="phantomInstalled">
-          You can look through the events without a wallet. Connect Phantom and sign a message when you want to enter a coupon. Signing is free and sends no transaction.
-        </template>
-        <template v-else>
-          Install the Phantom browser extension and switch it to Devnet in its settings. You can still browse the events first.
-        </template>
+        You can look through the events without a wallet. Connect Phantom, Jupiter, Solflare, or Backpack and sign a message when you want to enter a coupon. Signing is free and sends no transaction. Set the wallet to Devnet.
       </p>
-      <v-btn v-if="phantomInstalled" color="primary" size="large" :loading="auth.busy" @click="onPlay">Connect wallet</v-btn>
-      <v-btn v-else color="primary" size="large" href="https://phantom.app/" target="_blank" prepend-icon="mdi-download">Install Phantom</v-btn>
+      <v-btn color="primary" size="large" :loading="auth.busy" @click="openLogin">Connect wallet</v-btn>
     </section>
   </v-container>
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import TabReel from '@/components/TabReel.vue'
+import { useTabSwipe } from '@/composables/useSwipeNav'
 import { useRouter } from 'vue-router'
 import { eventApi } from '@/services/api'
 import { eventPda, fetchEvent } from '@/services/program'
-import { isPhantomInstalled } from '@/services/solana'
-import { auth, loadConfig, login } from '@/stores/auth'
+import { auth, loadConfig, openLogin } from '@/stores/auth'
 import { display } from '@/stores/currency'
 import { notifyError } from '@/stores/notify'
 import { eventTypeOf } from '@/services/eventTypes'
@@ -94,7 +93,6 @@ import { formatDate, formatSol, shortAddress } from '@/utils/format'
 import SolAmount from '@/components/SolAmount.vue'
 
 const router = useRouter()
-const phantomInstalled = ref(isPhantomInstalled())
 const events = ref([])
 const loading = ref(false)
 const chainPots = ref({})
@@ -102,6 +100,7 @@ const wins = ref([])
 const tab = ref('Open')
 const chip = ref('all')
 const tabs = ['Open', 'Live', 'Results']
+const { drag, dragging } = useTabSwipe(tab, tabs)
 
 function jackpotOf (event) {
   if (event.chain) return chainPots.value[event.id]?.jackpot || 0
@@ -132,10 +131,11 @@ const grouped = computed(() => ({
   Results: events.value.filter(event => event.status === 'completed')
 }))
 const chips = ['all', 'jackpot']
-const shown = computed(() => grouped.value[tab.value].filter(event => {
-  if (chip.value === 'jackpot') return jackpotOf(event) > 0
-  return true
-}))
+function rowsFor (name) {
+  const list = grouped.value[name] || []
+  if (name === tab.value && chip.value === 'jackpot') return list.filter(event => jackpotOf(event) > 0)
+  return list
+}
 const rollover = computed(() => {
   const event = events.value
     .filter(item => item.status === 'open' && jackpotOf(item) > 0)
@@ -199,17 +199,11 @@ async function loadWins () {
 }
 
 const newestFirst = (a, b) => new Date(b.createdAt || b.startTime) - new Date(a.createdAt || a.startTime)
-let phantomTimer
 
 onMounted(() => {
   loadEvents()
   loadWins()
-  phantomTimer = setInterval(() => {
-    phantomInstalled.value = isPhantomInstalled()
-    if (phantomInstalled.value) clearInterval(phantomTimer)
-  }, 250)
 })
-onUnmounted(() => clearInterval(phantomTimer))
 
 async function loadEvents () {
   loading.value = true
@@ -223,13 +217,9 @@ async function loadEvents () {
   }
 }
 
-async function onPlay () {
+function onPlay () {
   if (!auth.wallet) {
-    try {
-      await login()
-    } catch (error) {
-      notifyError(error)
-    }
+    openLogin()
     return
   }
   if (openEvent.value) router.push(`/events/${openEvent.value.id}`)

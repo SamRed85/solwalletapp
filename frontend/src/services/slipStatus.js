@@ -39,3 +39,25 @@ export function slipFromArchive ({ wallet, event, address, row, reveal, claimed,
   }
   return coupon
 }
+
+// The program numbers a coupon when the transaction lands, and logs the number.
+// Returns null when the logs have no line for this owner and commitment.
+export function slipIndexFromLogs (logs, event, owner, commitment) {
+  for (const line of logs || []) {
+    const parts = String(line).replace(/^Program log: /, '').split(':')
+    if (parts.length !== 6 || parts[0] !== 'slip-v1') continue
+    if (parts[1] !== event || parts[3] !== owner || parts[5] !== commitment) continue
+    const index = Number(parts[2])
+    if (Number.isInteger(index) && index >= 0) return index
+  }
+  return null
+}
+
+// On an event with a canopy a coupon has no number until its transaction lands. Until then
+// it is saved under its commitment, so two coupons signed at the same moment never share a key.
+export const pendingSlipAddress = (event, commitment) => `slip:${event}:${commitment}`
+
+// False while a slip is still saved under its commitment. Its number is then only a guess.
+export function slipNumbered (coupon) {
+  return !coupon?.slip || String(coupon.address || '').endsWith(`:${coupon.index}`)
+}

@@ -41,7 +41,7 @@ Test SOL: `solana airdrop 2 <wallet> --url devnet`, or https://faucet.solana.com
 | `PROGRAM_ID` | `H4x1HK...G97tr` | Predictions program that owns vault events |
 | `RESULT_COSIGNER` | `4gGayW...FEHH` | Required second result signer of every vault; must not be an admin wallet |
 | `SESSION_SECRET` | random per start | HMAC key for session tokens; set it to keep sessions across restarts |
-| `ALLOWED_ORIGIN` | `http://localhost:3000` | CORS origin, only needed when not using the dev proxy |
+| `ALLOWED_ORIGIN` | `http://localhost:3000` | Comma-separated origins that may sign in and call the API, such as `http://localhost:3000,https://samwebb.duckdns.org` |
 
 Frontend: `VITE_API_URL` (default empty, uses the dev proxy) and `BACKEND_URL` for the proxy target.
 

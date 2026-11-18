@@ -147,21 +147,64 @@ type slipArchiveView struct {
 }
 
 func (a *App) slipArchive(ctx context.Context, event string) (slipArchiveView, error) {
-	view := slipArchiveView{
-		Entries: []slipRecord{}, Reveals: []slipRecord{}, Scores: []slipRecord{}, Claims: []slipRecord{}, Refunds: []slipRecord{},
-	}
+	return a.slipArchiveRange(ctx, event, 0, 0)
+}
+
+// slipArchiveRange returns the records of one event with from <= index < to.
+// A to of zero means no upper bound. An event with a canopy needs one chunk of
+// 1,024 coupons for a proof, so the whole event is never loaded for it.
+func (a *App) slipArchiveRange(ctx context.Context, event string, from, to uint32) (slipArchiveView, error) {
+	view := emptyArchiveView()
 	if a.slips == nil {
 		return view, nil
 	}
-	cursor, err := a.slips.Find(ctx, bson.M{"event": event}, options.Find().SetSort(bson.D{{Key: "index", Value: 1}}))
-	if err != nil {
+	filter := bson.M{"event": event}
+	if to > 0 {
+		filter["index"] = bson.M{"$gte": int64(from), "$lt": int64(to)}
+	} else if from > 0 {
+		filter["index"] = bson.M{"$gte": int64(from)}
+	}
+	return view, a.collectSlips(ctx, filter, &view)
+}
+
+// slipArchiveOwner returns one wallet's coupons on an event, and the reveal, score, claim
+// and refund of each. A wallet's coupon list reads this instead of the whole event.
+func (a *App) slipArchiveOwner(ctx context.Context, event, owner string) (slipArchiveView, error) {
+	view := emptyArchiveView()
+	if a.slips == nil {
+		return view, nil
+	}
+	if err := a.collectSlips(ctx, bson.M{"event": event, "owner": owner}, &view); err != nil || len(view.Entries) == 0 {
 		return view, err
+	}
+	indexes := make([]int64, len(view.Entries))
+	for i, entry := range view.Entries {
+		indexes[i] = int64(entry.Index)
+	}
+	// These lines carry no owner, so they are matched by coupon number.
+	return view, a.collectSlips(ctx, bson.M{
+		"event": event,
+		"kind":  bson.M{"$in": []string{"score", "claim", "refund"}},
+		"index": bson.M{"$in": indexes},
+	}, &view)
+}
+
+func emptyArchiveView() slipArchiveView {
+	return slipArchiveView{
+		Entries: []slipRecord{}, Reveals: []slipRecord{}, Scores: []slipRecord{}, Claims: []slipRecord{}, Refunds: []slipRecord{},
+	}
+}
+
+func (a *App) collectSlips(ctx context.Context, filter bson.M, view *slipArchiveView) error {
+	cursor, err := a.slips.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "index", Value: 1}}))
+	if err != nil {
+		return err
 	}
 	defer cursor.Close(ctx)
 	for cursor.Next(ctx) {
 		var record slipRecord
 		if err = cursor.Decode(&record); err != nil {
-			return view, err
+			return err
 		}
 		switch record.Kind {
 		case "reveal":
@@ -176,7 +219,7 @@ func (a *App) slipArchive(ctx context.Context, event string) (slipArchiveView, e
 			view.Entries = append(view.Entries, record)
 		}
 	}
-	return view, cursor.Err()
+	return cursor.Err()
 }
 
 func (a *App) handleSlipArchive(w http.ResponseWriter, r *http.Request) {
@@ -185,14 +228,44 @@ func (a *App) handleSlipArchive(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "event is required")
 		return
 	}
+	from, to, ok := archiveRange(r.URL.Query().Get("from"), r.URL.Query().Get("to"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "from and to must be coupon numbers, with to above from")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	view, err := a.slipArchive(ctx, event)
+	var view slipArchiveView
+	var err error
+	if owner := strings.TrimSpace(r.URL.Query().Get("owner")); owner != "" {
+		view, err = a.slipArchiveOwner(ctx, event, owner)
+	} else {
+		view, err = a.slipArchiveRange(ctx, event, from, to)
+	}
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "could not read the slip archive")
 		return
 	}
 	writeJSON(w, http.StatusOK, view)
+}
+
+// archiveRange reads the optional from and to of an archive request. Both empty is the whole event.
+func archiveRange(fromText, toText string) (from, to uint32, ok bool) {
+	if fromText != "" {
+		value, err := strconv.ParseUint(fromText, 10, 32)
+		if err != nil {
+			return 0, 0, false
+		}
+		from = uint32(value)
+	}
+	if toText != "" {
+		value, err := strconv.ParseUint(toText, 10, 32)
+		if err != nil || uint32(value) <= from {
+			return 0, 0, false
+		}
+		to = uint32(value)
+	}
+	return from, to, true
 }
 
 func (a *App) handleIngestSlip(w http.ResponseWriter, r *http.Request) {

@@ -17,7 +17,7 @@ type Config struct {
 	Port                string
 	MongoURI            string
 	MongoDB             string
-	AllowedOrigin       string
+	AllowedOrigins      []string
 	SessionSecret       []byte
 	AdminWallets        map[string]bool
 	TreasuryWallet      string
@@ -28,6 +28,9 @@ type Config struct {
 	APIFootballKey      string
 	// OddsBookmakerID is the API-Football bookmaker used for every game. 8 is Bet365.
 	OddsBookmakerID int
+	// TotalsWatch counts from this process's own archive and challenges a signed list that
+	// differs. It does not post totals. Run it with its own MongoDB and RPC.
+	TotalsWatch bool
 }
 
 const defaultWallet = "4tyf8awFN919MwuhDs7AkPN4gY6RJNawSwqisK3dcHdy"
@@ -38,7 +41,7 @@ func loadConfig() Config {
 		Port:           env("PORT", "8080"),
 		MongoURI:       env("MONGODB_URI", "mongodb://localhost:27017"),
 		MongoDB:        env("MONGODB_DB", "sol"),
-		AllowedOrigin:  env("ALLOWED_ORIGIN", "http://localhost:3000"),
+		AllowedOrigins: parseAllowedOrigins(env("ALLOWED_ORIGIN", "http://localhost:3000")),
 		TreasuryWallet: env("TREASURY_WALLET", defaultWallet),
 		SolanaRPCURL:   env("SOLANA_RPC_URL", "https://api.devnet.solana.com"),
 		ProgramID:      env("PROGRAM_ID", "AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX"),
@@ -51,6 +54,7 @@ func loadConfig() Config {
 		log.Fatal("ODDS_BOOKMAKER must be the API-Football bookmaker id, for example 8 for Bet365")
 	}
 	cfg.OddsBookmakerID = bookmaker
+	cfg.TotalsWatch = os.Getenv("TOTALS_WATCH") == "1"
 	if strings.Contains(env("ADMIN_WALLETS", defaultWallet), cfg.ResultCosigner) {
 		log.Fatal("RESULT_COSIGNER must not be an admin wallet: an admin would then hold both result keys")
 	}
@@ -158,6 +162,41 @@ func stdinIsTerminal() bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// parseAllowedOrigins reads ALLOWED_ORIGIN as one origin or a comma-separated list.
+// Each value must be an http or https origin. A trailing slash is ignored.
+func parseAllowedOrigins(raw string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for part := range strings.SplitSeq(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		origin, _, ok := siteOrigin(part)
+		if !ok {
+			log.Fatalf("ALLOWED_ORIGIN must be http(s) origins separated by commas, got %q", part)
+		}
+		if seen[origin] {
+			continue
+		}
+		seen[origin] = true
+		out = append(out, origin)
+	}
+	if len(out) == 0 {
+		log.Fatal("ALLOWED_ORIGIN must list at least one origin")
+	}
+	return out
+}
+
+func (c Config) allowsOrigin(origin string) bool {
+	for _, allowed := range c.AllowedOrigins {
+		if origin == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func env(key, fallback string) string {

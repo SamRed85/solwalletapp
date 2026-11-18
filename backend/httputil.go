@@ -67,7 +67,7 @@ func friendlyKind(t reflect.Type) string {
 
 func (a *App) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if origin := r.Header.Get("Origin"); origin != "" && origin == a.cfg.AllowedOrigin {
+		if origin := r.Header.Get("Origin"); origin != "" && a.cfg.allowsOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Vary", "Origin")

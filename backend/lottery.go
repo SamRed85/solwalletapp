@@ -181,10 +181,9 @@ func (a *App) takeDraw(ctx context.Context, program, lotteryKey, vaultKey []byte
 	if !equal32(winner, a.keeper.Public().(ed25519.PublicKey)) {
 		winnerIndex = 3
 	}
-	budget := []byte{2, 0x80, 0x1a, 0x06, 0x00}
-	readonly := [][]byte{mustDecode(slotHashesSysvar), mustDecode("ComputeBudget111111111111111111111111111111"), program}
+	readonly := [][]byte{mustDecode(slotHashesSysvar), mustDecode(computeBudgetProgram), program}
 	tx, err := signLegacy(a.keeper, keys, readonly, []ixSpec{
-		{program: len(keys) + 2, accounts: nil, data: budget},
+		{program: len(keys) + 2, accounts: nil, data: unitLimit},
 		{program: len(keys) + 3, accounts: []int{0, 1, 2, winnerIndex, len(keys) + 1}, data: ixDisc("take_lottery_draw")},
 	}, blockhash)
 	if err != nil {

@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
+pub mod canopy;
 mod math;
 
 declare_id!("AaXABVJE79W6za8ntvto8wvtP6Kqgs5kQgHCS2uoHoaX");
@@ -26,7 +27,10 @@ pub const KIND_SPRINT: u8 = 3;
 /// The rollover kind shares the `pending` word. Amounts stay below 2^56 lamports,
 /// and an escrow written before types reads as Saturday because those bits are zero.
 const PENDING_KIND_SHIFT: u32 = 56;
+const CANOPY_SEED: &[u8] = b"canopy";
 const SLIP_DEPTH: usize = 20;
+/// Proof hashes a client sends on an event with a canopy. The program stores the ten above.
+pub const CANOPY_LEVELS: u8 = 10;
 /// An admin can cap an event lower. Coupon 1,000,001 is refused on every event.
 const HARD_MAX_COUPONS: u32 = 1_000_000;
 #[cfg(not(feature = "devnet-testing"))]
@@ -40,6 +44,23 @@ pub const SEALED_LEN: usize = math::MAX_GAMES + 8;
 const PROPOSAL_NONE: u8 = 0;
 const PROPOSAL_RESOLVE: u8 = 1;
 const PROPOSAL_CANCEL: u8 = 2;
+/// Events created before signed totals. The on-chain count starts as soon as results lock.
+const PATH_LEGACY: u8 = 0;
+/// The keeper posts winner totals. Claims wait for the challenge window or a recount.
+const PATH_SIGNED: u8 = 1;
+/// Claims are capped at the totals the event settled with.
+const PATH_CAPPED: u8 = 2;
+/// No locked totals within a day of result approval, and anyone may start the on-chain count.
+/// The event admin or a result signer can start it sooner with `open_count`.
+const TOTALS_WAIT: i64 = 24 * 60 * 60;
+/// Six hours, measured in slots so a cluster halt does not shorten the window.
+const CHALLENGE_SLOTS: u64 = 54_000;
+const POSTER_BOND: u64 = 3_000_000_000;
+/// Base signature fee recorded for one recount score. A million of them are about 5 SOL.
+const RECOUNT_FEE: u64 = 5_000;
+const SOL_LAMPORTS: u64 = 1_000_000_000;
+const TOTALS_SEED: &[u8] = b"totals";
+const FEE_SEED: &[u8] = b"recount-fee";
 
 #[program]
 pub mod predictions {
@@ -67,6 +88,7 @@ pub mod predictions {
         require!(is_sol_kind(args.kind) || args.kind == KIND_LEAGUE, PredError::BadEvent);
         require!(args.min_rows >= 1 && args.min_rows <= math::MAX_COMBINATIONS, PredError::BadEvent);
         require!(args.max_coupons >= 1 && args.max_coupons <= HARD_MAX_COUPONS, PredError::BadEvent);
+        require!(args.dispute_min >= 1 && args.dispute_max <= 100 && args.dispute_min <= args.dispute_max, PredError::BadEvent);
         let tiers: Vec<math::Tier> = args
             .tiers
             .iter()
@@ -93,6 +115,18 @@ pub mod predictions {
         event.max_coupons = args.max_coupons;
         event.bump = ctx.bumps.event;
         event.vault_bump = ctx.bumps.vault;
+        event.canopy = CANOPY_LEVELS;
+        event.canopy_bump = ctx.bumps.canopy;
+        event.dispute_min = args.dispute_min;
+        event.dispute_max = args.dispute_max;
+        event.settlement_path = PATH_SIGNED;
+        create_canopy(
+            &ctx.accounts.admin.to_account_info(),
+            &ctx.accounts.canopy.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            &event.key(),
+            ctx.bumps.canopy,
+        )?;
         event.rent_reserve = ctx.accounts.vault.to_account_info().lamports();
         if ctx.accounts.escrow.rent_reserve == 0 {
             ctx.accounts.escrow.rent_reserve = ctx.accounts.escrow.to_account_info().lamports();
@@ -219,6 +253,7 @@ pub mod predictions {
         require!(!ctx.accounts.gate.paused, PredError::Paused);
         let proof = slip_proof(&proof)?;
         let event = &mut ctx.accounts.event;
+        require!(event.canopy == 0, PredError::WrongTree);
         require!(event.status == EventStatus::Open, PredError::BadStatus);
         require!(Clock::get()?.unix_timestamp < event.deadline, PredError::DeadlinePassed);
         let book = &mut ctx.accounts.slips;
@@ -269,6 +304,7 @@ pub mod predictions {
     /// The reveal leaf starts empty, so the same index cannot be published twice.
     pub fn reveal_slip(ctx: Context<RevealSlip>, reveal: RevealArg, proof: Vec<[u8; 32]>) -> Result<()> {
         let event = &ctx.accounts.event;
+        require!(event.canopy == 0, PredError::WrongTree);
         require!(event.status == EventStatus::Open, PredError::BadStatus);
         let now = Clock::get()?.unix_timestamp;
         require!(now >= event.deadline && now < event.reveal_deadline, PredError::RevealClosed);
@@ -278,28 +314,7 @@ pub mod predictions {
         require!(reveal.index < book.count, PredError::MissingCoupon);
         let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks, &reveal.colors);
         write_leaf(&mut book.reveal_hash, reveal.index, &proof, &leaf)?;
-        if reveal.colors.is_empty() {
-            msg!(
-                "reveal-v1:{}:{}:{}:{}:{}:{}",
-                event.key(),
-                reveal.index,
-                reveal.owner,
-                reveal.combinations,
-                hex_encode(&reveal.commitment),
-                hex_encode(&reveal.picks)
-            );
-        } else {
-            msg!(
-                "reveal-v1:{}:{}:{}:{}:{}:{}:{}",
-                event.key(),
-                reveal.index,
-                reveal.owner,
-                reveal.combinations,
-                hex_encode(&reveal.commitment),
-                hex_encode(&reveal.picks),
-                hex_encode(&colors_bytes(&reveal.colors))
-            );
-        }
+        log_reveal(&event.key(), &reveal);
         book.reveal_count = book.reveal_count.checked_add(1).ok_or(error!(PredError::Overflow))?;
         Ok(())
     }
@@ -314,7 +329,8 @@ pub mod predictions {
         reveal_proof: Vec<[u8; 32]>,
         scored_proof: Vec<[u8; 32]>,
     ) -> Result<()> {
-        require!(ctx.accounts.event.status == EventStatus::Tallying, PredError::BadStatus);
+        require!(ctx.accounts.event.canopy == 0, PredError::WrongTree);
+        scoring_open(&mut ctx.accounts.event)?;
         require!(reveal.index == ctx.accounts.event.tallied, PredError::CouponOrder);
         let book = &mut ctx.accounts.slips;
         require!(book.event == ctx.accounts.event.key(), PredError::WrongEvent);
@@ -334,14 +350,19 @@ pub mod predictions {
         }
         write_leaf(&mut book.scored_root, reveal.index, &scored_proof, &slip_mark())?;
         msg!("score-v1:{}:{}", ctx.accounts.event.key(), reveal.index);
+        let event_key = ctx.accounts.event.key();
         let event = &mut ctx.accounts.event;
         event.tallied = event.tallied.checked_add(1).ok_or(error!(PredError::Overflow))?;
-        if event.tallied < event.coupon_count {
-            return Ok(());
-        }
-        let event_key = event.key();
-        apply_settlement(event, &ctx.accounts.vault.to_account_info(), &ctx.accounts.league.to_account_info())?;
-        schedule_remove(&mut ctx.accounts.schedule, &mut ctx.accounts.kinds, event_key)?;
+        finish_count(
+            event,
+            event_key,
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.league.to_account_info(),
+            &mut ctx.accounts.schedule,
+            &mut ctx.accounts.kinds,
+            &ctx.accounts.caller.to_account_info(),
+            ctx.remaining_accounts,
+        )?;
         Ok(())
     }
 
@@ -355,6 +376,7 @@ pub mod predictions {
         claimed_proof: Vec<[u8; 32]>,
     ) -> Result<()> {
         let event = &ctx.accounts.event;
+        require!(event.canopy == 0, PredError::WrongTree);
         require!(event.status == EventStatus::Resolved, PredError::BadStatus);
         require!(ctx.accounts.owner.key() == reveal.owner, PredError::WrongWinner);
         let book = &mut ctx.accounts.slips;
@@ -372,6 +394,7 @@ pub mod predictions {
             amount = amount.checked_add(per_winner.checked_mul(rows).ok_or(error!(PredError::Overflow))?).ok_or(error!(PredError::Overflow))?;
         }
         require!(amount > 0, PredError::NothingToClaim);
+        enforce_cap(event, event.key(), &counts, ctx.remaining_accounts)?;
         write_leaf(&mut book.claimed_root, reveal.index, &claimed_proof, &slip_mark())?;
         msg!("claim-v1:{}:{}", event.key(), reveal.index);
         transfer_from_vault(&ctx.accounts.vault.to_account_info(), &ctx.accounts.owner.to_account_info(), amount, event.rent_reserve)?;
@@ -389,6 +412,7 @@ pub mod predictions {
         refund_proof: Vec<[u8; 32]>,
     ) -> Result<()> {
         let event = &ctx.accounts.event;
+        require!(event.canopy == 0, PredError::WrongTree);
         require!(event.status == EventStatus::Cancelled, PredError::BadStatus);
         let owner = ctx.accounts.owner.key();
         let book = &mut ctx.accounts.slips;
@@ -399,6 +423,200 @@ pub mod predictions {
         require_leaf(&book.entry_hash, index, &leaf, &entry_proof)?;
         let amount = event.price.checked_mul(u64::from(combinations)).ok_or(error!(PredError::Overflow))?;
         write_leaf(&mut book.claimed_root, index, &refund_proof, &slip_mark())?;
+        msg!("refund-v1:{}:{}", event.key(), index);
+        if event.kind == KIND_LEAGUE {
+            let rad = &mut ctx.accounts.rad;
+            if rad.owner == Pubkey::default() {
+                rad.owner = owner;
+                rad.bump = ctx.bumps.rad;
+            }
+            require_keys_eq!(rad.owner, owner, PredError::WrongWinner);
+            rad.balance = rad.balance.checked_add(amount).ok_or(error!(PredError::Overflow))?;
+        } else {
+            transfer_from_vault(&ctx.accounts.vault.to_account_info(), &ctx.accounts.owner.to_account_info(), amount, event.rent_reserve)?;
+        }
+        Ok(())
+    }
+
+    /// Places one coupon on an event with a canopy. No proof is sent. The program keeps the
+    /// right edge of the entry tree and writes the new leaf's path itself. The coupon is the
+    /// same leaf and the same log line as `place_slip`. The player also pays the rent of the
+    /// bytes the canopy stores for one coupon.
+    pub fn place_canopy_slip(ctx: Context<PlaceCanopySlip>, slip: SlipArg) -> Result<()> {
+        require!(!ctx.accounts.gate.paused, PredError::Paused);
+        let event = &mut ctx.accounts.event;
+        require!(event.canopy != 0, PredError::WrongTree);
+        require!(event.status == EventStatus::Open, PredError::BadStatus);
+        require!(Clock::get()?.unix_timestamp < event.deadline, PredError::DeadlinePassed);
+        require_entry_room(event, slip.combinations)?;
+        let index = event.coupon_count;
+        let owner = ctx.accounts.player.key();
+        let cost = event.price.checked_mul(u64::from(slip.combinations)).ok_or(error!(PredError::Overflow))?;
+        let player = ctx.accounts.player.to_account_info();
+        let system = ctx.accounts.system_program.to_account_info();
+        if event.kind == KIND_LEAGUE {
+            spend_rad(&mut ctx.accounts.rad, cost)?;
+        } else {
+            system_program::transfer(
+                CpiContext::new(system.clone(), system_program::Transfer { from: player.clone(), to: ctx.accounts.vault.to_account_info() }),
+                cost,
+            )?;
+            event.sales = event.sales.checked_add(cost).ok_or(error!(PredError::Overflow))?;
+            credit_rad(&mut ctx.accounts.rad, owner, slip.combinations, ctx.bumps.rad)?;
+        }
+
+        let canopy_info = ctx.accounts.canopy.to_account_info();
+        let grew = fund_canopy(&player, &canopy_info, &system, index, event.canopy)?;
+        {
+            let mut guard = canopy_info.try_borrow_mut_data()?;
+            let data: &mut [u8] = &mut guard;
+            let tree = open_canopy(data, event)?;
+            // A coupon account placed on this event took an index the tree does not have.
+            require!(canopy::Canopy::count(data) == index, PredError::BadStatus);
+            if grew {
+                tree.init_record(data, tree.records() - 1);
+            }
+            let leaf = slip_leaf(index, &owner, slip.combinations, &slip.commitment);
+            tree.append(data, &leaf).ok_or(error!(PredError::TooManyCoupons))?;
+        }
+        msg!("slip-v1:{}:{}:{}:{}:{}", event.key(), index, owner, slip.combinations, hex_encode(&slip.commitment));
+        event.coupon_count = index.checked_add(1).ok_or(error!(PredError::Overflow))?;
+        Ok(())
+    }
+
+    /// Publishes the picks for one slip on an event with a canopy. Each proof is the bottom
+    /// ten hashes. The entry proof shows the coupon was placed with this owner, row count and
+    /// commitment. The reveal leaf must still be empty, so an index is published once.
+    pub fn reveal_canopy_slip(
+        ctx: Context<RevealCanopySlip>,
+        reveal: RevealArg,
+        entry_proof: Vec<[u8; 32]>,
+        reveal_proof: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let event = &ctx.accounts.event;
+        require!(event.canopy != 0, PredError::WrongTree);
+        require!(event.status == EventStatus::Open, PredError::BadStatus);
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= event.deadline && now < event.reveal_deadline, PredError::RevealClosed);
+        let counts = check_reveal(&reveal, event.game_count, None)?;
+        let entry = slip_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment);
+        let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks, &reveal.colors);
+        let canopy_info = ctx.accounts.canopy.to_account_info();
+        let mut guard = canopy_info.try_borrow_mut_data()?;
+        let data: &mut [u8] = &mut guard;
+        let tree = open_canopy(data, event)?;
+        require!(reveal.index < canopy::Canopy::count(data), PredError::MissingCoupon);
+        require!(tree.reveal(data, reveal.index, &entry, &entry_proof, &leaf, &reveal_proof), PredError::BadCommitment);
+        let rows = counts.iter().try_fold(0u64, |sum, rows| sum.checked_add(u64::from(*rows))).ok_or(error!(PredError::Overflow))?;
+        require!(canopy::add_revealed_rows(data, rows), PredError::Overflow);
+        log_reveal(&event.key(), &reveal);
+        Ok(())
+    }
+
+    /// Scores one slip on an event with a canopy, in index order. The reveal leaf was written
+    /// only after the entry leaf was checked, so the reveal proof alone identifies the coupon.
+    /// An empty reveal leaf scores nothing. The last scored slip settles the event.
+    pub fn score_canopy_slip(ctx: Context<ScoreCanopySlip>, reveal: RevealArg, revealed: bool, reveal_proof: Vec<[u8; 32]>) -> Result<()> {
+        require!(ctx.accounts.event.canopy != 0, PredError::WrongTree);
+        scoring_open(&mut ctx.accounts.event)?;
+        require!(reveal.index == ctx.accounts.event.tallied, PredError::CouponOrder);
+        let game_count = ctx.accounts.event.game_count;
+        let results = ctx.accounts.event.results;
+        let counts = {
+            let canopy_info = ctx.accounts.canopy.to_account_info();
+            let guard = canopy_info.try_borrow_data()?;
+            let data: &[u8] = &guard;
+            let tree = open_canopy(data, &ctx.accounts.event)?;
+            require!(reveal.index < canopy::Canopy::count(data), PredError::MissingCoupon);
+            if revealed {
+                let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks, &reveal.colors);
+                require!(tree.has_leaf(data, canopy::REVEAL, reveal.index, &leaf, &reveal_proof), PredError::BadCommitment);
+                Some(scored_rows(&reveal, game_count, &results[..game_count as usize])?)
+            } else {
+                require!(tree.has_leaf(data, canopy::REVEAL, reveal.index, &tree.empty(), &reveal_proof), PredError::BadCommitment);
+                None
+            }
+        };
+        let event = &mut ctx.accounts.event;
+        if let Some(counts) = counts {
+            for (score, winner) in event.winners.iter_mut().enumerate() {
+                *winner = winner.checked_add(u64::from(counts[score])).ok_or(error!(PredError::Overflow))?;
+            }
+        }
+        let event_key = event.key();
+        msg!("score-v1:{}:{}", event_key, reveal.index);
+        event.tallied = event.tallied.checked_add(1).ok_or(error!(PredError::Overflow))?;
+        finish_count(
+            event,
+            event_key,
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.league.to_account_info(),
+            &mut ctx.accounts.schedule,
+            &mut ctx.accounts.kinds,
+            &ctx.accounts.caller.to_account_info(),
+            ctx.remaining_accounts,
+        )?;
+        Ok(())
+    }
+
+    /// Pays one scored slip on an event with a canopy. The owner signs and sends the bottom
+    /// ten hashes of the reveal proof. The canopy keeps one paid bit per coupon, so a second
+    /// claim is refused.
+    pub fn claim_canopy_slip(ctx: Context<ClaimCanopySlip>, reveal: RevealArg, reveal_proof: Vec<[u8; 32]>) -> Result<()> {
+        let event = &ctx.accounts.event;
+        require!(event.canopy != 0, PredError::WrongTree);
+        require!(event.status == EventStatus::Resolved, PredError::BadStatus);
+        require!(ctx.accounts.owner.key() == reveal.owner, PredError::WrongWinner);
+        let game_count = event.game_count as usize;
+        let counts = check_reveal(&reveal, event.game_count, Some(&event.results[..game_count]))?;
+        let mut amount = 0u64;
+        for tier in &event.tiers[..event.tier_count as usize] {
+            let rows = u64::from(counts[tier.correct as usize]);
+            let per_winner = event.per_winner[tier.correct as usize - 1];
+            amount = amount.checked_add(per_winner.checked_mul(rows).ok_or(error!(PredError::Overflow))?).ok_or(error!(PredError::Overflow))?;
+        }
+        require!(amount > 0, PredError::NothingToClaim);
+        enforce_cap(event, event.key(), &counts, ctx.remaining_accounts)?;
+        {
+            let canopy_info = ctx.accounts.canopy.to_account_info();
+            let mut guard = canopy_info.try_borrow_mut_data()?;
+            let data: &mut [u8] = &mut guard;
+            let tree = open_canopy(data, event)?;
+            require!(reveal.index < canopy::Canopy::count(data), PredError::MissingCoupon);
+            let leaf = slip_reveal_leaf(reveal.index, &reveal.owner, reveal.combinations, &reveal.commitment, &reveal.picks, &reveal.colors);
+            require!(tree.has_leaf(data, canopy::REVEAL, reveal.index, &leaf, &reveal_proof), PredError::BadCommitment);
+            require!(tree.mark(data, reveal.index), PredError::AlreadyPaid);
+        }
+        msg!("claim-v1:{}:{}", event.key(), reveal.index);
+        transfer_from_vault(&ctx.accounts.vault.to_account_info(), &ctx.accounts.owner.to_account_info(), amount, event.rent_reserve)?;
+        Ok(())
+    }
+
+    /// Returns one cancelled slip's stake on an event with a canopy. The entry proof is the
+    /// bottom ten hashes and identifies the coupon. The paid bit refuses a second refund.
+    pub fn refund_canopy_slip(
+        ctx: Context<RefundCanopySlip>,
+        index: u32,
+        combinations: u32,
+        commitment: [u8; 32],
+        entry_proof: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let event = &ctx.accounts.event;
+        require!(event.canopy != 0, PredError::WrongTree);
+        require!(event.status == EventStatus::Cancelled, PredError::BadStatus);
+        let owner = ctx.accounts.owner.key();
+        require!(combinations >= 1, PredError::BadPicks);
+        {
+            let canopy_info = ctx.accounts.canopy.to_account_info();
+            let mut guard = canopy_info.try_borrow_mut_data()?;
+            let data: &mut [u8] = &mut guard;
+            let tree = open_canopy(data, event)?;
+            require!(index < canopy::Canopy::count(data), PredError::MissingCoupon);
+            let leaf = slip_leaf(index, &owner, combinations, &commitment);
+            require!(tree.has_leaf(data, canopy::ENTRY, index, &leaf, &entry_proof), PredError::BadCommitment);
+            require!(tree.mark(data, index), PredError::AlreadyPaid);
+        }
+        let amount = event.price.checked_mul(u64::from(combinations)).ok_or(error!(PredError::Overflow))?;
         msg!("refund-v1:{}:{}", event.key(), index);
         if event.kind == KIND_LEAGUE {
             let rad = &mut ctx.accounts.rad;
@@ -432,6 +650,11 @@ pub mod predictions {
             event.status = EventStatus::Tallying;
             event.tallied = 0;
             event.winners = [0; math::MAX_GAMES + 1];
+            if event.settlement_path == PATH_SIGNED {
+                let now = Clock::get()?.unix_timestamp;
+                event.approved_at = u32::try_from(now).map_err(|_| error!(PredError::Overflow))?;
+                event.count_started = 0;
+            }
         }
         Ok(())
     }
@@ -445,6 +668,11 @@ pub mod predictions {
             PROPOSAL_CANCEL,
             [0; math::MAX_GAMES],
         )? {
+            if ctx.accounts.event.status == EventStatus::Window {
+                let event_key = ctx.accounts.event.key();
+                let reserve = ctx.accounts.event.rent_reserve;
+                refund_poster_bond(event_key, reserve, &ctx.accounts.vault.to_account_info(), ctx.remaining_accounts)?;
+            }
             close_open_event(&mut ctx.accounts.event)?;
             restore_league_pool(&mut ctx.accounts.event, &ctx.accounts.vault.to_account_info(), &mut ctx.accounts.league)?;
             schedule_remove(&mut ctx.accounts.schedule, &mut ctx.accounts.kinds, ctx.accounts.event.key())?;
@@ -452,11 +680,154 @@ pub mod predictions {
         Ok(())
     }
 
+    /// One result signer approves a winner-row list and the poster who locks the bond.
+    /// When the threshold agrees, the 3 SOL bond moves into the vault and the challenge window opens.
+    /// A different list or poster replaces the proposal and starts the count again.
+    /// A locked list cannot be replaced.
+    pub fn sign_totals(ctx: Context<SignTotals>, totals: [u64; 14]) -> Result<()> {
+        let event = &mut ctx.accounts.event;
+        require!(event.settlement_path == PATH_SIGNED, PredError::BadStatus);
+        require!(event.status == EventStatus::Tallying && event.count_started == 0, PredError::BadStatus);
+        require!(Clock::get()?.unix_timestamp < event.resolve_timeout, PredError::ResolutionExpired);
+        let game_count = event.game_count as usize;
+        for score in (game_count + 1)..totals.len() {
+            require!(totals[score] == 0, PredError::BadTotals);
+        }
+        let sum = totals.iter().try_fold(0u64, |sum, rows| sum.checked_add(*rows)).ok_or(error!(PredError::Overflow))?;
+        let revealed = {
+            let canopy = ctx.accounts.canopy.try_borrow_data()?;
+            canopy::revealed_rows(&canopy)
+        };
+        require!(sum == revealed, PredError::BadTotals);
+
+        let poster = ctx.accounts.poster.key();
+        let position = ctx.accounts.signers.signers[..ctx.accounts.signers.count as usize]
+            .iter()
+            .position(|member| member == &ctx.accounts.signer.key())
+            .ok_or(error!(PredError::NotEnoughSigners))?;
+        let book = &mut ctx.accounts.totals;
+        require!(book.locked == 0, PredError::BadStatus);
+        if book.event == Pubkey::default() {
+            book.event = event.key();
+            book.bump = ctx.bumps.totals;
+        }
+        require_keys_eq!(book.event, event.key(), PredError::WrongEvent);
+        if book.poster != poster || book.totals != totals {
+            book.poster = poster;
+            book.totals = totals;
+            book.approvals = 0;
+        }
+        book.approvals |= 1 << position;
+        if book.approvals.count_ones() < u32::from(ctx.accounts.signers.threshold) {
+            return Ok(());
+        }
+        require!(ctx.accounts.poster.is_signer, PredError::NotEnoughSigners);
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer { from: ctx.accounts.poster.to_account_info(), to: ctx.accounts.vault.to_account_info() },
+            ),
+            POSTER_BOND,
+        )?;
+        book.locked = 1;
+        book.poster_bond = POSTER_BOND;
+        book.window_slot = Clock::get()?.slot;
+        event.status = EventStatus::Window;
+        Ok(())
+    }
+
+    /// The first challenge locks the disputer bond, closes claims, and starts the on-chain recount.
+    /// A later challenge is refused and moves no money. The bond returns only to this signer.
+    pub fn challenge(ctx: Context<Challenge>) -> Result<()> {
+        let event = &mut ctx.accounts.event;
+        let totals = &mut ctx.accounts.totals;
+        require!(event.status == EventStatus::Window, PredError::BadStatus);
+        require!(totals.locked == 1, PredError::BadStatus);
+        require!(totals.challenger == Pubkey::default(), PredError::AlreadyChallenged);
+        require_keys_eq!(totals.event, event.key(), PredError::WrongEvent);
+        let slot = Clock::get()?.slot;
+        require!(slot < totals.window_slot.saturating_add(CHALLENGE_SLOTS), PredError::ChallengeClosed);
+        let bond = dispute_bond(event)?;
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer { from: ctx.accounts.challenger.to_account_info(), to: ctx.accounts.vault.to_account_info() },
+            ),
+            bond,
+        )?;
+        totals.challenger = ctx.accounts.challenger.key();
+        totals.challenge_bond = bond;
+        event.status = EventStatus::Recount;
+        event.tallied = 0;
+        event.winners = [0; math::MAX_GAMES + 1];
+        event.count_started = 1;
+        Ok(())
+    }
+
+    /// After the window with no challenge, sets the payout per row from the signed totals,
+    /// runs settlement, opens claims, and returns the poster's bond.
+    pub fn finalize_totals(ctx: Context<FinalizeTotals>) -> Result<()> {
+        let event = &mut ctx.accounts.event;
+        require!(event.status == EventStatus::Window, PredError::BadStatus);
+        let totals = &mut ctx.accounts.totals;
+        require!(totals.locked == 1 && totals.challenger == Pubkey::default(), PredError::BadStatus);
+        require_keys_eq!(totals.event, event.key(), PredError::WrongEvent);
+        require_keys_eq!(ctx.accounts.poster.key(), totals.poster, PredError::WrongWinner);
+        let slot = Clock::get()?.slot;
+        let open = totals.window_slot.checked_add(CHALLENGE_SLOTS).ok_or(error!(PredError::Overflow))?;
+        require!(slot >= open, PredError::ChallengeClosed);
+        let bond = totals.poster_bond;
+        totals.poster_bond = 0;
+        if bond > 0 {
+            transfer_from_vault(&ctx.accounts.vault.to_account_info(), &ctx.accounts.poster.to_account_info(), bond, event.rent_reserve)?;
+        }
+        event.winners = totals.totals;
+        event.settlement_path = PATH_CAPPED;
+        let event_key = event.key();
+        apply_settlement(event, &ctx.accounts.vault.to_account_info(), &ctx.accounts.league.to_account_info())?;
+        schedule_remove(&mut ctx.accounts.schedule, &mut ctx.accounts.kinds, event_key)?;
+        Ok(())
+    }
+
+    /// Pays one recount fee payer from the bond set aside for fees, up to what is left.
+    pub fn claim_recount_fee(ctx: Context<ClaimRecountFee>) -> Result<()> {
+        let totals = &mut ctx.accounts.totals;
+        require_keys_eq!(totals.event, ctx.accounts.event.key(), PredError::WrongEvent);
+        require_keys_eq!(ctx.accounts.fee.payer, ctx.accounts.payer.key(), PredError::WrongWinner);
+        require_keys_eq!(ctx.accounts.fee.event, ctx.accounts.event.key(), PredError::WrongEvent);
+        let owed = ctx.accounts.fee.amount;
+        require!(owed > 0 && totals.fee_pot > 0, PredError::NothingToClaim);
+        let pay = owed.min(totals.fee_pot);
+        ctx.accounts.fee.amount = owed.checked_sub(pay).ok_or(error!(PredError::Overflow))?;
+        totals.fee_pot = totals.fee_pot.checked_sub(pay).ok_or(error!(PredError::Overflow))?;
+        transfer_from_vault(
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.payer.to_account_info(),
+            pay,
+            ctx.accounts.event.rent_reserve,
+        )?;
+        Ok(())
+    }
+
+    /// The event admin or a result signer starts the on-chain count without waiting 24 hours.
+    /// Signed totals can no longer be posted after this.
+    pub fn open_count(ctx: Context<OpenCount>) -> Result<()> {
+        let signer = ctx.accounts.signer.key();
+        let event = &mut ctx.accounts.event;
+        require!(event.status == EventStatus::Tallying, PredError::BadStatus);
+        require!(event.settlement_path == PATH_SIGNED, PredError::BadStatus);
+        require!(event.count_started == 0, PredError::BadStatus);
+        let members = &ctx.accounts.signers.signers[..ctx.accounts.signers.count as usize];
+        require!(signer == event.admin || members.contains(&signer), PredError::NotEnoughSigners);
+        event.count_started = 1;
+        Ok(())
+    }
+
     /// Counts winning rows for the next coupons in index order. Anyone can call it, in as
     /// many transactions as needed; the last batch settles the event. Locked results cannot
     /// be replaced or expired, and every coupon account exists until settlement.
     pub fn tally<'info>(ctx: Context<'_, '_, 'info, 'info, Tally<'info>>) -> Result<()> {
-        require!(ctx.accounts.event.status == EventStatus::Tallying, PredError::BadStatus);
+        tally_open(&mut ctx.accounts.event)?;
         let event_key = ctx.accounts.event.key();
         let game_count = ctx.accounts.event.game_count as usize;
         let results = ctx.accounts.event.results;
@@ -709,7 +1080,9 @@ pub mod predictions {
 /// Records one signer's approval. A different proposal replaces the old one and restarts
 /// the count. Returns true once the threshold agrees on the current proposal.
 fn record_approval(event: &mut Event, signers: &ResultSigners, signer: &Pubkey, kind: u8, results: [u8; math::MAX_GAMES]) -> Result<bool> {
-    require!(event.status == EventStatus::Open, PredError::BadStatus);
+    // During the totals window the same signers can still cancel, before any claim is paid.
+    let cancelling_window = kind == PROPOSAL_CANCEL && event.status == EventStatus::Window && event.settlement_path == PATH_SIGNED;
+    require!(event.status == EventStatus::Open || cancelling_window, PredError::BadStatus);
     require!(Clock::get()?.unix_timestamp < event.resolve_timeout, PredError::ResolutionExpired);
     let position = signers.signers[..signers.count as usize]
         .iter()
@@ -722,6 +1095,205 @@ fn record_approval(event: &mut Event, signers: &ResultSigners, signer: &Pubkey, 
     }
     event.approvals |= 1 << position;
     Ok(event.approvals.count_ones() >= u32::from(signers.threshold))
+}
+
+/// The on-chain count may run for a legacy event, after the admin opens it, after the 24-hour
+/// fallback, or during a recount.
+fn scoring_open(event: &mut Event) -> Result<()> {
+    if event.status == EventStatus::Recount {
+        return Ok(());
+    }
+    require!(event.status == EventStatus::Tallying, PredError::BadStatus);
+    if event.settlement_path == PATH_LEGACY || event.count_started == 1 {
+        return Ok(());
+    }
+    require!(event.settlement_path == PATH_SIGNED, PredError::BadStatus);
+    let now = Clock::get()?.unix_timestamp;
+    let opened = i64::from(event.approved_at);
+    let ready = opened.checked_add(TOTALS_WAIT).ok_or(error!(PredError::Overflow))?;
+    require!(event.approved_at != 0 && now >= ready, PredError::TotalsPending);
+    event.count_started = 1;
+    Ok(())
+}
+
+/// Coupon-account tally is the fallback count. A recount uses `score_slip`.
+fn tally_open(event: &mut Event) -> Result<()> {
+    require!(event.status != EventStatus::Recount, PredError::BadStatus);
+    scoring_open(event)
+}
+
+fn retie<'a>(info: &AccountInfo<'_>) -> AccountInfo<'a> {
+    // The caller and the extra accounts are one instruction. Anchor types them apart.
+    unsafe { std::mem::transmute(info.clone()) }
+}
+
+fn finish_count(
+    event: &mut Event,
+    event_key: Pubkey,
+    vault: &AccountInfo,
+    league: &AccountInfo,
+    schedule: &mut Schedule,
+    kinds: &mut ScheduleKinds,
+    payer: &AccountInfo,
+    remaining: &[AccountInfo],
+) -> Result<()> {
+    let recounting = event.status == EventStatus::Recount;
+    if recounting {
+        require!(remaining.len() >= 3, PredError::BadStatus);
+        let payer = retie(payer);
+        record_recount_fee(&event_key, &payer, &remaining[0], &remaining[1], &remaining[2])?;
+    }
+    if event.tallied < event.coupon_count {
+        return Ok(());
+    }
+    if recounting {
+        require!(remaining.len() >= 5, PredError::BadStatus);
+        settle_recount(event, event_key, vault, &remaining[0], &remaining[3], &remaining[4])?;
+    }
+    apply_settlement(event, vault, league)?;
+    schedule_remove(schedule, kinds, event_key)?;
+    Ok(())
+}
+
+fn read_account<T: AccountDeserialize>(info: &AccountInfo) -> Result<T> {
+    let data = info.try_borrow_data()?;
+    T::try_deserialize(&mut &data[..]).map_err(|_| error!(PredError::BadStatus))
+}
+
+fn write_account<T: AccountSerialize>(info: &AccountInfo, value: &T) -> Result<()> {
+    let mut data = info.try_borrow_mut_data()?;
+    let mut cursor = &mut data[..];
+    value.try_serialize(&mut cursor)?;
+    Ok(())
+}
+
+fn record_recount_fee<'info>(
+    event_key: &Pubkey,
+    payer: &AccountInfo<'info>,
+    totals_info: &AccountInfo<'info>,
+    fee_info: &AccountInfo<'info>,
+    system: &AccountInfo<'info>,
+) -> Result<()> {
+    let (expected, bump) = Pubkey::find_program_address(&[FEE_SEED, event_key.as_ref(), payer.key.as_ref()], &crate::ID);
+    require_keys_eq!(fee_info.key(), expected, PredError::WrongEvent);
+    require_keys_eq!(*system.key, system_program::ID, PredError::BadStatus);
+    if fee_info.data_is_empty() {
+        let space = 8 + RecountFee::SIZE;
+        let lamports = Rent::get()?.minimum_balance(space);
+        let bump_bytes = [bump];
+        let seeds: &[&[u8]] = &[FEE_SEED, event_key.as_ref(), payer.key.as_ref(), &bump_bytes];
+        system_program::create_account(
+            CpiContext::new_with_signer(system.clone(), system_program::CreateAccount { from: payer.clone(), to: fee_info.clone() }, &[seeds]),
+            lamports,
+            space as u64,
+            &crate::ID,
+        )?;
+        let fee = RecountFee { event: *event_key, payer: *payer.key, amount: RECOUNT_FEE, bump };
+        let mut data = fee_info.try_borrow_mut_data()?;
+        let mut cursor = &mut data[..];
+        fee.try_serialize(&mut cursor)?;
+    } else {
+        let mut fee = read_account::<RecountFee>(fee_info)?;
+        fee.amount = fee.amount.checked_add(RECOUNT_FEE).ok_or(error!(PredError::Overflow))?;
+        write_account(fee_info, &fee)?;
+    }
+    let (totals_key, _) = Pubkey::find_program_address(&[TOTALS_SEED, event_key.as_ref()], &crate::ID);
+    require_keys_eq!(totals_info.key(), totals_key, PredError::WrongEvent);
+    let mut totals = read_account::<SignedTotals>(totals_info)?;
+    totals.recount_fees = totals.recount_fees.checked_add(RECOUNT_FEE).ok_or(error!(PredError::Overflow))?;
+    write_account(totals_info, &totals)?;
+    Ok(())
+}
+
+/// A matching recount keeps the signed totals. A mismatch uses the recount and pays the challenger both bonds,
+/// after the poster's bond has repaid recount fees up to that bond.
+fn settle_recount(event: &mut Event, event_key: Pubkey, vault: &AccountInfo, totals_info: &AccountInfo, poster: &AccountInfo, challenger: &AccountInfo) -> Result<()> {
+    let mut totals = read_account::<SignedTotals>(totals_info)?;
+    require_keys_eq!(totals.event, event_key, PredError::WrongEvent);
+    require_keys_eq!(poster.key(), totals.poster, PredError::WrongWinner);
+    require_keys_eq!(challenger.key(), totals.challenger, PredError::WrongWinner);
+    let matched = event.winners == totals.totals;
+    if matched {
+        let fee = totals.recount_fees.min(totals.challenge_bond);
+        let remainder = totals.challenge_bond.checked_sub(fee).ok_or(error!(PredError::Overflow))?;
+        event.sales = event.sales.checked_add(remainder).ok_or(error!(PredError::Overflow))?;
+        totals.fee_pot = fee;
+        totals.challenge_bond = 0;
+        let bond = totals.poster_bond;
+        totals.poster_bond = 0;
+        if bond > 0 {
+            transfer_from_vault(vault, poster, bond, event.rent_reserve)?;
+        }
+    } else {
+        let fee = totals.recount_fees.min(totals.poster_bond);
+        let poster_left = totals.poster_bond.checked_sub(fee).ok_or(error!(PredError::Overflow))?;
+        let payout = totals.challenge_bond.checked_add(poster_left).ok_or(error!(PredError::Overflow))?;
+        totals.fee_pot = fee;
+        totals.poster_bond = 0;
+        totals.challenge_bond = 0;
+        totals.rejected = 1;
+        totals.recount = event.winners;
+        if payout > 0 {
+            transfer_from_vault(vault, challenger, payout, event.rent_reserve)?;
+        }
+    }
+    event.settlement_path = PATH_CAPPED;
+    write_account(totals_info, &totals)?;
+    Ok(())
+}
+
+fn refund_poster_bond(event_key: Pubkey, rent_reserve: u64, vault: &AccountInfo, remaining: &[AccountInfo]) -> Result<()> {
+    require!(remaining.len() >= 2, PredError::BadStatus);
+    let (expected, _) = Pubkey::find_program_address(&[TOTALS_SEED, event_key.as_ref()], &crate::ID);
+    require_keys_eq!(remaining[0].key(), expected, PredError::WrongEvent);
+    let mut totals = read_account::<SignedTotals>(&remaining[0])?;
+    require_keys_eq!(remaining[1].key(), totals.poster, PredError::WrongWinner);
+    let bond = totals.poster_bond;
+    totals.poster_bond = 0;
+    write_account(&remaining[0], &totals)?;
+    if bond > 0 {
+        transfer_from_vault(vault, &remaining[1], bond, rent_reserve)?;
+    }
+    Ok(())
+}
+
+/// 10% of the player pot, clamped to the event's whole-SOL limits. Zero on an older event means 10 and 50.
+fn dispute_bond(event: &Event) -> Result<u64> {
+    let mut percent = 0u64;
+    for tier in &event.tiers[..event.tier_count as usize] {
+        percent = percent.checked_add(u64::from(tier.percent)).ok_or(error!(PredError::Overflow))?;
+    }
+    let share = (u128::from(event.sales)).checked_mul(u128::from(percent)).ok_or(error!(PredError::Overflow))? / 100;
+    let pot = u64::try_from(share).map_err(|_| error!(PredError::Overflow))?.checked_add(event.rollover_in).ok_or(error!(PredError::Overflow))?;
+    let raw = pot / 10;
+    let min_sol = if event.dispute_min == 0 { 10 } else { event.dispute_min };
+    let max_sol = if event.dispute_max == 0 { 50 } else { event.dispute_max };
+    let min = u64::from(min_sol).checked_mul(SOL_LAMPORTS).ok_or(error!(PredError::Overflow))?;
+    let max = u64::from(max_sol).checked_mul(SOL_LAMPORTS).ok_or(error!(PredError::Overflow))?;
+    Ok(raw.clamp(min, max))
+}
+
+fn enforce_cap(event: &Event, event_key: Pubkey, counts: &[u32; math::MAX_GAMES + 1], remaining: &[AccountInfo]) -> Result<()> {
+    if event.settlement_path != PATH_CAPPED {
+        return Ok(());
+    }
+    require!(!remaining.is_empty(), PredError::BadTotals);
+    let (expected, _) = Pubkey::find_program_address(&[TOTALS_SEED, event_key.as_ref()], &crate::ID);
+    require_keys_eq!(remaining[0].key(), expected, PredError::WrongEvent);
+    let mut totals = read_account::<SignedTotals>(&remaining[0])?;
+    let table = if totals.rejected == 1 { totals.recount } else { totals.totals };
+    for tier in &event.tiers[..event.tier_count as usize] {
+        let score = tier.correct as usize;
+        let rows = u64::from(counts[score]);
+        if rows == 0 {
+            continue;
+        }
+        let next = totals.claimed[score].checked_add(rows).ok_or(error!(PredError::Overflow))?;
+        require!(next <= table[score], PredError::BadTotals);
+        totals.claimed[score] = next;
+    }
+    write_account(&remaining[0], &totals)?;
+    Ok(())
 }
 
 fn apply_settlement(event: &mut Event, vault: &AccountInfo, league: &AccountInfo) -> Result<()> {
@@ -789,6 +1361,92 @@ fn check_reveal(reveal: &RevealArg, game_count: u8, results: Option<&[u8]>) -> R
         PredError::BadCommitment
     );
     kept_by_score(reveal, game_count, results)
+}
+
+fn log_reveal(event: &Pubkey, reveal: &RevealArg) {
+    if reveal.colors.is_empty() {
+        msg!(
+            "reveal-v1:{}:{}:{}:{}:{}:{}",
+            event,
+            reveal.index,
+            reveal.owner,
+            reveal.combinations,
+            hex_encode(&reveal.commitment),
+            hex_encode(&reveal.picks)
+        );
+    } else {
+        msg!(
+            "reveal-v1:{}:{}:{}:{}:{}:{}:{}",
+            event,
+            reveal.index,
+            reveal.owner,
+            reveal.combinations,
+            hex_encode(&reveal.commitment),
+            hex_encode(&reveal.picks),
+            hex_encode(&colors_bytes(&reveal.colors))
+        );
+    }
+}
+
+/// Creates the canopy account of a new event with room for the first chunk of coupons.
+/// The address may already hold lamports, so it is funded, sized and assigned in steps then.
+fn create_canopy<'info>(payer: &AccountInfo<'info>, canopy: &AccountInfo<'info>, system: &AccountInfo<'info>, event: &Pubkey, bump: u8) -> Result<()> {
+    require!(canopy.owner == &system_program::ID && canopy.data_is_empty(), PredError::BadCanopy);
+    let space = canopy::account_len(CANOPY_LEVELS as usize, 1);
+    let lamports = Rent::get()?.minimum_balance(space);
+    let seeds: &[&[u8]] = &[CANOPY_SEED, event.as_ref(), &[bump]];
+    if canopy.lamports() == 0 {
+        system_program::create_account(
+            CpiContext::new_with_signer(system.clone(), system_program::CreateAccount { from: payer.clone(), to: canopy.clone() }, &[seeds]),
+            lamports,
+            space as u64,
+            &crate::ID,
+        )?;
+    } else {
+        let missing = lamports.saturating_sub(canopy.lamports());
+        if missing > 0 {
+            system_program::transfer(CpiContext::new(system.clone(), system_program::Transfer { from: payer.clone(), to: canopy.clone() }), missing)?;
+        }
+        system_program::allocate(
+            CpiContext::new_with_signer(system.clone(), system_program::Allocate { account_to_allocate: canopy.clone() }, &[seeds]),
+            space as u64,
+        )?;
+        system_program::assign(
+            CpiContext::new_with_signer(system.clone(), system_program::Assign { account_to_assign: canopy.clone() }, &[seeds]),
+            &crate::ID,
+        )?;
+    }
+    let mut guard = canopy.try_borrow_mut_data()?;
+    let data: &mut [u8] = &mut guard;
+    canopy::Canopy::init(data, &event.to_bytes(), CANOPY_LEVELS as usize, bump, SLIP_DEPTH).ok_or(error!(PredError::BadCanopy))?;
+    Ok(())
+}
+
+/// Each coupon pays the rent of its share of one canopy record, so the balance covers the
+/// next record when its first coupon arrives. Returns true when the account grew by a record.
+fn fund_canopy<'info>(player: &AccountInfo<'info>, canopy: &AccountInfo<'info>, system: &AccountInfo<'info>, index: u32, levels: u8) -> Result<bool> {
+    let levels = levels as usize;
+    let record = canopy::record_len(levels);
+    let rent = Rent::get()?;
+    let fee = rent.minimum_balance(record).saturating_sub(rent.minimum_balance(0)).div_ceil(1u64 << levels);
+    system_program::transfer(CpiContext::new(system.clone(), system_program::Transfer { from: player.clone(), to: canopy.clone() }), fee)?;
+    let records = canopy.data_len().saturating_sub(canopy::account_len(levels, 0)) / record;
+    if ((index >> levels) as usize) < records {
+        return Ok(false);
+    }
+    let grown = canopy.data_len() + record;
+    let short = rent.minimum_balance(grown).saturating_sub(canopy.lamports());
+    if short > 0 {
+        system_program::transfer(CpiContext::new(system.clone(), system_program::Transfer { from: player.clone(), to: canopy.clone() }), short)?;
+    }
+    canopy.resize(grown)?;
+    Ok(true)
+}
+
+fn open_canopy(data: &[u8], event: &Event) -> Result<canopy::Canopy> {
+    let tree = canopy::Canopy::open(data, SLIP_DEPTH).ok_or(error!(PredError::BadCanopy))?;
+    require!(tree.levels() == event.canopy as usize, PredError::BadCanopy);
+    Ok(tree)
 }
 
 /// A proof may stop once every remaining sibling is an empty subtree. Those hashes are
@@ -1069,6 +1727,10 @@ pub struct CreateEventArgs {
     pub min_rows: u32,
     /// Coupons the event accepts. The default at creation is 250,000, and 1,000,000 is the ceiling.
     pub max_coupons: u32,
+    /// Whole SOL. The disputer bond is 10% of the player pot, clamped to this pair. Both are 1 to 100.
+    pub dispute_min: u8,
+    /// Whole SOL. The minimum cannot be above this.
+    pub dispute_max: u8,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1077,6 +1739,10 @@ pub enum EventStatus {
     Resolved,
     Cancelled,
     Tallying,
+    /// Signed totals are locked and claims are closed. Anyone can challenge until the slot window ends.
+    Window,
+    /// A challenge is in progress. The on-chain count runs again, and claims stay closed.
+    Recount,
 }
 
 /// `per_winner[n - 1]` is the payout per row with `n` correct picks.
@@ -1120,6 +1786,20 @@ pub struct Event {
     pub min_rows: u32,
     /// Coupons this event accepts. Zero on older events, which means the tree cap of 2^20.
     pub max_coupons: u32,
+    /// Proof hashes a client sends for a slip. The program stores the levels above them in the
+    /// canopy account. Zero on events created before the canopy, which send the whole proof.
+    pub canopy: u8,
+    pub canopy_bump: u8,
+    /// Whole SOL. Zero on events created before this field means 10.
+    pub dispute_min: u8,
+    /// Whole SOL. Zero means 50.
+    pub dispute_max: u8,
+    /// 0 keeps the on-chain count. 1 waits for signed totals. 2 caps claims at those totals.
+    pub settlement_path: u8,
+    /// 1 once the on-chain count is how this event settles: an admin opened it, the 24-hour fallback, or a recount.
+    pub count_started: u8,
+    /// Unix time the results were locked. Zero on events that do not use signed totals.
+    pub approved_at: u32,
 }
 
 /// A coupon is admitted when it has enough rows and the event is not full.
@@ -1240,6 +1920,7 @@ pub struct RevealSlip<'info> {
 
 #[derive(Accounts)]
 pub struct ScoreSlip<'info> {
+    #[account(mut)]
     pub caller: Signer<'info>,
     #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
     pub event: Box<Account<'info, Event>>,
@@ -1265,6 +1946,94 @@ pub struct ClaimSlip<'info> {
     pub vault: Account<'info, Vault>,
     #[account(mut, seeds = [SLIP_SEED, event.key().as_ref()], bump = slips.bump)]
     pub slips: Account<'info, SlipBook>,
+}
+
+#[derive(Accounts)]
+pub struct PlaceCanopySlip<'info> {
+    #[account(mut)]
+    pub player: Signer<'info>,
+    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: the event's canopy. `create_event` created it at this address, and only this program writes it.
+    #[account(mut, seeds = [CANOPY_SEED, event.key().as_ref()], bump = event.canopy_bump, owner = crate::ID)]
+    pub canopy: UncheckedAccount<'info>,
+    #[account(seeds = [GATE_SEED, event.admin.as_ref()], bump = gate.bump)]
+    pub gate: Account<'info, Gate>,
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = 8 + RadAccount::SIZE,
+        seeds = [RAD_SEED, player.key().as_ref()],
+        bump
+    )]
+    pub rad: Account<'info, RadAccount>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RevealCanopySlip<'info> {
+    pub caller: Signer<'info>,
+    #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    /// CHECK: the event's canopy. `create_event` created it at this address, and only this program writes it.
+    #[account(mut, seeds = [CANOPY_SEED, event.key().as_ref()], bump = event.canopy_bump, owner = crate::ID)]
+    pub canopy: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ScoreCanopySlip<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: the event's canopy. Scoring only reads it.
+    #[account(seeds = [CANOPY_SEED, event.key().as_ref()], bump = event.canopy_bump, owner = crate::ID)]
+    pub canopy: UncheckedAccount<'info>,
+    #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
+    pub schedule: Box<Account<'info, Schedule>>,
+    #[account(mut, seeds = [KINDS_SEED, event.admin.as_ref()], bump)]
+    pub kinds: Account<'info, ScheduleKinds>,
+    #[account(mut, seeds = [LEAGUE_SEED], bump)]
+    pub league: Account<'info, LeagueVault>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimCanopySlip<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: the event's canopy. `create_event` created it at this address, and only this program writes it.
+    #[account(mut, seeds = [CANOPY_SEED, event.key().as_ref()], bump = event.canopy_bump, owner = crate::ID)]
+    pub canopy: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RefundCanopySlip<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: the event's canopy. `create_event` created it at this address, and only this program writes it.
+    #[account(mut, seeds = [CANOPY_SEED, event.key().as_ref()], bump = event.canopy_bump, owner = crate::ID)]
+    pub canopy: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + RadAccount::SIZE,
+        seeds = [RAD_SEED, owner.key().as_ref()],
+        bump
+    )]
+    pub rad: Account<'info, RadAccount>,
+    pub system_program: Program<'info, System>,
 }
 
 #[account]
@@ -1424,6 +2193,9 @@ pub struct CreateEvent<'info> {
         bump
     )]
     pub league: Account<'info, LeagueVault>,
+    /// CHECK: created here. It stores the upper nodes of this event's slip trees.
+    #[account(mut, seeds = [CANOPY_SEED, event.key().as_ref()], bump)]
+    pub canopy: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1471,6 +2243,15 @@ pub struct Approve<'info> {
     pub vault: Account<'info, Vault>,
     #[account(mut, seeds = [LEAGUE_SEED], bump)]
     pub league: Account<'info, LeagueVault>,
+}
+
+#[derive(Accounts)]
+pub struct OpenCount<'info> {
+    pub signer: Signer<'info>,
+    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(seeds = [SIGNERS_SEED, event.key().as_ref()], bump = signers.bump)]
+    pub signers: Account<'info, ResultSigners>,
 }
 
 #[derive(Accounts)]
@@ -1643,6 +2424,20 @@ pub enum PredError {
     WrongWinner,
     /// The escrow already holds a parked rollover for a different event type.
     EscrowHoldsOtherKind,
+    /// An event with a canopy takes the canopy slip instructions, and an older event the others.
+    WrongTree,
+    /// The canopy account is not the one this event created.
+    BadCanopy,
+    /// This coupon was already paid or refunded.
+    AlreadyPaid,
+    /// Signed totals are not locked, and the 24-hour fallback has not opened.
+    TotalsPending,
+    /// The totals do not add up to the revealed rows, or a claim would pass a tier's total.
+    BadTotals,
+    /// The challenge window is not open for this call.
+    ChallengeClosed,
+    /// This event already has a challenge.
+    AlreadyChallenged,
 }
 
 fn is_sol_kind(kind: u8) -> bool {
@@ -1697,6 +2492,118 @@ impl Gate {
     pub const SIZE: usize = 32 + 1 + 1;
 }
 
+/// The signed winner rows, the poster's bond, and one challenge.
+/// `totals[n]` is the signed rows with `n` correct. `recount` is filled only when those were rejected.
+#[account]
+pub struct SignedTotals {
+    pub event: Pubkey,
+    pub poster: Pubkey,
+    pub totals: [u64; 14],
+    pub approvals: u8,
+    pub locked: u8,
+    pub window_slot: u64,
+    pub challenger: Pubkey,
+    pub challenge_bond: u64,
+    pub poster_bond: u64,
+    pub claimed: [u64; 14],
+    pub recount_fees: u64,
+    pub fee_pot: u64,
+    pub rejected: u8,
+    pub bump: u8,
+    pub recount: [u64; 14],
+}
+
+impl SignedTotals {
+    pub const SIZE: usize = 32 + 32 + 14 * 8 + 1 + 1 + 8 + 32 + 8 + 8 + 14 * 8 + 8 + 8 + 1 + 1 + 14 * 8;
+}
+
+/// Fees one payer spent sending recount scores. The losing bond pays these back first.
+#[account]
+pub struct RecountFee {
+    pub event: Pubkey,
+    pub payer: Pubkey,
+    pub amount: u64,
+    pub bump: u8,
+}
+
+impl RecountFee {
+    pub const SIZE: usize = 32 + 32 + 8 + 1;
+}
+
+#[derive(Accounts)]
+pub struct SignTotals<'info> {
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    /// CHECK: pays the 3 SOL bond when this signature locks the totals, and must sign that transaction.
+    #[account(mut)]
+    pub poster: UncheckedAccount<'info>,
+    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(seeds = [SIGNERS_SEED, event.key().as_ref()], bump = signers.bump)]
+    pub signers: Account<'info, ResultSigners>,
+    /// CHECK: the event's canopy. It holds the revealed-row total.
+    #[account(seeds = [CANOPY_SEED, event.key().as_ref()], bump = event.canopy_bump, owner = crate::ID)]
+    pub canopy: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = signer,
+        space = 8 + SignedTotals::SIZE,
+        seeds = [TOTALS_SEED, event.key().as_ref()],
+        bump
+    )]
+    pub totals: Account<'info, SignedTotals>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Challenge<'info> {
+    #[account(mut)]
+    pub challenger: Signer<'info>,
+    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [TOTALS_SEED, event.key().as_ref()], bump = totals.bump)]
+    pub totals: Account<'info, SignedTotals>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FinalizeTotals<'info> {
+    pub caller: Signer<'info>,
+    #[account(mut, seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [TOTALS_SEED, event.key().as_ref()], bump = totals.bump)]
+    pub totals: Account<'info, SignedTotals>,
+    /// CHECK: the poster receives the bond back. The stored key is checked.
+    #[account(mut)]
+    pub poster: UncheckedAccount<'info>,
+    #[account(mut, seeds = [SCHEDULE_SEED, event.admin.as_ref()], bump)]
+    pub schedule: Box<Account<'info, Schedule>>,
+    #[account(mut, seeds = [KINDS_SEED, event.admin.as_ref()], bump)]
+    pub kinds: Account<'info, ScheduleKinds>,
+    #[account(mut, seeds = [LEAGUE_SEED], bump)]
+    pub league: Account<'info, LeagueVault>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimRecountFee<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [EVENT_SEED, event.admin.as_ref(), &event.nonce.to_le_bytes()], bump = event.bump)]
+    pub event: Box<Account<'info, Event>>,
+    #[account(mut, seeds = [VAULT_SEED, event.key().as_ref()], bump = event.vault_bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [TOTALS_SEED, event.key().as_ref()], bump = totals.bump)]
+    pub totals: Account<'info, SignedTotals>,
+    #[account(mut, seeds = [FEE_SEED, event.key().as_ref(), payer.key().as_ref()], bump = fee.bump)]
+    pub fee: Account<'info, RecountFee>,
+}
+
 #[derive(Accounts)]
 pub struct InitializeUpgrade<'info> {
     #[account(mut)]
@@ -1746,6 +2653,7 @@ pub struct ExecuteUpgrade<'info> {
 #[cfg(test)]
 mod slip_proof_tests {
     use super::*;
+    use anchor_lang::AccountSerialize;
 
     #[test]
     fn a_short_proof_matches_the_full_empty_tail() {
@@ -1755,6 +2663,26 @@ mod slip_proof_tests {
         let leaf = slip_leaf(4, &Pubkey::default(), 1, &[7; 32]);
         assert_eq!(slip_fold(4, &leaf, &short), slip_fold(4, &leaf, &full));
         assert!(slip_proof(&full).is_ok());
+        let totals = SignedTotals {
+            event: Pubkey::default(),
+            poster: Pubkey::default(),
+            totals: [0; 14],
+            approvals: 0,
+            locked: 0,
+            window_slot: 0,
+            challenger: Pubkey::default(),
+            challenge_bond: 0,
+            poster_bond: 0,
+            claimed: [0; 14],
+            recount_fees: 0,
+            fee_pot: 0,
+            rejected: 0,
+            bump: 0,
+            recount: [0; 14],
+        };
+        let mut buf = Vec::new();
+        totals.try_serialize(&mut buf).unwrap();
+        assert_eq!(buf.len(), 8 + SignedTotals::SIZE, "the totals account size must match its bytes");
         let mut too_long = full.clone();
         too_long.push(slip_zero(0));
         assert!(slip_proof(&too_long).is_err());

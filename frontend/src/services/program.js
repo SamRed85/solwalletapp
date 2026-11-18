@@ -18,7 +18,10 @@ export const RESOLVE_WINDOW_SECONDS = 7 * 24 * 3600
 const EVENT_ACCOUNT_SIZE = 8 + 448
 const COUPON_ACCOUNT_SIZE = 8 + 149
 const SEALED_LEN = 21
-export const EVENT_STATUSES = ['open', 'resolved', 'cancelled', 'tallying']
+export const EVENT_STATUSES = ['open', 'resolved', 'cancelled', 'tallying', 'window', 'recount']
+export const CHALLENGE_SLOTS = 54_000n
+export const POSTER_BOND = 3_000_000_000n
+export const SOL_LAMPORTS = 1_000_000_000n
 
 const text = value => new TextEncoder().encode(value)
 
@@ -93,6 +96,14 @@ export function schedulePda (admin) {
   return findPda([text('schedule'), base58Decode(admin, 32)])
 }
 
+export function totalsPda (event) {
+  return findPda([text('totals'), base58Decode(event, 32)])
+}
+
+export function recountFeePda (event, payer) {
+  return findPda([text('recount-fee'), base58Decode(event, 32), base58Decode(payer, 32)])
+}
+
 export function signersPda (event) {
   return findPda([text('signers'), base58Decode(event, 32)])
 }
@@ -111,6 +122,16 @@ export function radPda (owner) {
 
 export function escrowPda (admin) {
   return findPda([text('rollover-escrow'), base58Decode(admin, 32)])
+}
+
+// The canopy holds the upper nodes of an event's slip trees. Events made before it have none.
+export const CANOPY_LEVELS = 10
+export const CANOPY_CHUNK = 1 << CANOPY_LEVELS
+// Each coupon pays this toward the rent of the nodes it adds: the rent of 256 bytes over 1,024 coupons.
+export const CANOPY_STORAGE_LAMPORTS = 1_740
+
+export function canopyPda (event) {
+  return findPda([text('canopy'), base58Decode(event, 32)])
 }
 
 export function couponCommitment (player, picks, nonce) {
@@ -145,8 +166,8 @@ function discriminator (name) {
 // count and the 13 pick masks. Claim checks it against the commitment, and a published
 // slip does not keep the nonce anywhere else.
 export function revealNonceFromInstruction (data) {
-  const mark = discriminator('reveal_slip')
-  if (data.length < 69 || mark.some((byte, index) => data[index] !== byte)) return null
+  const marks = [discriminator('reveal_slip'), discriminator('reveal_canopy_slip')]
+  if (data.length < 69 || !marks.some(mark => mark.every((byte, index) => data[index] === byte))) return null
   return new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(61, true)
 }
 
@@ -171,19 +192,22 @@ export const DEFAULT_MIN_ROWS = 1
 export const DEFAULT_MAX_COUPONS = 250_000
 export const HARD_MAX_COUPONS = 1_000_000
 
-export function createEventIx ({ admin, other, nonce, deadline, revealDeadline, endTime, resolveTimeout, gameCount = 7, price = 1_000_000, tiers, league = false, kind = 0, minRows = DEFAULT_MIN_ROWS, maxCoupons = DEFAULT_MAX_COUPONS }) {
+export function createEventIx ({ admin, other, nonce, deadline, revealDeadline, endTime, resolveTimeout, gameCount = 7, price = 1_000_000, tiers, league = false, kind = 0, minRows = DEFAULT_MIN_ROWS, maxCoupons = DEFAULT_MAX_COUPONS, disputeMin = 10, disputeMax = 50 }) {
   const event = eventPda(admin, nonce)
   const prizeTiers = tiers?.length ? tiers : [{ correct: gameCount, percent: league ? 100 : 90 }]
+  if (!Number.isInteger(disputeMin) || !Number.isInteger(disputeMax) || disputeMin < 1 || disputeMax > 100 || disputeMin > disputeMax) {
+    throw new Error('The challenge bond limits are whole SOL from 1 to 100, and the minimum cannot be above the maximum')
+  }
   const data = concat([
     u64(nonce), Uint8Array.of(gameCount), u64(price), u64(deadline), u64(revealDeadline), u64(endTime ?? revealDeadline), u64(resolveTimeout ?? revealDeadline + 10_000),
     Uint8Array.of(2), u32(2), base58Decode(admin, 32), base58Decode(other, 32),
     u32(prizeTiers.length), Uint8Array.from(prizeTiers.flatMap(tier => [tier.correct, tier.percent])),
-    Uint8Array.of(league ? 1 : kind), u32(minRows), u32(maxCoupons)
+    Uint8Array.of(league ? 1 : kind), u32(minRows), u32(maxCoupons), Uint8Array.of(disputeMin, disputeMax)
   ])
   return ix('create_event', [
     signer(admin, true), writable(event), writable(vaultPda(event)), writable(escrowPda(admin)),
     writable(schedulePda(admin)), writable(signersPda(event)), writable(gatePda(admin)),
-    writable(kindsPda(admin)), writable(leaguePda()), readonly(SYSTEM_PROGRAM)
+    writable(kindsPda(admin)), writable(leaguePda()), writable(canopyPda(event)), readonly(SYSTEM_PROGRAM)
   ], data)
 }
 
@@ -217,8 +241,45 @@ export function approveResolutionIx ({ signer: signerKey, admin, event, results 
   return ix('approve_resolution', approveAccounts(signerKey, admin, event), concat([u32(bytes.length), bytes]))
 }
 
-export function approveCancelIx ({ signer: signerKey, admin, event }) {
-  return ix('approve_cancel', approveAccounts(signerKey, admin, event), new Uint8Array())
+export function approveCancelIx ({ signer: signerKey, admin, event, poster }) {
+  const accounts = approveAccounts(signerKey, admin, event)
+  if (poster) accounts.push(writable(totalsPda(event)), writable(poster))
+  return ix('approve_cancel', accounts, new Uint8Array())
+}
+
+export function signTotalsIx ({ signer: signerKey, poster, event, totals }) {
+  if (!poster) throw new Error('The reveal keeper is not configured')
+  if (!Array.isArray(totals) || totals.length !== 14) throw new Error('The counted totals are incomplete')
+  const rows = concat(totals.map(count => u64(count)))
+  return ix('sign_totals', [
+    signer(signerKey, true), writable(poster), writable(event), writable(vaultPda(event)),
+    readonly(signersPda(event)), readonly(canopyPda(event)), writable(totalsPda(event)), readonly(SYSTEM_PROGRAM)
+  ], rows)
+}
+
+// The keeper also signs, which is what lets this signature lock the bond.
+export function signTotalsLockIx ({ signer: signerKey, poster, event, totals }) {
+  if (!poster) throw new Error('The reveal keeper is not configured')
+  if (!Array.isArray(totals) || totals.length !== 14) throw new Error('The counted totals are incomplete')
+  const rows = concat(totals.map(count => u64(count)))
+  return ix('sign_totals', [
+    signer(signerKey, true), signer(poster, true), writable(event), writable(vaultPda(event)),
+    readonly(signersPda(event)), readonly(canopyPda(event)), writable(totalsPda(event)), readonly(SYSTEM_PROGRAM)
+  ], rows)
+}
+
+// True when this wallet's signature reaches the signer threshold for the list already on chain.
+export function totalsSignatureLocks ({ wallet, members, threshold, approvals = 0, sameList = false }) {
+  if (!sameList || !Array.isArray(members) || !members.includes(wallet)) return false
+  let count = 0
+  for (let index = 0; index < members.length && index < 8; index++) {
+    if (members[index] === wallet || (approvals & (1 << index)) !== 0) count += 1
+  }
+  return count >= threshold
+}
+
+export function openCountIx ({ signer: signerKey, event }) {
+  return ix('open_count', [signer(signerKey, false), writable(event), readonly(signersPda(event))], new Uint8Array())
 }
 
 export function tallyIx ({ admin, event, coupons }) {
@@ -317,8 +378,59 @@ export function decodeEvent (data) {
     // Zero means the account was created before these limits. The program then requires 1 row
     // and allows the tree cap of 2^20 coupons.
     minRows: data.length >= 434 ? v.getUint32(430, true) : 0,
-    maxCoupons: data.length >= 438 ? v.getUint32(434, true) : 0
+    maxCoupons: data.length >= 438 ? v.getUint32(434, true) : 0,
+    canopy: data.length > 438 ? data[438] : 0,
+    disputeMin: data.length > 440 ? data[440] : 0,
+    disputeMax: data.length > 441 ? data[441] : 0,
+    settlementPath: data.length > 442 ? data[442] : 0,
+    countStarted: data.length > 443 ? data[443] : 0,
+    approvedAt: data.length >= 448 ? v.getUint32(444, true) : 0
   }
+}
+
+// disputeBond is 10% of the player pot, clamped to the event's whole-SOL limits.
+// Zero limits mean 10 and 50. The player pot is the sales the tiers take, plus rollover.
+export function disputeBond ({ sales = 0n, rolloverIn = 0n, tiers = [], disputeMin = 0, disputeMax = 0 }) {
+  const percent = tiers.reduce((sum, tier) => sum + BigInt(tier.percent), 0n)
+  const pot = BigInt(sales) * percent / 100n + BigInt(rolloverIn)
+  let raw = pot / 10n
+  const min = BigInt(disputeMin || 10) * SOL_LAMPORTS
+  const max = BigInt(disputeMax || 50) * SOL_LAMPORTS
+  if (raw < min) raw = min
+  if (raw > max) raw = max
+  return raw
+}
+
+export function decodeTotals (data) {
+  if (!data || data.length < 8 + 476 || !sameBytes(data.slice(0, 8), accountDiscriminator('SignedTotals'))) {
+    throw new Error('The account is not signed totals')
+  }
+  const v = view(data)
+  const totals = []
+  const recount = []
+  for (let i = 0; i < 14; i++) {
+    totals.push(v.getBigUint64(72 + 8 * i, true))
+    recount.push(v.getBigUint64(372 + 8 * i, true))
+  }
+  return {
+    poster: base58Encode(data.slice(40, 72)),
+    totals,
+    approvals: data[184],
+    locked: data[185] === 1,
+    windowSlot: v.getBigUint64(186, true),
+    challenger: base58Encode(data.slice(194, 226)),
+    challengeBond: v.getBigUint64(226, true),
+    posterBond: v.getBigUint64(234, true),
+    feePot: v.getBigUint64(362, true),
+    rejected: data[370] === 1,
+    recount
+  }
+}
+
+export async function fetchTotals (rpcUrl, event) {
+  const data = await getAccount(rpcUrl, totalsPda(event))
+  if (!data) throw new Error('The signed totals were not found')
+  return decodeTotals(data)
 }
 
 export function decodeCoupon (data) {
@@ -421,10 +533,12 @@ export async function couponCount (rpcUrl, eventAddress) {
 }
 
 // count is the coupons already placed. A zero limit is an event created before limits existed.
+// canopy is the number of tree levels a coupon still proves. Zero is an event with no canopy.
 export async function couponCapacity (rpcUrl, eventAddress) {
   const event = decodeEvent(await getAccount(rpcUrl, eventAddress))
   return {
     count: event.couponCount,
+    canopy: event.canopy,
     minRows: event.minRows || DEFAULT_MIN_ROWS,
     maxCoupons: event.maxCoupons || (1 << 20),
     sales: event.sales,
@@ -514,12 +628,21 @@ export function unsealCoupon (key, coupon) {
   return { picks, revealNonce }
 }
 
-// The fee payer signs in Phantom, which also broadcasts the transaction.
+// The fee payer signs in the connected wallet, which also broadcasts the transaction.
 export function serializeTransaction (compiled) {
   const signatures = compiled.signers.map((address, index) => {
     if (index === 0) return new Uint8Array(64)
     throw new Error(`No signer for ${address}`)
   })
+  return packTransaction(compiled, signatures)
+}
+
+// Every signature slot is left empty. The wallet fills its own, and the server fills the keeper's.
+export function serializeUnsigned (compiled) {
+  return packTransaction(compiled, compiled.signers.map(() => new Uint8Array(64)))
+}
+
+function packTransaction (compiled, signatures) {
   const transaction = concat([compactU16(signatures.length), ...signatures, compiled.message])
   if (transaction.length > 1232) throw new Error('The transaction is too large for Solana')
   return transaction
@@ -587,21 +710,30 @@ export function revealSlipIx ({ caller, admin, nonce, index, owner, combinations
   ], concat([revealArg({ index, owner, combinations, picks, revealNonce, commitment, colors }), proofBytes(proof)]))
 }
 
-export function scoreSlipIx ({ caller, admin, event, reveal, revealed, entryProof, revealProof, scoredProof }) {
-  return ix('score_slip', [
-    signer(caller, false), writable(event), writable(vaultPda(event)), writable(slipsPda(event)), writable(schedulePda(admin)),
+export function scoreSlipIx ({ caller, admin, event, reveal, revealed, entryProof, revealProof, scoredProof, recount = null }) {
+  const accounts = [
+    signer(caller, !!recount), writable(event), writable(vaultPda(event)), writable(slipsPda(event)), writable(schedulePda(admin)),
     writable(kindsPda(admin)), writable(leaguePda())
-  ], concat([
+  ]
+  if (recount) {
+    accounts.push(
+      writable(totalsPda(event)), writable(recountFeePda(event, caller)), readonly(SYSTEM_PROGRAM),
+      writable(recount.poster), writable(recount.challenger)
+    )
+  }
+  return ix('score_slip', accounts, concat([
     revealArg(reveal), Uint8Array.of(revealed ? 1 : 0),
     proofBytes(entryProof), proofBytes(revealProof), proofBytes(scoredProof)
   ]))
 }
 
-export function claimSlipIx ({ owner, admin, nonce, reveal, entryProof, revealProof, claimedProof }) {
+export function claimSlipIx ({ owner, admin, nonce, reveal, entryProof, revealProof, claimedProof, capped = false }) {
   const event = eventPda(admin, nonce)
-  return ix('claim_slip', [
+  const accounts = [
     signer(owner, true), readonly(event), writable(vaultPda(event)), writable(slipsPda(event))
-  ], concat([revealArg(reveal), proofBytes(entryProof), proofBytes(revealProof), proofBytes(claimedProof)]))
+  ]
+  if (capped) accounts.push(writable(totalsPda(event)))
+  return ix('claim_slip', accounts, concat([revealArg(reveal), proofBytes(entryProof), proofBytes(revealProof), proofBytes(claimedProof)]))
 }
 
 export function refundSlipIx ({ owner, admin, nonce, index, combinations, commitment, entryProof, refundProof }) {
@@ -610,6 +742,76 @@ export function refundSlipIx ({ owner, admin, nonce, index, combinations, commit
     signer(owner, true), readonly(event), writable(vaultPda(event)), writable(slipsPda(event)),
     writable(radPda(owner)), readonly(SYSTEM_PROGRAM)
   ], concat([u32(index), u32(combinations), commitment, proofBytes(entryProof), proofBytes(refundProof)]))
+}
+
+// A canopy event keeps the upper nodes on chain. Each proof is the hashes inside the
+// coupon's chunk of 1,024, sent whole: the program reads the rest from the canopy.
+function bottomProofBytes (proof) {
+  if (proof.length !== CANOPY_LEVELS) throw new Error(`A canopy proof has ${CANOPY_LEVELS} hashes`)
+  return concat([u32(proof.length), ...proof])
+}
+
+export function placeCanopySlipIx ({ player, admin, nonce, commitment, combinations }) {
+  const event = eventPda(admin, nonce)
+  return ix('place_canopy_slip', [
+    signer(player, true), writable(event), writable(vaultPda(event)), writable(canopyPda(event)),
+    readonly(gatePda(admin)), writable(radPda(player)), readonly(SYSTEM_PROGRAM)
+  ], concat([commitment, u32(combinations)]))
+}
+
+export function revealCanopySlipIx ({ caller, admin, nonce, index, owner, combinations, picks, revealNonce, commitment, colors, entryProof, revealProof }) {
+  const event = eventPda(admin, nonce)
+  return ix('reveal_canopy_slip', [
+    signer(caller, false), readonly(event), writable(canopyPda(event))
+  ], concat([
+    revealArg({ index, owner, combinations, picks, revealNonce, commitment, colors }),
+    bottomProofBytes(entryProof), bottomProofBytes(revealProof)
+  ]))
+}
+
+// An unrevealed coupon scores nothing. Its proof shows the reveal leaf is still empty.
+export function scoreCanopySlipIx ({ caller, admin, event, reveal, revealed, revealProof, recount = null }) {
+  const accounts = [
+    signer(caller, !!recount), writable(event), writable(vaultPda(event)), readonly(canopyPda(event)), writable(schedulePda(admin)),
+    writable(kindsPda(admin)), writable(leaguePda())
+  ]
+  if (recount) {
+    accounts.push(
+      writable(totalsPda(event)), writable(recountFeePda(event, caller)), readonly(SYSTEM_PROGRAM),
+      writable(recount.poster), writable(recount.challenger)
+    )
+  }
+  return ix('score_canopy_slip', accounts, concat([revealArg(reveal), Uint8Array.of(revealed ? 1 : 0), bottomProofBytes(revealProof)]))
+}
+
+export function claimCanopySlipIx ({ owner, admin, nonce, reveal, revealProof, capped = false }) {
+  const event = eventPda(admin, nonce)
+  const accounts = [
+    signer(owner, true), readonly(event), writable(vaultPda(event)), writable(canopyPda(event))
+  ]
+  if (capped) accounts.push(writable(totalsPda(event)))
+  return ix('claim_canopy_slip', accounts, concat([revealArg(reveal), bottomProofBytes(revealProof)]))
+}
+
+export function challengeIx ({ challenger, event }) {
+  return ix('challenge', [
+    signer(challenger, true), writable(event), writable(vaultPda(event)), writable(totalsPda(event)), readonly(SYSTEM_PROGRAM)
+  ], new Uint8Array())
+}
+
+export function finalizeTotalsIx ({ caller, admin, event, poster }) {
+  return ix('finalize_totals', [
+    signer(caller, true), writable(event), writable(vaultPda(event)), writable(totalsPda(event)), writable(poster),
+    writable(schedulePda(admin)), writable(kindsPda(admin)), writable(leaguePda())
+  ], new Uint8Array())
+}
+
+export function refundCanopySlipIx ({ owner, admin, nonce, index, combinations, commitment, entryProof }) {
+  const event = eventPda(admin, nonce)
+  return ix('refund_canopy_slip', [
+    signer(owner, true), readonly(event), writable(vaultPda(event)), writable(canopyPda(event)),
+    writable(radPda(owner)), readonly(SYSTEM_PROGRAM)
+  ], concat([u32(index), u32(combinations), commitment, bottomProofBytes(entryProof)]))
 }
 
 export function claimIx ({ owner, event, coupon }) {

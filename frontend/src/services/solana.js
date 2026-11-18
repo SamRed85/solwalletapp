@@ -1,68 +1,10 @@
-export function getProvider () {
-  const phantom = window.phantom?.solana
-  if (phantom?.isPhantom) return phantom
-  return window.solana?.isPhantom ? window.solana : null
-}
-
-export const isPhantomInstalled = () => getProvider() !== null
-
-function requireProvider () {
-  const provider = getProvider()
-  if (!provider) throw new Error('Phantom wallet is not installed')
-  return provider
-}
-
-export async function connectWallet () {
-  const { publicKey } = await requireProvider().connect()
-  return publicKey.toBase58()
-}
-
-// The account Phantom has already shared with this page.
-// This only reads the provider. Calling connect() again, even with onlyIfTrusted,
-// makes Phantom's in-app browser show the connect sheet a second time after the
-// first approval. The desktop extension answers that call without a prompt.
-export function selectedAccount () {
-  return getProvider()?.publicKey?.toBase58?.() || null
-}
-
-export function onPhantomAccount (handler) {
-  const bound = new Set()
-  const bind = () => {
-    const providers = [window.phantom?.solana, window.solana].filter(provider => provider?.isPhantom && !bound.has(provider))
-    for (const provider of providers) {
-      bound.add(provider)
-      provider.on?.('accountChanged', key => {
-        if (key?.toBase58) handler(key.toBase58())
-        else if (typeof key === 'string' && key) handler(key)
-        else handler(null)
-      })
-      provider.on?.('disconnect', () => handler(null))
-    }
-  }
-  bind()
-  window.addEventListener('load', bind, { once: true })
-  const timer = setInterval(() => {
-    bind()
-    if (bound.size > 0) clearInterval(timer)
-  }, 250)
-  setTimeout(() => clearInterval(timer), 10000)
-}
-
-export async function disconnectWallet () {
-  try {
-    await getProvider()?.disconnect()
-  } catch {
-    // already disconnected
-  }
-}
-
 export async function signMessage (message) {
   return btoa(String.fromCharCode(...await signMessageBytes(message)))
 }
 
 export async function signMessageBytes (message) {
-  const { signature } = await requireProvider().signMessage(new TextEncoder().encode(message), 'utf8')
-  return Uint8Array.from(signature)
+  const { signWithWallet } = await import('./wallets.js')
+  return signWithWallet(new TextEncoder().encode(message))
 }
 
 async function rpc (rpcUrl, method, params) {
@@ -75,6 +17,10 @@ async function rpc (rpcUrl, method, params) {
   const { result, error } = await response.json()
   if (error) throw new Error(error.message)
   return result
+}
+
+export async function getSlot (rpcUrl) {
+  return rpc(rpcUrl, 'getSlot', [{ commitment: 'confirmed' }])
 }
 
 export async function getBalance (rpcUrl, publicKey) {
@@ -150,7 +96,7 @@ export function transferMessage (from, to, lamports, blockhash, memo) {
   ])
 }
 
-// Phantom deserializes the payload as a complete transaction: a signature count, one
+// A wallet deserializes the payload as a complete transaction: a signature count, one
 // 64-byte signature slot, then the message. Sending the message alone makes it treat
 // part of the recipient address as the message version.
 export function phantomTransaction (message) {
@@ -188,19 +134,29 @@ export async function getProgramAccounts (rpcUrl, programId, filters) {
 }
 
 export async function signAndSendTransaction (serialized) {
-  const { signature } = await requireProvider().request({
-    method: 'signAndSendTransaction',
-    params: { message: base58Encode(serialized) }
-  })
-  return signature
+  const { sendWithWallet } = await import('./wallets.js')
+  return base58Encode(await sendWithWallet(serialized))
+}
+
+export function toBase64 (bytes) {
+  const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
+  let text = ''
+  for (const byte of raw) text += String.fromCharCode(byte)
+  return btoa(text)
+}
+
+// Returns the full transaction after the wallet has signed. The server still has to co-sign.
+export async function signTransaction (serialized) {
+  const { signTransactionWithWallet } = await import('./wallets.js')
+  return signTransactionWithWallet(serialized)
 }
 
 export async function signAndSendMessage (message) {
   return signAndSendTransaction(phantomTransaction(message))
 }
 
-// Phantom submits the transaction to the network it is set to. The blockhash comes from devnet,
-// so a wallet left on mainnet rejects the transaction instead of spending real SOL.
+// The wallet submits the transaction on the chain it was given, devnet. A wallet left on
+// mainnet rejects the devnet blockhash instead of spending real SOL.
 export async function sendPayment (rpcUrl, from, to, lamports, memo) {
   const { value } = await rpc(rpcUrl, 'getLatestBlockhash', [{ commitment: 'confirmed' }])
   const message = transferMessage(from, to, lamports, value.blockhash, memo)

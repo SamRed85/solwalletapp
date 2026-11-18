@@ -158,6 +158,8 @@ func (a *App) routes() *http.ServeMux {
 	mux.HandleFunc("PUT /api/events/{id}/chain", a.requireAdmin(a.handleSetChain))
 	mux.HandleFunc("POST /api/events/{id}/results", a.requireAdmin(a.handleSetResults))
 	mux.HandleFunc("GET /api/events/{id}/projection", a.requireAuth(a.handleProjection))
+	mux.HandleFunc("GET /api/events/{id}/totals", a.requireAuth(a.handleTotalsPreview))
+	mux.HandleFunc("POST /api/events/{id}/totals/lock", a.requireAuth(a.limitRequests("totals-lock", 10, time.Minute, walletRateKey, a.handleLockTotals)))
 	mux.HandleFunc("POST /api/events/{id}/projection/refresh", a.requireAdmin(a.handleRefreshScores))
 	mux.HandleFunc("POST /api/events/{id}/odds/refresh", a.requireAdmin(a.handleRefreshOdds))
 	mux.HandleFunc("GET /api/events/{id}/payouts", a.requireAdmin(a.handlePayouts))
@@ -211,6 +213,15 @@ func (a *App) ensureIndexes() error {
 	})
 	if err != nil {
 		return err
+	}
+	// A proof on an event with a canopy reads one chunk of coupons by index.
+	if a.slips != nil {
+		if _, err = a.slips.Indexes().CreateMany(ctx, []mongo.IndexModel{
+			{Keys: bson.D{{Key: "event", Value: 1}, {Key: "index", Value: 1}}},
+			{Keys: bson.D{{Key: "event", Value: 1}, {Key: "owner", Value: 1}}},
+		}); err != nil {
+			return err
+		}
 	}
 	_, err = a.coupons.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "walletAddress", Value: 1}, {Key: "couponId", Value: 1}}, Options: options.Index().SetUnique(true)},

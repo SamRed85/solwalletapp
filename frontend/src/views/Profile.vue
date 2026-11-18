@@ -19,19 +19,25 @@
     </div>
     <p class="facts">Best {{ bestLabel }}</p>
 
-    <div class="net-head">
-      <div>
-        <div class="net">{{ netLabel }}</div>
-        <div class="net-note">net result</div>
-      </div>
+    <div class="net-block">
       <div class="spans">
         <button v-for="item in spans" :key="item" type="button" class="span" :class="{ on: span === item }" @click="span = item">{{ item }}</button>
       </div>
+      <TabReel :items="spans" :current="span" :drag="drag" :dragging="dragging">
+        <template #default="{ item }">
+          <div class="net-head">
+            <div>
+              <div class="net">{{ netText(item) }}</div>
+              <div class="net-note">net result</div>
+            </div>
+          </div>
+          <svg class="chart" viewBox="0 0 288 110" role="img" :aria-label="`Net result, ${item}`">
+            <line x1="0" :x2="288" :y1="chartFor(item).zero" :y2="chartFor(item).zero" class="zero" />
+            <polyline :points="chartFor(item).points" fill="none" stroke="rgb(var(--v-theme-primary))" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />
+          </svg>
+        </template>
+      </TabReel>
     </div>
-    <svg class="chart" viewBox="0 0 288 110" role="img" :aria-label="`Net result, ${span}`">
-      <line x1="0" :x2="288" :y1="zeroY" :y2="zeroY" class="zero" />
-      <polyline :points="points" fill="none" stroke="rgb(var(--v-theme-primary))" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />
-    </svg>
 
     <div class="currency">
       <div class="net-note">Display currency</div>
@@ -52,6 +58,8 @@
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
+import TabReel from '@/components/TabReel.vue'
+import { useTabSwipe } from '@/composables/useSwipeNav'
 import { authApi, entryApi, eventApi } from '@/services/api'
 import { auth, setProfile } from '@/stores/auth'
 import { display, setCurrency } from '@/stores/currency'
@@ -65,6 +73,7 @@ const rank = ref(0)
 const openEvent = ref(null)
 const span = ref('All')
 const spans = ['Round', 'Week', 'All']
+const { drag, dragging } = useTabSwipe(span, spans)
 
 const currency = computed({
   get: () => display.currency,
@@ -89,15 +98,44 @@ const initials = computed(() => ((auth.displayName || auth.wallet || '').trim().
 const short = computed(() => shortAddress(auth.wallet))
 
 const settled = computed(() => entries.value.filter(entry => entry.event?.settlement))
-const inSpan = computed(() => {
-  if (span.value === 'All') return settled.value
-  if (span.value === 'Round') {
+function entriesFor (name) {
+  if (name === 'All') return settled.value
+  if (name === 'Round') {
     const newest = [...settled.value].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0]
     return newest ? settled.value.filter(entry => entry.eventId === newest.eventId) : []
   }
   const start = Date.now() - 7 * 24 * 60 * 60 * 1000
   return settled.value.filter(entry => new Date(entry.createdAt).getTime() >= start)
-})
+}
+function seriesFor (name) {
+  const ordered = [...entriesFor(name)].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+  let net = 0
+  const values = [0]
+  for (const entry of ordered) {
+    net += (entry.winningsLamports || 0) - (entry.lamports || 0)
+    values.push(net)
+  }
+  return values
+}
+function netText (name) {
+  const net = seriesFor(name).at(-1) || 0
+  const sign = net > 0 ? '+' : net < 0 ? '−' : ''
+  return `${sign}${formatSol(Math.abs(net))}`
+}
+function chartFor (name) {
+  const values = seriesFor(name)
+  const min = Math.min(...values, 0)
+  const max = Math.max(...values, 0)
+  const spanHeight = max - min || 1
+  return {
+    zero: 102 - ((0 - min) / spanHeight) * 86,
+    points: values.map((value, index) => {
+      const x = values.length === 1 ? 0 : (index / (values.length - 1)) * 288
+      const y = 102 - ((value - min) / spanHeight) * 86
+      return `${x},${y}`
+    }).join(' ')
+  }
+}
 const coupons = computed(() => entries.value.length)
 const wins = computed(() => entries.value.filter(entry => entry.winningsLamports > 0).length)
 const claimLabel = computed(() => wins.value ? 'See winnings' : 'My coupons')
@@ -115,39 +153,6 @@ const best = computed(() => {
 })
 const bestLabel = computed(() => best.value.games ? `${best.value.correct} of ${best.value.games}` : '—')
 const rankLabel = computed(() => rank.value ? `#${rank.value}` : '—')
-
-const series = computed(() => {
-  const ordered = [...inSpan.value].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
-  let net = 0
-  const values = [0]
-  for (const entry of ordered) {
-    net += (entry.winningsLamports || 0) - (entry.lamports || 0)
-    values.push(net)
-  }
-  return values
-})
-const netLabel = computed(() => {
-  const net = series.value[series.value.length - 1] || 0
-  const sign = net > 0 ? '+' : net < 0 ? '−' : ''
-  return `${sign}${formatSol(Math.abs(net))}`
-})
-const points = computed(() => {
-  const values = series.value
-  const min = Math.min(...values, 0)
-  const max = Math.max(...values, 0)
-  const spanHeight = max - min || 1
-  return values.map((value, index) => {
-    const x = values.length === 1 ? 0 : (index / (values.length - 1)) * 288
-    const y = 102 - ((value - min) / spanHeight) * 86
-    return `${x},${y}`
-  }).join(' ')
-})
-const zeroY = computed(() => {
-  const values = series.value
-  const min = Math.min(...values, 0)
-  const max = Math.max(...values, 0)
-  return 102 - ((0 - min) / (max - min || 1)) * 86
-})
 
 async function save () {
   saving.value = true
@@ -192,7 +197,9 @@ onMounted(async () => {
 .stats { display: flex; gap: 16px; margin-top: 16px; font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.62); }
 .stats b { color: rgb(var(--v-theme-on-surface)); }
 .facts { margin: 8px 0 0; font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.45); }
-.net-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-top: 24px; }
+.net-block { position: relative; margin-top: 24px; }
+.net-block .spans { position: absolute; z-index: 1; top: 0; right: 0; }
+.net-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding-right: 148px; }
 .net { font-size: var(--fs-display); line-height: var(--lh-display); font-weight: 700; letter-spacing: -0.02em; }
 .net-note { font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.62); }
 .spans { display: flex; gap: 2px; }

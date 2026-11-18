@@ -61,6 +61,7 @@ func testApp(t *testing.T, db *mongo.Database) *App {
 		reveals:    db.Collection("reveals"),
 		sessions:   db.Collection("sessions"),
 		reductions: db.Collection("reductions"),
+		coupons:    db.Collection("coupons"),
 		verifyRecoveryPayment: func(context.Context, string, string, string, uint64, string) error {
 			return nil
 		},

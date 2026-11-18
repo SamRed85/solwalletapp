@@ -56,6 +56,8 @@ fn main() {
     assert_eq!(rpc.event(&event).status, EventStatus::Open, "one signer must not lock results");
     rpc.send_all(&[&player, &other], &[approve_ix(&other, &admin.pubkey(), event)], true).unwrap();
     assert_eq!(rpc.event(&event).status, EventStatus::Tallying);
+    // New events wait for signed totals. This count is the 24-hour fallback, so it does not
+    // settle on a live validator until that time has passed.
     let mut tally = tally_ix(&admin, event);
     tally.accounts.push(AccountMeta::new_readonly(coupon, false));
     rpc.send(&stranger, &[tally], true).unwrap();
@@ -103,6 +105,8 @@ fn colored_at_the_cap(rpc: &Rpc, admin: &Keypair, other: &Keypair, player: &Keyp
         kind: predictions::KIND_SOL,
         min_rows: 1,
         max_coupons: 250_000,
+        dispute_min: 10,
+        dispute_max: 50,
     };
     rpc.send(admin, &[create_args_ix(admin, args)], true).unwrap();
 
@@ -116,27 +120,30 @@ fn colored_at_the_cap(rpc: &Rpc, admin: &Keypair, other: &Keypair, player: &Keyp
     let picks = [0b111u8; 13];
     let commitment = predictions::slip_commitment(&player.pubkey(), &picks, REVEAL_NONCE, &colors);
     let reveal = RevealArg { index: 0, owner: player.pubkey(), combinations: 32_640, picks, nonce: REVEAL_NONCE, commitment, colors };
-    let slips = pda(&[b"slips", event.as_ref()]);
+    // A new event has a canopy. The client sends the bottom ten hashes of a proof, and
+    // with one coupon in the event every one of them is an empty subtree.
+    let canopy = pda(&[b"canopy", event.as_ref()]);
+    let bottom: Vec<[u8; 32]> = (0..predictions::CANOPY_LEVELS as usize).map(predictions::slip_zero).collect();
     let place = Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::PlaceSlip {
+        accounts: predictions::accounts::PlaceCanopySlip {
             player: player.pubkey(),
             event,
             vault: pda(&[b"vault", event.as_ref()]),
-            slips,
+            canopy,
             gate: pda(&[b"gate", admin.pubkey().as_ref()]),
             rad: pda(&[b"rad", player.pubkey().as_ref()]),
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),
-        data: predictions::instruction::PlaceSlip { slip: SlipArg { commitment, combinations: 32_640 }, proof: vec![] }.data(),
+        data: predictions::instruction::PlaceCanopySlip { slip: SlipArg { commitment, combinations: 32_640 } }.data(),
     };
-    rpc.send(player, &[place], true).unwrap();
+    let place_units = rpc.units(&rpc.send(player, &[budget(), place], true).unwrap());
     rpc.wait_until(deadline);
     let reveal_ix = Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::RevealSlip { caller: player.pubkey(), event, slips }.to_account_metas(None),
-        data: predictions::instruction::RevealSlip { reveal: reveal.clone(), proof: vec![] }.data(),
+        accounts: predictions::accounts::RevealCanopySlip { caller: player.pubkey(), event, canopy }.to_account_metas(None),
+        data: predictions::instruction::RevealCanopySlip { reveal: reveal.clone(), entry_proof: bottom.clone(), reveal_proof: bottom.clone() }.data(),
     };
     let reveal_units = rpc.units(&rpc.send(player, &[budget(), reveal_ix], true).unwrap());
     rpc.wait_until(reveal_deadline);
@@ -144,27 +151,30 @@ fn colored_at_the_cap(rpc: &Rpc, admin: &Keypair, other: &Keypair, player: &Keyp
     let results = b"1X21X21X21X21".to_vec();
     rpc.send(admin, &[approve_results_ix(admin, &admin.pubkey(), event, results.clone())], true).unwrap();
     rpc.send_all(&[player, other], &[approve_results_ix(other, &admin.pubkey(), event, results)], true).unwrap();
+    // Same fallback as the coupon walkthrough above: a new event does not score until 24 hours
+    // after the results lock, unless signed totals are posted.
     let score = Instruction {
         program_id: predictions::ID,
-        accounts: predictions::accounts::ScoreSlip {
+        accounts: predictions::accounts::ScoreCanopySlip {
             caller: player.pubkey(),
             event,
             vault: pda(&[b"vault", event.as_ref()]),
-            slips,
+            canopy,
             schedule: pda(&[b"schedule", admin.pubkey().as_ref()]),
             kinds: pda(&[b"schedule-kinds", admin.pubkey().as_ref()]),
             league: pda(&[b"league"]),
         }
         .to_account_metas(None),
-        data: predictions::instruction::ScoreSlip { reveal, revealed: true, entry_proof: vec![], reveal_proof: vec![], scored_proof: vec![] }.data(),
+        data: predictions::instruction::ScoreCanopySlip { reveal, revealed: true, reveal_proof: bottom }.data(),
     };
     let score_units = rpc.units(&rpc.send(player, &[budget(), score], true).unwrap());
     let settled = rpc.event(&event);
     assert_eq!(settled.status, EventStatus::Resolved);
     let scored: u64 = settled.winners.iter().sum();
     assert_eq!(scored, 32_640, "every kept row is scored once");
-    println!("colored slip at 64 states: reveal used {reveal_units} compute units, score used {score_units}");
-    assert!(score_units < 1_000_000, "scoring at the cap must leave room for full-depth proofs");
+    println!("colored slip at 64 states: place used {place_units} compute units, reveal used {reveal_units}, score used {score_units}");
+    // The canopy path costs the same hashes in a full event: ten sent and ten stored.
+    assert!(score_units < 1_000_000, "scoring at the cap must fit one transaction with room to spare");
 }
 
 fn budget() -> Instruction {
@@ -188,6 +198,8 @@ fn create_ix(admin: &Keypair, other: &Keypair, nonce: u64, deadline: i64, reveal
             kind: predictions::KIND_SOL,
             min_rows: 1,
             max_coupons: 250_000,
+            dispute_min: 10,
+            dispute_max: 50,
         },
     )
 }
@@ -207,6 +219,7 @@ fn create_args_ix(admin: &Keypair, args: CreateEventArgs) -> Instruction {
             gate: pda(&[b"gate", admin_key.as_ref()]),
             kinds: pda(&[b"schedule-kinds", admin_key.as_ref()]),
             league: pda(&[b"league"]),
+            canopy: pda(&[b"canopy", event.as_ref()]),
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),

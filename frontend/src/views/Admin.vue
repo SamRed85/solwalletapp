@@ -178,8 +178,21 @@
             <v-text-field
               v-model.number="newEvent.maxCoupons" label="Maximum coupons" type="number" min="1" max="1000000" step="1"
               :rules="[v => Number.isInteger(v) && v >= 1 && v <= 1000000 || 'Between 1 and 1,000,000 coupons']"
-              hint="The event stops taking entries at this many coupons. The default is 250,000." persistent-hint
+              hint="The event is full at this many coupons and takes no more entries. An event holds at most 1,000,000. The default is 250,000." persistent-hint
             />
+            <v-text-field
+              v-model.number="newEvent.disputeMin" label="Minimum challenge bond (SOL)" type="number" min="1" max="100" step="1"
+              :rules="[v => Number.isInteger(v) && v >= 1 && v <= 100 || 'Whole SOL from 1 to 100']"
+              hint="The bond is 10% of the player pot, clamped between this minimum and the maximum. A pot of 100 SOL or less locks the minimum, 250 SOL locks 25 SOL, and 500 SOL or more locks the maximum." persistent-hint
+            />
+            <v-text-field
+              v-model.number="newEvent.disputeMax" label="Maximum challenge bond (SOL)" type="number" min="1" max="100" step="1"
+              :rules="[v => Number.isInteger(v) && v >= 1 && v <= 100 || 'Whole SOL from 1 to 100', v => v >= newEvent.disputeMin || 'The minimum cannot be above the maximum']"
+              hint="Whole SOL from 1 to 100." persistent-hint
+            />
+            <v-alert v-if="Number.isInteger(newEvent.disputeMin) && newEvent.disputeMin < 10" type="warning" variant="tonal" density="compact" class="mt-2">
+              A minimum under 10 SOL does not cover the fees of a recount at 1,000,000 coupons.
+            </v-alert>
             <v-checkbox v-model="newEvent.autoResolve" label="Auto resolve" density="compact" hide-details class="mt-2" />
             <div class="text-caption text-medium-emphasis mb-2">
               When this is on, finished matches settle the round. A match still in play waits. Turn it off to set 1, X, 2 or C yourself.
@@ -553,7 +566,9 @@ async function publishVault (item) {
         league: !!item.league,
         kind: kindOf(item),
         minRows: item.minRows || 1,
-        maxCoupons: item.maxCoupons || 250_000
+        maxCoupons: item.maxCoupons || 250_000,
+        disputeMin: item.disputeMin || 10,
+        disputeMax: item.disputeMax || 50
       })
       const sent = await sendProgramTransaction(rpcUrl, auth.wallet, parkFrom
         ? [parkRolloverIx({ admin: auth.wallet, source: parkFrom }), create]
@@ -657,7 +672,9 @@ async function openCreate (type = 'saturday') {
     priceSol: config.value.couponPriceLamports / 1e9,
     tiers: [],
     minRows: 1,
-    maxCoupons: 250000
+    maxCoupons: 250000,
+    disputeMin: 10,
+    disputeMax: 50
   }
   resetTiers()
   createDialog.value = true
@@ -671,6 +688,8 @@ function createEvent () {
     gameCount: Math.round(Number(gameCount)),
     minRows: Math.round(Number(newEvent.value.minRows)),
     maxCoupons: Math.round(Number(newEvent.value.maxCoupons)),
+    disputeMin: Math.round(Number(newEvent.value.disputeMin)),
+    disputeMax: Math.round(Number(newEvent.value.disputeMax)),
     startTime: new Date(startTime).toISOString(),
     endTime: new Date(endTime).toISOString(),
     league: !!league,

@@ -92,12 +92,12 @@ function nodeAt (level, index, depth) {
 }
 
 /** Sibling path for one index. A missing node is an empty leaf, so reveals and claims can arrive in any order. */
-export function sparseProof (nodes, index) {
-  if (!Number.isInteger(index) || index < 0 || index >= 2 ** SLIP_DEPTH) throw new Error('that coupon is not in the archive')
+export function sparseProof (nodes, index, levels = SLIP_DEPTH) {
+  if (!Number.isInteger(index) || index < 0 || index >= 2 ** levels) throw new Error('that coupon is not in the archive')
   let level = nodes
   let cursor = index
   const proof = []
-  for (let depth = 0; depth < SLIP_DEPTH; depth += 1) {
+  for (let depth = 0; depth < levels; depth += 1) {
     proof.push(nodeAt(level, cursor ^ 1, depth))
     const nextCount = Math.max(Math.ceil(level.length / 2), (cursor >> 1) + 1)
     const next = []
@@ -110,6 +110,26 @@ export function sparseProof (nodes, index) {
     cursor >>= 1
   }
   return proof
+}
+
+/** The first coupon of the chunk that holds `index`, and the first coupon after it. */
+export function canopyChunk (index, levels) {
+  const size = 2 ** levels
+  const from = Math.floor(index / size) * size
+  return { from, to: from + size }
+}
+
+/**
+ * The hashes a coupon sends on an event with a canopy: its path inside its own chunk.
+ * `nodes` maps a coupon number to its leaf. The program holds every node above the chunk.
+ */
+export function bottomProof (nodes, index, levels) {
+  const { from, to } = canopyChunk(index, levels)
+  const chunk = Array.from({ length: to - from }, () => null)
+  for (const [at, leaf] of nodes) {
+    if (at >= from && at < to) chunk[at - from] = leaf
+  }
+  return sparseProof(chunk, index - from, levels)
 }
 
 export function slipFold(index, leaf, proof) {

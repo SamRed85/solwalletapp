@@ -27,7 +27,7 @@
           <div class="sales-amount">{{ sol(chain.sales + chain.rolloverIn) }}</div>
         </div>
         <p class="text-caption text-medium-emphasis mb-3">
-          {{ sol(chain.sales) }} from {{ chain.couponCount }} coupon(s)<template v-if="chain.rolloverIn > 0n"> + {{ sol(chain.rolloverIn) }} jackpot</template>
+          {{ sol(chain.sales) }} from {{ chain.couponCount }} coupon(s)<template v-if="chain.maxCoupons && chain.couponCount >= chain.maxCoupons"> (the event is full)</template><template v-if="chain.rolloverIn > 0n"> + {{ sol(chain.rolloverIn) }} jackpot</template>
         </p>
         <p class="text-caption text-medium-emphasis">
           Entries close {{ when(chain.deadline) }} · reveals and results from {{ when(chain.endTime) }} ·
@@ -57,7 +57,7 @@
           </v-expansion-panel>
         </v-expansion-panels>
       </template>
-      <v-alert v-if="auth.isAdmin && event.autoResolveBlock" type="warning" variant="tonal" density="compact" class="mt-2">
+      <v-alert v-if="auth.isAdmin && event.autoResolveBlock && resultsStillOpen" type="warning" variant="tonal" density="compact" class="mt-2">
         {{ event.autoResolveBlock }}
       </v-alert>
       <p v-if="settled">
@@ -70,9 +70,53 @@
       <p v-if="chain.status === 'cancelled'">
         Refund each coupon from <router-link to="/coupons">My Coupons</router-link>. Rollover to pass on: {{ sol(chain.rolloverOut) }}{{ chain.rolloverForwarded ? ' (passed on)' : '' }}
       </p>
-      <p v-if="chain.status === 'tallying'">
+      <div v-if="waitingForTotals" class="mt-2">
+        <p>
+          Results {{ chain.results }} are locked. The stored coupons are counted off chain.
+          <template v-if="canSignTotals && signatureLocks">The other signer already approved this list, so this signature locks it. The reveal keeper co-signs and posts the bond. Any wallet can then challenge during the 6-hour window.</template>
+          <template v-else-if="canSignTotals">Sign that list from this wallet. The server then locks it, and any wallet can challenge during the 6-hour window.</template>
+          <template v-else-if="signedWaiting && otherMissing">You signed these totals in the browser, before the other signer. The bond stays where it is until that signer locks the list.</template>
+          <template v-else-if="signedWaiting">You signed these totals. The server locks them next. Any wallet can then challenge during the 6-hour window.</template>
+          <template v-else-if="cosignerWallet">This wallet is the result cosigner. It does not sign totals in the browser. The other result signer signs first, and this server locks the bond.</template>
+          <template v-else-if="fallbackOpen">The 24-hour wait has passed. Count the coupons on chain to open claims.</template>
+          <template v-else>A result signer signs the list from their wallet. Any wallet can challenge once it is locked.</template>
+        </p>
+        <p v-if="signedNames.length" class="mb-2">Signed by {{ signedNames.join(', ') }}.</p>
+        <p v-if="previewError" class="text-caption">{{ previewError }}</p>
+        <p v-if="previewRows.length" class="mb-2">
+          <template v-for="(row, index) in previewRows" :key="row.score">
+            <template v-if="index"> · </template>{{ row.count }} with {{ row.score }} correct
+          </template>
+        </p>
+        <v-btn v-if="canSignTotals" color="primary" variant="flat" :loading="busy === 'sign-totals'" @click="signCountedTotals">
+          {{ signatureLocks ? 'Sign and lock these totals' : 'Sign these totals' }}
+        </v-btn>
+      </div>
+      <p v-else-if="chain.status === 'tallying'">
         Results {{ chain.results }} are locked. {{ chain.tallied }} of {{ chain.couponCount }} coupons counted.
       </p>
+      <div v-if="showTotals" class="mt-2">
+        <p v-if="totals?.rejected" class="mb-1">The signed totals were rejected. The recount is what this event pays.</p>
+        <p v-else-if="chain.status === 'resolved' && chain.settlementPath === 2" class="mb-1">The signed totals were confirmed.</p>
+        <p v-else-if="chain.status === 'window'" class="mb-1">{{ windowLeft }}</p>
+        <p v-if="chain.status === 'recount'" class="mb-1">Recount {{ chain.tallied }} of {{ chain.couponCount }} coupons. Claims stay closed until it finishes.</p>
+        <p v-if="signedRows.length" class="mb-1">
+          <template v-for="(row, index) in signedRows" :key="row.score">
+            <template v-if="index"> · </template>{{ row.count }} with {{ row.score }} correct
+          </template>
+        </p>
+        <p v-if="chain.status === 'window'" class="text-caption text-medium-emphasis mb-2">
+          The poster locked {{ sol(POSTER_BOND) }}. A challenge locks {{ sol(challengeBond) }}, 10% of the player pot within this event's limits.
+        </p>
+        <div class="d-flex flex-wrap ga-2">
+          <v-btn v-if="auth.wallet && chain.status === 'window' && !challenged" color="warning" variant="flat" :loading="busy === 'challenge'" @click="challenge">
+            Challenge these totals
+          </v-btn>
+          <v-btn v-if="auth.wallet && windowOver" color="primary" variant="flat" :loading="busy === 'finalize'" @click="finalize">
+            Settle from the signed totals
+          </v-btn>
+        </div>
+      </div>
 
       <template v-if="chain.status === 'open' && chain.proposalKind !== 'none'">
         <div class="text-subtitle-2 mt-2">Pending {{ chain.proposalKind === 'cancel' ? 'cancellation' : `results ${chain.proposalResults}` }}</div>
@@ -134,8 +178,13 @@
       </div>
     </v-card-text>
 
+    <v-card-text v-if="chain && isSigner && chain.status === 'window'">
+      <p class="text-body-2 mb-2">The result signers can still cancel before the window ends. Every stake is then refunded, and the poster bond comes back.</p>
+      <v-btn color="error" variant="tonal" :loading="busy === 'cancel'" @click="approveCancel">Approve cancelling the event</v-btn>
+    </v-card-text>
+
     <v-card-actions v-if="chain" class="flex-wrap ga-2">
-      <v-btn v-if="chain.status === 'tallying'" color="primary" variant="flat" :loading="busy === 'tally'" @click="tally">Count coupons and settle</v-btn>
+      <v-btn v-if="canCount" color="primary" variant="flat" :loading="busy === 'tally'" @click="tally">Count coupons and settle</v-btn>
       <v-btn v-if="canExpire" color="warning" variant="flat" :loading="busy === 'expire'" @click="expire">Refund the whole event (timeout)</v-btn>
       <v-btn v-if="canPassRollover" color="primary" variant="tonal" :loading="busy === 'rollover'" @click="passRollover">
         {{ rolloverLabel }}
@@ -153,7 +202,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { VCard } from 'vuetify/components'
 import MatchScore from '@/components/MatchScore.vue'
@@ -162,11 +211,11 @@ import { kickoffStamp } from '@/services/projection'
 import { eventApi } from '@/services/api'
 import { scoreNextSlip } from '@/services/entry'
 import {
-  RESULT_COSIGNER, TALLY_BATCH, approveCancelIx, approveResolutionIx, computeBudgetIx, eventCoupons, eventPda,
-  expireEventIx, fetchEvent, fetchGatePaused, fetchKinds, fetchSchedule, fetchSigners, forwardRolloverIx, parkRolloverIx,
-  sendProgramTransaction, setPauseIx, slipsPda, tallyIx, withdrawHouseIx
+  CHALLENGE_SLOTS, POSTER_BOND, RESULT_COSIGNER, TALLY_BATCH, approveCancelIx, approveResolutionIx, challengeIx, computeBudgetIx, decodeTotals, disputeBond, eventCoupons, eventPda,
+  compileMessage, expireEventIx, fetchEvent, fetchGatePaused, fetchKinds, fetchSchedule, fetchSigners, finalizeTotalsIx, forwardRolloverIx, openCountIx, parkRolloverIx, serializeUnsigned, signTotalsIx, signTotalsLockIx,
+  sendProgramTransaction, setPauseIx, slipsPda, tallyIx, totalsPda, totalsSignatureLocks, withdrawHouseIx
 } from '@/services/program'
-import { getAccount, waitForConfirmation } from '@/services/solana'
+import { getAccount, getSlot, latestBlockhash, signTransaction, toBase64, waitForConfirmation } from '@/services/solana'
 import { auth, loadConfig } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { explorerAddress, formatDate, formatSol, shortAddress } from '@/utils/format'
@@ -179,6 +228,8 @@ const props = defineProps({
 const emit = defineEmits(['changed'])
 
 const chain = ref(null)
+const totals = ref(null)
+const slot = ref(null)
 const signers = ref(null)
 const paused = ref(false)
 const router = useRouter()
@@ -195,15 +246,18 @@ const progress = ref('')
 const error = ref('')
 const draft = ref([])
 const projection = ref(null)
+const preview = ref(null)
+const previewError = ref('')
 const refreshingScores = ref(false)
 const now = ref(Math.floor(Date.now() / 1000))
+let clock = 0
 
 const address = computed(() => props.event.chain.address || eventPda(props.event.chain.admin, props.event.chain.nonce))
 const admin = computed(() => props.event.chain.admin)
 const rpcUrl = () => auth.config.solanaRpcUrl
 const sol = lamports => formatSol(Number(lamports))
 const when = seconds => formatDate(seconds * 1000)
-const statusColor = computed(() => ({ open: 'success', tallying: 'primary', resolved: 'primary', cancelled: 'error' })[chain.value?.status] ?? 'default')
+const statusColor = computed(() => ({ open: 'success', tallying: 'primary', window: 'warning', recount: 'warning', resolved: 'primary', cancelled: 'error' })[chain.value?.status] ?? 'default')
 const settled = computed(() => chain.value?.status === 'resolved')
 const isSigner = computed(() => signers.value?.members.includes(auth.wallet))
 const isAdmin = computed(() => auth.wallet === admin.value)
@@ -225,7 +279,74 @@ const canWithdrawHouse = computed(() => settled.value && chain.value.house > 0n 
 const chainStatusVisible = computed(() => {
   const state = chain.value
   if (!state) return false
-  return settled.value || state.status === 'cancelled' || state.status === 'tallying' || state.proposalKind !== 'none' || !!(auth.isAdmin && props.event.autoResolveBlock)
+  return settled.value || state.status === 'cancelled' || state.status === 'tallying' || state.status === 'window' || state.status === 'recount' || state.proposalKind !== 'none' || !!(auth.isAdmin && props.event.autoResolveBlock)
+})
+const TOTALS_WAIT = 24 * 60 * 60
+const resultsStillOpen = computed(() => !chain.value || chain.value.status === 'open')
+const waitingForTotals = computed(() => chain.value?.status === 'tallying' && chain.value.settlementPath === 1 && !chain.value.countStarted)
+const fallbackAt = computed(() => chain.value?.approvedAt ? chain.value.approvedAt + TOTALS_WAIT : 0)
+const fallbackOpen = computed(() => waitingForTotals.value && fallbackAt.value > 0 && now.value >= fallbackAt.value)
+const previewRows = computed(() => {
+  const counts = preview.value?.totals
+  if (!counts || !chain.value) return []
+  return counts.map((count, score) => ({ score, count })).filter(row => row.score <= chain.value.gameCount && BigInt(row.count) > 0n)
+})
+const samePreview = computed(() => {
+  const proposal = totals.value
+  const counted = preview.value
+  if (!proposal || !counted?.poster || proposal.locked || proposal.poster !== counted.poster) return false
+  return proposal.totals.every((count, index) => count === BigInt(counted.totals[index]))
+})
+const alreadySignedPreview = computed(() => {
+  if (!samePreview.value) return false
+  const index = signers.value?.members.indexOf(auth.wallet) ?? -1
+  return index >= 0 && (totals.value.approvals & (1 << index)) !== 0
+})
+const canSignTotals = computed(() => waitingForTotals.value && isSigner.value && auth.wallet !== RESULT_COSIGNER && !!preview.value?.poster && Array.isArray(preview.value?.totals) && !alreadySignedPreview.value)
+const signedWaiting = computed(() => waitingForTotals.value && alreadySignedPreview.value)
+const cosignerWallet = computed(() => waitingForTotals.value && auth.wallet === RESULT_COSIGNER && isSigner.value && !alreadySignedPreview.value)
+const approvedSigners = computed(() => {
+  if (!totals.value || totals.value.locked || !signers.value) return []
+  if (preview.value && !samePreview.value) return []
+  return signers.value.members.filter((_, index) => (totals.value.approvals & (1 << index)) !== 0)
+})
+const signedNames = computed(() => approvedSigners.value.map(shortAddress))
+const otherMissing = computed(() => (signers.value?.members ?? []).some(member => member !== auth.wallet && !approvedSigners.value.includes(member)))
+const signatureLocks = computed(() => totalsSignatureLocks({
+  wallet: auth.wallet,
+  members: signers.value?.members,
+  threshold: signers.value?.threshold,
+  approvals: totals.value?.approvals ?? 0,
+  sameList: samePreview.value
+}))
+const canCount = computed(() => {
+  const state = chain.value
+  if (!state) return false
+  if (state.status === 'recount' || fallbackOpen.value) return true
+  return state.status === 'tallying' && (state.settlementPath !== 1 || state.countStarted === 1)
+})
+const showTotals = computed(() => chain.value && (chain.value.status === 'window' || chain.value.status === 'recount' || chain.value.settlementPath === 2))
+const challenged = computed(() => totals.value && totals.value.challenger !== '11111111111111111111111111111111')
+const challengeBond = computed(() => chain.value ? disputeBond(chain.value) : 0n)
+const signedRows = computed(() => {
+  const source = totals.value?.rejected ? totals.value.recount : totals.value?.totals
+  if (!source || !chain.value) return []
+  return source.map((count, score) => ({ score, count })).filter(row => row.score <= chain.value.gameCount && row.count > 0n)
+    .map(row => ({ ...row, count: row.count.toString() }))
+})
+const windowOver = computed(() => {
+  if (chain.value?.status !== 'window' || !totals.value || slot.value == null) return false
+  return BigInt(slot.value) >= totals.value.windowSlot + CHALLENGE_SLOTS
+})
+const windowLeft = computed(() => {
+  if (!totals.value) return 'Signed totals are locked. Claims stay closed during the challenge window.'
+  if (slot.value == null) return 'The challenge window is open.'
+  const end = totals.value.windowSlot + CHALLENGE_SLOTS
+  if (BigInt(slot.value) >= end) return 'The window has ended. Anyone can settle.'
+  const left = Number(end - BigInt(slot.value))
+  const hours = Math.floor(left / 9000)
+  const minutes = Math.round((left % 9000) / 150)
+  return `${hours}h ${minutes}m left in the challenge window`
 })
 
 const tierRows = computed(() => chain.value.tiers.map(tier => {
@@ -289,6 +410,15 @@ async function load () {
       fetchGatePaused(rpcUrl(), admin.value), fetchSchedule(rpcUrl(), admin.value), fetchKinds(rpcUrl(), admin.value)
     ])
     chain.value = state
+    totals.value = null
+    slot.value = null
+    preview.value = null
+    previewError.value = ''
+    if (state.status === 'window' || state.status === 'recount' || state.settlementPath === 2 || (state.status === 'tallying' && state.settlementPath === 1)) {
+      const raw = await getAccount(rpcUrl(), totalsPda(address.value))
+      totals.value = raw ? decodeTotals(raw) : null
+    }
+    if (state.status === 'window') slot.value = await getSlot(rpcUrl()).catch(() => null)
     signers.value = signerList
     paused.value = gate
     const future = schedule.entries
@@ -300,6 +430,13 @@ async function load () {
       draft.value = state.proposalKind === 'resolve' ? [...state.proposalResults] : Array(state.gameCount).fill(null)
     }
     if (auth.wallet) await loadStanding()
+    if (auth.wallet && state.status === 'tallying' && state.settlementPath === 1 && !state.countStarted && signerList?.members.includes(auth.wallet)) {
+      try {
+        preview.value = await eventApi.totals(props.event.id)
+      } catch (err) {
+        previewError.value = err.message
+      }
+    }
     if (auth.wallet && state.status !== (props.event.chain?.status || 'open') && syncedFor !== `${props.event.id}:${state.status}`) {
       syncedFor = `${props.event.id}:${state.status}`
       eventApi.syncChain(props.event.id).then(() => emit('changed')).catch(() => {})
@@ -337,6 +474,28 @@ async function run (kind, task, message) {
   }
 }
 
+const signCountedTotals = () => run('sign-totals', async () => {
+  const counted = preview.value
+  if (!counted?.poster || !counted.totals) throw new Error('The counted totals are not loaded')
+  if (signatureLocks.value) {
+    const { value } = await latestBlockhash(rpcUrl())
+    const compiled = compileMessage(auth.wallet, [signTotalsLockIx({
+      signer: auth.wallet, poster: counted.poster, event: address.value, totals: counted.totals
+    })], value.blockhash)
+    const signed = await signTransaction(serializeUnsigned(compiled))
+    let locked
+    try {
+      locked = await eventApi.lockTotals(props.event.id, toBase64(signed))
+    } catch (err) {
+      if (/404|not found/i.test(err.message)) throw new Error('The server cannot lock these totals yet. Update the backend, then sign again.')
+      throw err
+    }
+    await waitForConfirmation(rpcUrl(), locked.signature, value.lastValidBlockHeight)
+    return
+  }
+  await send([signTotalsIx({ signer: auth.wallet, poster: counted.poster, event: address.value, totals: counted.totals })])
+}, signatureLocks.value ? 'Totals locked. The challenge window is open.' : 'Totals signed. The server locks them next.')
+
 const approveResults = () => run('resolve', async () => {
   const results = draft.value.join('')
   if (chain.value.proposalKind === 'resolve' && chain.value.approvals && chain.value.proposalResults !== results &&
@@ -348,21 +507,40 @@ const approveResults = () => run('resolve', async () => {
 
 const approveCancel = () => run('cancel', async () => {
   if (!confirm('Approve cancelling this event? Once both signers approve, every coupon is refunded.')) throw new Error('Approval cancelled')
-  await send([approveCancelIx({ signer: auth.wallet, admin: admin.value, event: address.value })])
+  const poster = chain.value.status === 'window' ? totals.value?.poster : undefined
+  await send([approveCancelIx({ signer: auth.wallet, admin: admin.value, event: address.value, poster })])
 }, 'Cancellation approved')
+
+const challenge = () => run('challenge', async () => {
+  const bond = sol(challengeBond.value)
+  if (!confirm(`Lock ${bond} to challenge these totals? If the recount finds the same totals, this bond pays the recount and the rest joins the pool.`)) {
+    throw new Error('Challenge cancelled')
+  }
+  await send([challengeIx({ challenger: auth.wallet, event: address.value })])
+}, 'Challenge locked. The recount has started.')
+
+const finalize = () => run('finalize', async () => {
+  await send([finalizeTotalsIx({ caller: auth.wallet, admin: admin.value, event: address.value, poster: totals.value.poster })])
+}, 'The event is settled from the signed totals')
+
+const counting = status => status === 'tallying' || status === 'recount'
 
 // Tallying is permissionless and resumable: each batch continues from the on-chain counter.
 const tally = () => run('tally', async () => {
-  const book = await getAccount(rpcUrl(), slipsPda(address.value))
   let state = await fetchEvent(rpcUrl(), address.value)
-  if (book) {
+  if (state.status === 'tallying' && state.settlementPath === 1 && !state.countStarted && (isAdmin.value || isSigner.value)) {
+    await send([openCountIx({ signer: auth.wallet, event: address.value })])
+    state = await fetchEvent(rpcUrl(), address.value)
+  }
+  // An event with a canopy has no slip book. Both are counted one coupon at a time.
+  if (state.canopy || await getAccount(rpcUrl(), slipsPda(address.value))) {
     do {
       progress.value = `Counting coupon ${state.tallied + 1} of ${state.couponCount}...`
       await scoreNextSlip({ config: auth.config, wallet: auth.wallet, admin: admin.value, event: address.value })
       const before = state.tallied
       state = await fetchEvent(rpcUrl(), address.value)
-      if (state.status === 'tallying' && state.tallied <= before) throw new Error('The count did not advance; reload and try again')
-    } while (state.status === 'tallying')
+      if (counting(state.status) && state.tallied <= before) throw new Error('The count did not advance; reload and try again')
+    } while (counting(state.status))
     return
   }
   const coupons = await eventCoupons(rpcUrl(), address.value)
@@ -373,8 +551,8 @@ const tally = () => run('tally', async () => {
     await send([computeBudgetIx(1_400_000), tallyIx({ admin: admin.value, event: address.value, coupons: batch })])
     const before = state.tallied
     state = await fetchEvent(rpcUrl(), address.value)
-    if (state.status === 'tallying' && state.tallied <= before) throw new Error('The count did not advance; reload and try again')
-  } while (state.status === 'tallying')
+    if (counting(state.status) && state.tallied <= before) throw new Error('The count did not advance; reload and try again')
+  } while (counting(state.status))
 }, 'Coupons counted and the event is settled')
 
 const expire = () => run('expire', () => send([expireEventIx({ caller: auth.wallet, admin: admin.value, event: address.value })]), 'The event is refundable')
@@ -396,7 +574,11 @@ const withdrawHouse = () => run('house', () => send([withdrawHouseIx({ admin: au
 const togglePause = () => run('pause', () => send([setPauseIx({ admin: auth.wallet, paused: !paused.value })]), paused.value ? 'Entries resumed' : 'Entries paused')
 
 watch(() => [props.event.id, auth.wallet], load)
-onMounted(load)
+onMounted(() => {
+  load()
+  clock = setInterval(() => { now.value = Math.floor(Date.now() / 1000) }, 30000)
+})
+onUnmounted(() => clearInterval(clock))
 </script>
 
 <style scoped>

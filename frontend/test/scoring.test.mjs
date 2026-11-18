@@ -27,8 +27,8 @@ test('a void result counts as a hit and the payout is one row times its rows', (
   const score = couponScore({ revealed: true, picks, gameCount: 3 }, event)
   assert.equal(score.best, 3)
   assert.deepEqual(score.lines, [
-    { correct: 3, rows: 1, each: 2000n },
-    { correct: 2, rows: 1, each: 1000n }
+    { correct: 3, rows: 1, each: 2000n, total: 1 },
+    { correct: 2, rows: 1, each: 1000n, total: 1 }
   ])
   assert.equal(couponPayout({ revealed: true, picks, gameCount: 3 }, event), 3000n)
   assert.equal(couponScore({ revealed: false, picks, gameCount: 3 }, event), null)

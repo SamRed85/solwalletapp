@@ -9,39 +9,44 @@
       </button>
     </div>
 
-    <div v-if="auth.wallet" class="me">
-      <span class="avatar">{{ initials(auth.displayName || auth.wallet) }}</span>
-      <div class="me-copy">
-        <div class="me-label">Your rank</div>
-        <div class="me-rank"><span>#</span> {{ me?.rank || '–' }}</div>
-      </div>
-      <div class="me-won">{{ me?.winningsLamports ? `+${formatSol(me.winningsLamports)}` : '—' }}</div>
-    </div>
-    <v-btn v-else class="mt-4" variant="outlined" :loading="auth.busy" @click="onLogin">Connect to see your rank</v-btn>
+    <v-btn v-if="!auth.wallet" class="mt-4" variant="outlined" :loading="auth.busy" @click="onLogin">Connect to see your rank</v-btn>
 
-    <v-progress-linear v-if="loading" indeterminate class="mt-4" />
-    <p v-else-if="failed" class="empty">The leaderboard could not be loaded. Restart the backend so this server has the new route.</p>
-    <p v-else-if="!rows.length" class="empty">No settled winnings in this period.</p>
-    <div v-for="(row, index) in rows" :key="row.wallet" class="player">
-      <span class="place" :class="placeClass(index)">{{ index + 1 }}.</span>
-      <span class="avatar">{{ initials(row.name || row.wallet) }}</span>
-      <div class="player-copy">
-        <div class="player-name">{{ row.name || shortAddress(row.wallet) }}</div>
-        <span class="hit">{{ row.bestCorrect }} of {{ row.gameCount }}</span>
-      </div>
-      <div class="player-won">
-        <div>+{{ formatSol(row.winningsLamports) }}</div>
-        <div class="coupons">{{ row.coupons }} coupon{{ row.coupons === 1 ? '' : 's' }}</div>
-      </div>
-    </div>
+    <TabReel :items="spans" :current="span" :drag="drag" :dragging="dragging">
+      <template #default="{ item }">
+        <div v-if="auth.wallet" class="me">
+          <span class="avatar">{{ initials(auth.displayName || auth.wallet) }}</span>
+          <div class="me-copy">
+            <div class="me-label">Your rank</div>
+            <div class="me-rank"><span>#</span> {{ boards[item.id]?.me?.rank || '–' }}</div>
+          </div>
+          <div class="me-won">{{ boards[item.id]?.me?.winningsLamports ? `+${formatSol(boards[item.id].me.winningsLamports)}` : '—' }}</div>
+        </div>
+        <v-progress-linear v-if="loading && !boards[item.id]" indeterminate class="mt-4" />
+        <p v-else-if="failed[item.id] && !boards[item.id]" class="empty">The leaderboard could not be loaded. Restart the backend so this server has the new route.</p>
+        <p v-else-if="boards[item.id] && !boards[item.id].rows.length" class="empty">No settled winnings in this period.</p>
+        <div v-for="(row, index) in boards[item.id]?.rows || []" :key="row.wallet" class="player">
+          <span class="place" :class="placeClass(index)">{{ index + 1 }}.</span>
+          <span class="avatar">{{ initials(row.name || row.wallet) }}</span>
+          <div class="player-copy">
+            <div class="player-name">{{ row.name || shortAddress(row.wallet) }}</div>
+            <span class="hit">{{ row.bestCorrect }} of {{ row.gameCount }}</span>
+          </div>
+          <div class="player-won">
+            <div>+{{ formatSol(row.winningsLamports) }}</div>
+            <div class="coupons">{{ row.coupons }} coupon{{ row.coupons === 1 ? '' : 's' }}</div>
+          </div>
+        </div>
+      </template>
+    </TabReel>
   </v-container>
 </template>
 
 <script setup>
 import { onMounted, ref, watch } from 'vue'
+import TabReel from '@/components/TabReel.vue'
+import { useTabSwipe } from '@/composables/useSwipeNav'
 import { eventApi } from '@/services/api'
-import { auth, login } from '@/stores/auth'
-import { notifyError } from '@/stores/notify'
+import { auth, openLogin } from '@/stores/auth'
 import { formatSol, shortAddress } from '@/utils/format'
 
 const spans = [
@@ -51,10 +56,10 @@ const spans = [
   { id: 'all', label: 'All' }
 ]
 const span = ref('week')
-const rows = ref([])
-const me = ref(null)
+const { drag, dragging } = useTabSwipe(span, spans)
+const boards = ref({})
 const loading = ref(false)
-const failed = ref(false)
+const failed = ref({})
 
 function initials (value) {
   return ((value || '').trim().slice(0, 2) || '•').toUpperCase()
@@ -64,33 +69,37 @@ function placeClass (index) {
   return ['gold', 'silver', 'bronze'][index] || ''
 }
 
-async function load () {
-  loading.value = true
+async function load (id = span.value) {
+  const visible = id === span.value && !boards.value[id]
+  if (visible) loading.value = true
   try {
-    const board = await eventApi.leaderboard(span.value)
-    rows.value = board.rows || []
-    me.value = board.me
-    failed.value = false
+    const next = await eventApi.leaderboard(id)
+    boards.value = { ...boards.value, [id]: { rows: next.rows || [], me: next.me || null } }
+    const nextFailed = { ...failed.value }
+    delete nextFailed[id]
+    failed.value = nextFailed
   } catch {
-    rows.value = []
-    me.value = null
-    failed.value = true
+    if (!boards.value[id]) failed.value = { ...failed.value, [id]: true }
   } finally {
-    loading.value = false
+    if (visible) loading.value = false
   }
 }
 
-async function onLogin () {
-  try {
-    await login()
-  } catch (error) {
-    notifyError(error)
-  }
+function refresh () {
+  boards.value = {}
+  failed.value = {}
+  for (const item of spans) load(item.id)
 }
 
-onMounted(load)
-watch(span, load)
-watch(() => auth.wallet, load)
+function onLogin () {
+  openLogin()
+}
+
+onMounted(refresh)
+watch(span, id => {
+  if (!boards.value[id]) load(id)
+})
+watch(() => auth.wallet, refresh)
 </script>
 
 <style scoped>

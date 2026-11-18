@@ -40,7 +40,7 @@ export const configApi = {
 
 export const authApi = {
   nonce: publicKey => data(api.post('/api/auth/nonce', { publicKey })),
-  login: (publicKey, nonce, signature) => data(api.post('/api/auth/login', { publicKey, nonce, signature })),
+  login: (publicKey, nonce, signature, signedMessage) => data(api.post('/api/auth/login', { publicKey, nonce, signature, signedMessage })),
   logout: () => api.post('/api/auth/logout'),
   me: () => data(api.get('/api/me')),
   updateProfile: displayName => data(api.put('/api/me', { displayName }))
@@ -65,6 +65,8 @@ export const eventApi = {
   setResults: (id, results) => data(api.post(`/api/events/${id}/results`, { results }, { timeout: 150000 })),
   payouts: id => data(api.get(`/api/events/${id}/payouts`)),
   projection: id => data(api.get(`/api/events/${id}/projection`)),
+  totals: id => data(api.get(`/api/events/${id}/totals`)),
+  lockTotals: (id, transaction) => data(api.post(`/api/events/${id}/totals/lock`, { transaction }, { timeout: 60000 })),
   refreshScores: id => data(api.post(`/api/events/${id}/projection/refresh`, null, { timeout: 45000 })),
   refreshOdds: id => data(api.post(`/api/events/${id}/odds/refresh`, null, { timeout: 90000 })),
   searchFixtures: (team, date, away, timezone) => data(api.get('/api/football/fixtures', { params: { team, date, away, timezone } })),
@@ -101,6 +103,10 @@ export const couponApi = {
 
 export const slipApi = {
   get: event => data(api.get('/api/slip-archive', { params: { event } })),
+  // Coupons from..to-1 only. A proof on an event with a canopy needs one chunk.
+  range: (event, from, to) => data(api.get('/api/slip-archive', { params: { event, from, to } })),
+  // One wallet's coupons, with the reveal, claim and refund of each.
+  mine: (event, owner) => data(api.get('/api/slip-archive', { params: { event, owner } })),
   ingest: signature => data(api.post('/api/slip-archive', { signature }))
 }
 

@@ -60,3 +60,26 @@ test('someone else\'s slip is not adopted', () => {
     row: { owner: 'SomeoneElse', index: 2, combinations: 1, commitment: 'ab' }
   }), null)
 })
+
+test('the coupon number is read from the confirmed transaction', async () => {
+  const { slipIndexFromLogs } = await import('../src/services/slipStatus.js')
+  const logs = [
+    'Program AaXA invoke [1]',
+    'Program log: Instruction: PlaceCanopySlip',
+    'Program log: slip-v1:EventAddress:41:SomeoneElse:1:ab',
+    'Program log: slip-v1:EventAddress:42:Owner111:3:cd'
+  ]
+  assert.equal(slipIndexFromLogs(logs, 'EventAddress', wallet, 'cd'), 42)
+  assert.equal(slipIndexFromLogs(logs, 'EventAddress', wallet, 'ab'), null)
+  assert.equal(slipIndexFromLogs(logs, 'OtherEvent', wallet, 'cd'), null)
+  assert.equal(slipIndexFromLogs(undefined, 'EventAddress', wallet, 'cd'), null)
+})
+
+test('a slip saved under its commitment has no number yet', async () => {
+  const { pendingSlipAddress, slipNumbered } = await import('../src/services/slipStatus.js')
+  const commitment = '07'.repeat(32)
+  assert.equal(slipNumbered({ slip: true, index: 7, address: pendingSlipAddress('EventAddress', commitment) }), false)
+  assert.equal(slipNumbered({ slip: true, index: 7, address: 'slip:EventAddress:7' }), true)
+  assert.equal(slipNumbered({ slip: true, index: 7, address: 'slip:EventAddress:17' }), false)
+  assert.equal(slipNumbered({ index: 7, address: 'CouponAccount' }), true)
+})

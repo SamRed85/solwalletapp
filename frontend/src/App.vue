@@ -2,13 +2,9 @@
   <v-app :class="{ 'glow-band': route.name === 'Leaderboard' }">
     <v-app-bar class="sol-bar" :class="{ 'is-phone': mobile }" color="transparent" elevation="0" :height="mobile ? 56 : 64">
       <v-app-bar-title>
-        <button v-if="couponOpen" type="button" class="bar-back" aria-label="Back to my coupons" @click="closeCoupon">
-          <v-icon icon="mdi-arrow-left" size="22" />
-          Back
-        </button>
-        <span v-else class="wordmark">Edge</span>
+        <span class="wordmark">Edge</span>
         <v-icon
-          v-if="mobile && !couponOpen" class="health-dot" size="8"
+          v-if="mobile" class="health-dot" size="8"
           :color="healthy === false ? 'error' : 'success'"
           :title="healthy === null ? 'Checking the backend' : healthy ? 'Backend healthy' : 'Backend unreachable'"
         >mdi-circle</v-icon>
@@ -60,11 +56,13 @@
     </v-app-bar>
 
     <v-main :class="{ 'has-phone-nav': mobile }">
-      <router-view v-slot="{ Component }">
-        <transition name="page" mode="out-in">
-          <component :is="Component" :key="route.path" />
-        </transition>
-      </router-view>
+      <div class="swipe-host" :class="{ 'is-dragging': dragging, 'is-settling': settling }" :style="swipeStyle">
+        <router-view v-slot="{ Component }">
+          <transition name="page" mode="out-in">
+            <component :is="Component" :key="route.path" />
+          </transition>
+        </router-view>
+      </div>
     </v-main>
 
     <v-bottom-navigation v-if="mobile" :model-value="navValue" class="phone-nav" grow :height="60">
@@ -100,6 +98,8 @@
       </v-card>
     </v-dialog>
 
+    <WalletDialog />
+
     <v-snackbar v-model="snackbar.show" :color="snackbar.color" location="top" timeout="5000">
       {{ snackbar.text }}
       <template #actions>
@@ -115,7 +115,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { useDisplay, useTheme } from 'vuetify'
 import { authApi, healthApi } from '@/services/api'
 import { startAutoReveal } from '@/services/autoReveal'
-import { auth, login, logout, setProfile } from '@/stores/auth'
+import WalletDialog from '@/components/WalletDialog.vue'
+import { useSwipeNav } from '@/composables/useSwipeNav'
+import { auth, logout, openLogin, setProfile } from '@/stores/auth'
 import { loadRates } from '@/stores/currency'
 import { notify, notifyError, snackbar } from '@/stores/notify'
 import { shortAddress } from '@/utils/format'
@@ -155,11 +157,21 @@ const menuItems = computed(() => [
 const navValue = computed(() => phoneItems.find(item => item.to === route.path)?.to ?? route.path)
 
 const couponOpen = computed(() => route.name === 'MyCoupons' && !!route.query.coupon)
-
-function closeCoupon () {
-  if (window.history.state?.back) router.back()
-  else router.replace({ path: '/coupons' })
-}
+const { offset, dragging, settling } = useSwipeNav({
+  enabled: () => mobile.value && !needsName.value,
+  canBack: () => route.name === 'Event',
+  onBack () {
+    if (window.history.state?.back) router.back()
+    else if (couponOpen.value) router.replace({ path: '/coupons' })
+    else router.push('/')
+  }
+})
+// A transform here makes position:fixed children, including the pay dock, stick
+// to the page instead of the screen. The back gesture is the only swipe that
+// moves the page, and only while the finger is actually dragging it.
+const swipeStyle = computed(() => (
+  mobile.value && offset.value ? { transform: `translate3d(${offset.value}px, 0, 0)` } : undefined
+))
 
 function guard (item) {
   if (item.auth && !auth.wallet) onLogin()
@@ -186,13 +198,8 @@ function toggleTheme () {
   localStorage.setItem('theme', next)
 }
 
-async function onLogin () {
-  try {
-    await login()
-    notify('Signed in')
-  } catch (error) {
-    notifyError(error)
-  }
+function onLogin () {
+  openLogin()
 }
 
 async function saveName () {
@@ -313,29 +320,21 @@ button.bar-link {
   text-overflow: ellipsis;
 }
 
-.bar-back {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px 6px 4px;
-  border: 0;
-  border-radius: var(--radius-pill);
-  background: none;
-  color: rgb(var(--v-theme-on-surface));
-  font: inherit;
-  font-size: var(--fs-body);
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.bar-back:focus-visible {
-  outline: 2px solid rgb(var(--v-theme-primary));
-  outline-offset: 2px;
-}
-
 .health-dot {
   margin-left: 6px;
   vertical-align: middle;
+}
+
+.swipe-host.is-dragging {
+  touch-action: none;
+}
+
+.swipe-host.is-settling {
+  transition: transform 180ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .swipe-host.is-settling { transition: none; }
 }
 
 .sol-bar.is-phone :deep(.v-toolbar__content) {

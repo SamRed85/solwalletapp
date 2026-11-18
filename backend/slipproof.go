@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,6 +99,67 @@ func compactProof(proof [][]byte) [][]byte {
 	return proof[:end]
 }
 
+// canopyChunk is the range of coupons that share the bottom proof hashes with index.
+func canopyChunk(index uint32, levels int) (from, to uint32) {
+	from = index >> levels << levels
+	return from, from + 1<<levels
+}
+
+// chunkLeaves lays the records of one chunk out by position. A missing record stays nil,
+// which the proof treats as the empty leaf.
+func chunkLeaves(records []slipRecord, from uint32, levels int, leaf func(slipRecord) []byte) [][]byte {
+	leaves := make([][]byte, 1<<levels)
+	for _, record := range records {
+		if record.Index < from || record.Index-from >= uint32(len(leaves)) {
+			continue
+		}
+		leaves[record.Index-from] = leaf(record)
+	}
+	return leaves
+}
+
+// bottomProof is what a client sends on an event with a canopy: the bottom hashes of the
+// full proof. They never leave the coupon's chunk, and the program stores the rest.
+func bottomProof(records []slipRecord, index uint32, levels int, leaf func(slipRecord) []byte) [][]byte {
+	from, _ := canopyChunk(index, levels)
+	return sparseProof(chunkLeaves(records, from, levels, leaf), index-from)[:levels]
+}
+
+// revealArg is the program's RevealArg in wire order.
+func revealArg(index uint32, owner []byte, combinations uint32, picks []byte, nonce uint64, commitment, colors []byte) []byte {
+	data := append(putU32(index), owner...)
+	data = append(data, putU32(combinations)...)
+	data = append(data, picks...)
+	data = append(data, putU64(nonce)...)
+	data = append(data, commitment...)
+	return append(data, colorsArg(colors)...)
+}
+
+func appendProof(data []byte, proof [][]byte) []byte {
+	data = append(data, putU32(uint32(len(proof)))...)
+	for _, sibling := range proof {
+		data = append(data, sibling...)
+	}
+	return data
+}
+
+// eventCanopy reads how many proof hashes a slip of this event sends. Zero is an event from
+// before the canopy.
+func (a *App) eventCanopy(ctx context.Context, address string) (int, error) {
+	if a.fetchAccount == nil {
+		return 0, errors.New("no Solana connection")
+	}
+	account, err := a.fetchAccount(ctx, address)
+	if err != nil {
+		return 0, err
+	}
+	chain, err := decodeChainEvent(account, a.cfg.ProgramID)
+	if err != nil {
+		return 0, err
+	}
+	return chain.Canopy, nil
+}
+
 func (a *App) armSlipReveal(w http.ResponseWriter, r *http.Request, wallet, coupon, ciphertext string) {
 	parts := strings.Split(coupon, ":")
 	if len(parts) != 3 || !isValidWallet(parts[1]) {
@@ -114,7 +177,7 @@ func (a *App) armSlipReveal(w http.ResponseWriter, r *http.Request, wallet, coup
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
-	view, err := a.slipArchive(ctx, parts[1])
+	view, err := a.slipArchiveRange(ctx, parts[1], uint32(index64), uint32(index64)+1)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "could not read the slip archive")
 		return
@@ -170,7 +233,18 @@ func (a *App) publishSlip(ctx context.Context, item scheduledReveal) {
 		a.finishReveal(ctx, item.Coupon, "expired", "the reveal window closed", true)
 		return
 	}
-	view, err := a.slipArchive(ctx, item.Event)
+	levels, err := a.eventCanopy(ctx, item.Event)
+	if err != nil {
+		a.retryReveal(ctx, item, "the vault event could not be read")
+		return
+	}
+	var view slipArchiveView
+	if levels > 0 {
+		from, to := canopyChunk(item.Index, levels)
+		view, err = a.slipArchiveRange(ctx, item.Event, from, to)
+	} else {
+		view, err = a.slipArchive(ctx, item.Event)
+	}
 	if err != nil {
 		a.retryReveal(ctx, item, "could not read the slip archive")
 		return
@@ -209,43 +283,43 @@ func (a *App) publishSlip(ctx context.Context, item scheduledReveal) {
 		a.finishReveal(ctx, item.Coupon, "rejected", "the stored picks do not match this coupon", true)
 		return
 	}
-	nodes := revealNodes(view.Reveals)
-	for int(item.Index) >= len(nodes) {
-		nodes = append(nodes, nil)
-	}
-	proof := compactProof(sparseProof(nodes, item.Index))
 	program, err := base58Decode(a.cfg.ProgramID)
 	eventKey, err2 := base58Decode(item.Event)
 	if err != nil || err2 != nil {
 		a.retryReveal(ctx, item, "the event address is invalid")
 		return
 	}
-	slips, err := findPDA([][]byte{[]byte("slips"), eventKey}, program)
+	arg := revealArg(item.Index, owner, item.Combinations, picks, revealNonce, commitment, colors)
+	// The tree account is the canopy on a new event and the slip book on an older one.
+	// Either way the instruction takes the keeper, the event, and that account.
+	seed, data := "slips", revealSlipData(arg, item.Index, view)
+	if levels > 0 {
+		seed, data = "canopy", revealCanopyData(arg, item.Index, view, levels)
+	}
+	slips, err := findPDA([][]byte{[]byte(seed), eventKey}, program)
 	if err != nil {
 		a.retryReveal(ctx, item, err.Error())
 		return
-	}
-	data := append(ixDisc("reveal_slip"), putU32(item.Index)...)
-	data = append(data, owner...)
-	data = append(data, putU32(item.Combinations)...)
-	data = append(data, picks...)
-	data = append(data, putU64(revealNonce)...)
-	data = append(data, commitment...)
-	data = append(data, colorsArg(colors)...)
-	data = append(data, putU32(uint32(len(proof)))...)
-	for _, sibling := range proof {
-		data = append(data, sibling...)
 	}
 	hash, err := a.rpc.latestBlockhash(ctx)
 	if err != nil {
 		a.retryReveal(ctx, item, "could not read a recent blockhash")
 		return
 	}
-	raw, err := signLegacy(a.keeper, [][]byte{slips}, [][]byte{eventKey, program}, []ixSpec{{
-		program: 3, accounts: []int{0, 2, 1}, data: data,
-	}}, hash)
+	var raw []byte
+	if levels > 0 {
+		raw, err = revealCanopyTx(a.keeper, slips, eventKey, program, data, hash)
+	} else {
+		raw, err = signLegacy(a.keeper, [][]byte{slips}, [][]byte{eventKey, program}, []ixSpec{{
+			program: 3, accounts: []int{0, 2, 1}, data: data,
+		}}, hash)
+	}
 	if err != nil {
 		a.retryReveal(ctx, item, err.Error())
+		return
+	}
+	if len(raw) > maxTransactionBytes {
+		a.retryReveal(ctx, item, "the reveal transaction is too large")
 		return
 	}
 	if err := a.rpc.simulate(ctx, raw); err != nil {
@@ -265,4 +339,33 @@ func (a *App) publishSlip(ctx context.Context, item scheduledReveal) {
 		_, _ = a.ingestSlipLogs(ctx, signature, logs)
 	}
 	a.finishReveal(ctx, item.Coupon, "revealed", "", true)
+}
+
+// revealSlipData is reveal_slip on an event from before the canopy: one proof, cut where
+// the rest of the tree is empty.
+func revealSlipData(arg []byte, index uint32, view slipArchiveView) []byte {
+	nodes := revealNodes(view.Reveals)
+	for int(index) >= len(nodes) {
+		nodes = append(nodes, nil)
+	}
+	data := append(ixDisc("reveal_slip"), arg...)
+	return appendProof(data, compactProof(sparseProof(nodes, index)))
+}
+
+// revealCanopyTx signs reveal_canopy_slip behind the compute limit.
+func revealCanopyTx(keeper ed25519.PrivateKey, canopy, event, program, data, blockhash []byte) ([]byte, error) {
+	// 0 keeper, 1 canopy, 2 event, 3 compute budget, 4 program.
+	return signLegacy(keeper, [][]byte{canopy}, [][]byte{event, mustDecode(computeBudgetProgram), program}, []ixSpec{
+		{program: 3, data: unitLimit},
+		{program: 4, accounts: []int{0, 2, 1}, data: data},
+	}, blockhash)
+}
+
+// revealCanopyData is reveal_canopy_slip. The entry proof shows the coupon was placed and
+// the reveal proof shows its reveal leaf is still empty. Each is the bottom hashes only,
+// built from the coupon's own chunk.
+func revealCanopyData(arg []byte, index uint32, view slipArchiveView, levels int) []byte {
+	data := append(ixDisc("reveal_canopy_slip"), arg...)
+	data = appendProof(data, bottomProof(view.Entries, index, levels, entryLeafOf))
+	return appendProof(data, bottomProof(view.Reveals, index, levels, revealLeafOf))
 }

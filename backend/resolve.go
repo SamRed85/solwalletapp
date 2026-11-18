@@ -21,10 +21,10 @@ const (
 	proposalCancel             = 2
 
 	// Auto resolve uses scores already saved by the timed refreshes. It calls the
-	// feed only when a saved score is missing or still in play: five tries, five
+	// feed only when a saved score is missing or still in play: ten tries, thirty
 	// minutes apart, and then it stops and tells the admin.
-	resolveScoreFetches = 5
-	resolveScoreGap     = 5 * time.Minute
+	resolveScoreFetches = 10
+	resolveScoreGap     = 30 * time.Minute
 )
 
 type chainProposal struct {
@@ -303,9 +303,10 @@ func savedScoreState(games []Game, saved map[int]fixtureState) (settled, blocked
 }
 
 func scoreGiveUpMessage(wait string) string {
-	message := "Auto resolve stopped after 5 tries, 5 minutes apart. Set the results by hand."
+	gap := int(resolveScoreGap / time.Minute)
+	message := fmt.Sprintf("Auto resolve stopped after %d tries, %d minutes apart. Set the results by hand.", resolveScoreFetches, gap)
 	if wait != "" {
-		message = "Auto resolve stopped after 5 tries, 5 minutes apart: " + wait + ". Set the results by hand."
+		message = fmt.Sprintf("Auto resolve stopped after %d tries, %d minutes apart: %s. Set the results by hand.", resolveScoreFetches, gap, wait)
 	}
 	return message
 }

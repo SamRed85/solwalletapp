@@ -2,13 +2,14 @@ use std::convert::TryFrom;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
+use anchor_lang::{AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
+use predictions::canopy::{self, Canopy};
 use predictions::{ColorArg, CreateEventArgs, Escrow, Event, EventStatus, LeagueVault, RadAccount, RevealArg, SlipArg, SlipBook, TierArg, UpgradeCouncil};
 use solana_program_error::ProgramResult;
 use solana_program_test::{processor, ProgramTest, ProgramTestContext};
 use solana_sdk::{
-    account_info::AccountInfo, clock::Clock, instruction::Instruction, pubkey::Pubkey, signature::Keypair, signer::Signer,
+    account_info::AccountInfo, clock::Clock, instruction::{AccountMeta, Instruction}, pubkey::Pubkey, signature::Keypair, signer::Signer,
     system_instruction, transaction::Transaction,
 };
 
@@ -73,6 +74,8 @@ fn event_args(nonce: u64, deadline: i64) -> CreateEventArgs {
         kind: predictions::KIND_SOL,
         min_rows: 1,
         max_coupons: 250_000,
+        dispute_min: 10,
+        dispute_max: 50,
     }
 }
 
@@ -110,6 +113,42 @@ fn signers_of(event: &Pubkey) -> Pubkey {
     pda(&[b"signers", event.as_ref()])
 }
 
+fn canopy_of(event: &Pubkey) -> Pubkey {
+    pda(&[b"canopy", event.as_ref()])
+}
+
+async fn patch_event(context: &mut ProgramTestContext, event: Pubkey, edit: impl FnOnce(&mut Event)) {
+    let mut account = context.banks_client.get_account(event).await.unwrap().unwrap();
+    let mut stored = Event::try_deserialize(&mut account.data.as_slice()).unwrap();
+    edit(&mut stored);
+    let mut bytes = Vec::new();
+    stored.try_serialize(&mut bytes).unwrap();
+    account.data[..bytes.len()].copy_from_slice(&bytes);
+    context.set_account(&event, &account.into());
+}
+
+/// An event created before the canopy has no canopy byte. Its slips send the whole proof.
+async fn as_older_event(context: &mut ProgramTestContext, event: Pubkey) {
+    patch_event(context, event, |stored| {
+        stored.canopy = 0;
+        stored.canopy_bump = 0;
+        // Events created before signed totals keep the on-chain count.
+        stored.settlement_path = 0;
+    })
+    .await;
+}
+
+/// The 24-hour fallback: with no locked totals, the on-chain count may start.
+async fn open_fallback(context: &mut ProgramTestContext, event: Pubkey) {
+    let stored = load_event(context, event).await;
+    if stored.settlement_path == 0 || stored.count_started == 1 {
+        return;
+    }
+    let mut next = clock(context).await;
+    next.unix_timestamp = i64::from(stored.approved_at) + 24 * 60 * 60;
+    context.set_sysvar(&next);
+}
+
 fn create_ix(admin: Pubkey, other: Pubkey, nonce: u64, deadline: i64) -> (Instruction, Pubkey, Pubkey) {
     create_kind_ix(admin, other, nonce, deadline, predictions::KIND_SOL)
 }
@@ -134,6 +173,7 @@ fn create_kind_ix(admin: Pubkey, other: Pubkey, nonce: u64, deadline: i64, kind:
             gate: gate_of(&admin),
             kinds: kinds_of(&admin),
             league: league_vault(),
+            canopy: canopy_of(&event),
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),
@@ -222,6 +262,14 @@ async fn load_council(context: &mut ProgramTestContext, council: Pubkey) -> Upgr
     UpgradeCouncil::try_deserialize(&mut account.data.as_slice()).unwrap()
 }
 
+fn open_count_ix(signer: Pubkey, event: Pubkey) -> Instruction {
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::OpenCount { signer, event, signers: signers_of(&event) }.to_account_metas(None),
+        data: predictions::instruction::OpenCount {}.data(),
+    }
+}
+
 fn approve_ix(signer: Pubkey, admin: Pubkey, event: Pubkey, results: Vec<u8>) -> Instruction {
     Instruction {
         program_id: predictions::ID,
@@ -280,6 +328,7 @@ async fn resolve(context: &mut ProgramTestContext, admin: &Keypair, other: &Keyp
     send(context, admin, approve_ix(admin.pubkey(), admin.pubkey(), event, results.clone())).await.unwrap();
     fund(context, &other.pubkey(), 10_000_000).await;
     send(context, other, approve_ix(other.pubkey(), admin.pubkey(), event, results)).await.unwrap();
+    open_fallback(context, event).await;
     send(context, admin, tally_ix(admin.pubkey(), event, coupons)).await.unwrap();
 }
 
@@ -354,6 +403,7 @@ async fn winner_is_paid_once_from_the_vault() {
     fund(&mut context, &other.pubkey(), 10_000_000).await;
     send(&mut context, &other, approve_ix(other.pubkey(), admin.pubkey(), event, vec![b'1'; 7])).await.unwrap();
     assert_eq!(load_event(&mut context, event).await.status, EventStatus::Tallying);
+    open_fallback(&mut context, event).await;
     send(&mut context, &admin, tally_ix(admin.pubkey(), event, &[])).await.unwrap();
     assert_eq!(load_event(&mut context, event).await.status, EventStatus::Tallying, "settlement waits for every coupon");
     send(&mut context, &admin, tally_ix(admin.pubkey(), event, &[coupon])).await.unwrap();
@@ -519,6 +569,7 @@ async fn forwarding_rollover_leaves_unclaimed_winnings() {
             gate: gate_of(&admin.pubkey()),
             kinds: kinds_of(&admin.pubkey()),
             league: league_vault(),
+            canopy: canopy_of(&event),
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),
@@ -694,6 +745,7 @@ async fn batched_tally_settles_a_full_thirteen_game_event() {
             gate: gate_of(&admin.pubkey()),
             kinds: kinds_of(&admin.pubkey()),
             league: league_vault(),
+            canopy: canopy_of(&event),
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),
@@ -737,6 +789,7 @@ async fn batched_tally_settles_a_full_thirteen_game_event() {
         send(&mut context, &other, approve_cancel_ix(other.pubkey(), admin.pubkey(), event)).await.is_err(),
         "locked results cannot be cancelled"
     );
+    open_fallback(&mut context, event).await;
     assert!(
         send(&mut context, &player, reveal_picks_ix(player.pubkey(), admin.pubkey(), nonce, 1, away)).await.is_err(),
         "no reveal after results are locked"
@@ -1065,6 +1118,7 @@ async fn one_slip_pays_no_coupon_account() {
     let now = clock(&mut context).await.unix_timestamp;
     let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), 90, now + 30);
     send(&mut context, &admin, create).await.unwrap();
+    as_older_event(&mut context, event).await;
 
     let picks = all_home();
     let commitment = predictions::coupon_commitment(&player.pubkey(), &picks, REVEAL_NONCE);
@@ -1140,6 +1194,7 @@ async fn a_slip_claim_pays_the_owner_once() {
     let now = clock(&mut context).await.unix_timestamp;
     let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), 91, now + 30);
     send(&mut context, &admin, create).await.unwrap();
+    as_older_event(&mut context, event).await;
 
     let picks = all_home();
     let commitment = predictions::coupon_commitment(&player.pubkey(), &picks, REVEAL_NONCE);
@@ -1188,6 +1243,7 @@ async fn an_unrevealed_slip_cannot_win() {
     let now = clock(&mut context).await.unix_timestamp;
     let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), 92, now + 30);
     send(&mut context, &admin, create).await.unwrap();
+    as_older_event(&mut context, event).await;
 
     let picks = all_home();
     let hidden_picks = [0b100u8; 13];
@@ -1247,6 +1303,7 @@ async fn a_cancelled_slip_refunds_its_owner_once() {
     let now = clock(&mut context).await.unix_timestamp;
     let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), 93, now + 3_600);
     send(&mut context, &admin, create).await.unwrap();
+    as_older_event(&mut context, event).await;
     let reserve = load_event(&mut context, event).await.rent_reserve;
     let picks = all_home();
     let commitment = predictions::coupon_commitment(&player.pubkey(), &picks, REVEAL_NONCE);
@@ -1320,6 +1377,22 @@ fn colored_hashes_match_the_keeper() {
     );
 }
 
+/// The keeper test and the browser test pin the same two hashes for a canopy proof.
+#[test]
+fn canopy_hashes_match_the_keeper() {
+    let owner = Pubkey::new_from_array([1; 32]);
+    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    // Coupons 1024 to 1029 are the first six of the second chunk.
+    let leaves: Vec<[u8; 32]> = (1024u32..1030).map(|index| predictions::slip_leaf(index, &owner, 1, &[index as u8; 32])).collect();
+    let proof = bottom_proof(&leaves, 3);
+    assert_eq!(proof.len(), 10);
+    assert_eq!(
+        hex(&predictions::canopy::fold(1027, &leaves[3], &proof)),
+        "6dc83f88ac175a33282aed66fd901da954f9fd9bd97b66c62a78d24bf78ab65d"
+    );
+    assert_eq!(hex(&proof[1]), "8f181aec88bc669959be78fe4878bdf1a7b7cfec7eb7da2a16df616ca7f8b93d");
+}
+
 #[tokio::test]
 async fn a_colored_slip_pays_only_its_kept_rows() {
     let mut context = start().await;
@@ -1341,6 +1414,7 @@ async fn a_colored_slip_pays_only_its_kept_rows() {
     let (mut create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), nonce, deadline);
     create.data = predictions::instruction::CreateEvent { args }.data();
     send(&mut context, &admin, create).await.unwrap();
+    as_older_event(&mut context, event).await;
 
     // Every outcome on seven games is 2,187 rows. Exactly six home picks keeps 14 of them,
     // none of which is the all-home row that the full frame would also contain.
@@ -1472,6 +1546,7 @@ async fn a_league_event_pays_the_collected_pool_in_rad() {
             gate: gate_of(&admin.pubkey()),
             kinds: kinds_of(&admin.pubkey()),
             league: league_vault(),
+            canopy: canopy_of(&league_event),
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),
@@ -1486,23 +1561,16 @@ async fn a_league_event_pays_the_collected_pool_in_rad() {
     let drained_league = LeagueVault::try_deserialize(&mut drained.data.as_slice()).unwrap();
     assert_eq!(drained.lamports, drained_league.rent_reserve);
 
-    let stranger_place = place_slip_ix(
+    let stranger_place = place_canopy_ix(
         stranger.pubkey(),
         admin.pubkey(),
         95,
         SlipArg { commitment: predictions::coupon_commitment(&stranger.pubkey(), &picks, REVEAL_NONCE), combinations: 1 },
-        empty_proof(),
     );
     assert!(send(&mut context, &stranger, stranger_place).await.is_err(), "a wallet with no RAD cannot enter");
 
     let before = context.banks_client.get_balance(player.pubkey()).await.unwrap();
-    send(
-        &mut context,
-        &player,
-        place_slip_ix(player.pubkey(), admin.pubkey(), 95, SlipArg { commitment, combinations: 1 }, empty_proof()),
-    )
-    .await
-    .unwrap();
+    send(&mut context, &player, place_canopy_ix(player.pubkey(), admin.pubkey(), 95, SlipArg { commitment, combinations: 1 })).await.unwrap();
     let after_entry = context.banks_client.get_balance(player.pubkey()).await.unwrap();
     assert!(before - after_entry < 10_000_000, "a league entry spends RAD, not the SOL stake");
     let spent = RadAccount::try_deserialize(
@@ -1514,29 +1582,18 @@ async fn a_league_event_pays_the_collected_pool_in_rad() {
 
     set_clock(&mut context, league_deadline + 1);
     let reveal = RevealArg { index: 0, owner: player.pubkey(), combinations: 1, picks, nonce: REVEAL_NONCE, commitment, colors: vec![] };
-    send(&mut context, &player, reveal_slip_ix(player.pubkey(), admin.pubkey(), 95, reveal.clone(), empty_proof())).await.unwrap();
+    send(&mut context, &player, reveal_canopy_ix(player.pubkey(), admin.pubkey(), 95, reveal.clone(), bottom_proof(&[], 0), bottom_proof(&[], 0))).await.unwrap();
     set_clock(&mut context, league_deadline + 20);
     send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), league_event, vec![b'1'; 7])).await.unwrap();
     send(&mut context, &other, approve_ix(other.pubkey(), admin.pubkey(), league_event, vec![b'1'; 7])).await.unwrap();
-    send(
-        &mut context,
-        &player,
-        score_slip_ix(player.pubkey(), admin.pubkey(), 95, reveal.clone(), true, empty_proof(), empty_proof(), empty_proof()),
-    )
-    .await
-    .unwrap();
+    open_fallback(&mut context, league_event).await;
+    send(&mut context, &player, score_canopy_ix(player.pubkey(), admin.pubkey(), 95, reveal.clone(), true, bottom_proof(&[], 0))).await.unwrap();
     let league_settled = load_event(&mut context, league_event).await;
     assert_eq!(league_settled.per_winner[6], 10_000_000);
     assert_eq!(league_settled.house, 0);
     assert_eq!(league_settled.league_cut, 0);
     let claim_before = context.banks_client.get_balance(player.pubkey()).await.unwrap();
-    send(
-        &mut context,
-        &player,
-        claim_slip_ix(player.pubkey(), admin.pubkey(), 95, reveal, empty_proof(), empty_proof(), empty_proof()),
-    )
-    .await
-    .unwrap();
+    send(&mut context, &player, claim_canopy_ix(player.pubkey(), admin.pubkey(), 95, reveal, bottom_proof(&[], 0))).await.unwrap();
     let claim_after = context.banks_client.get_balance(player.pubkey()).await.unwrap();
     assert!(claim_after > claim_before, "the league vault pays the winner in SOL");
     let left = context.banks_client.get_account(league_event_vault).await.unwrap().unwrap();
@@ -1609,4 +1666,860 @@ async fn rollover_stays_with_its_event_type() {
     set_clock(&mut context, now + 150);
     resolve(&mut context, &admin, &other, event_w4, vec![b'2'; 7], &[coupon_w4]).await;
     assert!(send(&mut context, &admin, forward_ix(admin.pubkey(), 45, 43)).await.is_err(), "Wildcard rollover cannot move to a Saturday event");
+}
+
+fn place_canopy_ix(player: Pubkey, admin: Pubkey, nonce: u64, slip: SlipArg) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::PlaceCanopySlip {
+            player,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            canopy: canopy_of(&event),
+            gate: gate_of(&admin),
+            rad: rad_of(&player),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::PlaceCanopySlip { slip }.data(),
+    }
+}
+
+fn reveal_canopy_ix(caller: Pubkey, admin: Pubkey, nonce: u64, reveal: RevealArg, entry_proof: Vec<[u8; 32]>, reveal_proof: Vec<[u8; 32]>) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::RevealCanopySlip { caller, event, canopy: canopy_of(&event) }.to_account_metas(None),
+        data: predictions::instruction::RevealCanopySlip { reveal, entry_proof, reveal_proof }.data(),
+    }
+}
+
+fn score_canopy_ix(caller: Pubkey, admin: Pubkey, nonce: u64, reveal: RevealArg, revealed: bool, reveal_proof: Vec<[u8; 32]>) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::ScoreCanopySlip {
+            caller,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            canopy: canopy_of(&event),
+            schedule: schedule_of(&admin),
+            kinds: kinds_of(&admin),
+            league: league_vault(),
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::ScoreCanopySlip { reveal, revealed, reveal_proof }.data(),
+    }
+}
+
+fn claim_canopy_ix(owner: Pubkey, admin: Pubkey, nonce: u64, reveal: RevealArg, reveal_proof: Vec<[u8; 32]>) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::ClaimCanopySlip { owner, event, vault: pda(&[b"vault", event.as_ref()]), canopy: canopy_of(&event) }.to_account_metas(None),
+        data: predictions::instruction::ClaimCanopySlip { reveal, reveal_proof }.data(),
+    }
+}
+
+fn refund_canopy_ix(owner: Pubkey, admin: Pubkey, nonce: u64, index: u32, combinations: u32, commitment: [u8; 32], entry_proof: Vec<[u8; 32]>) -> Instruction {
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::RefundCanopySlip {
+            owner,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            canopy: canopy_of(&event),
+            rad: rad_of(&owner),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::RefundCanopySlip { index, combinations, commitment, entry_proof }.data(),
+    }
+}
+
+/// The ten hashes a client sends on an event with a canopy: the bottom of the full proof.
+/// They stay inside one chunk of 1,024 coupons, so `leaves` may be that chunk alone.
+fn bottom_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
+    tree_proof(leaves, index)[..predictions::CANOPY_LEVELS as usize].to_vec()
+}
+
+/// The depth-20 root an older event would hold for the same leaves.
+fn full_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    predictions::slip_fold(0, leaves.first().unwrap_or(&predictions::slip_zero(0)), &tree_proof(leaves, 0))
+}
+
+struct StoredCanopy {
+    data: Vec<u8>,
+    lamports: u64,
+}
+
+impl StoredCanopy {
+    fn tree(&self) -> Canopy {
+        Canopy::open(&self.data, 20).unwrap()
+    }
+
+    fn root(&self, tree: usize) -> [u8; 32] {
+        self.tree().root(&self.data, tree)
+    }
+}
+
+async fn load_canopy(context: &mut ProgramTestContext, event: Pubkey) -> StoredCanopy {
+    let account = context.banks_client.get_account(canopy_of(&event)).await.unwrap().unwrap();
+    assert_eq!(account.owner, predictions::ID, "the program owns the canopy");
+    StoredCanopy { data: account.data, lamports: account.lamports }
+}
+
+fn custom_code(result: Result<(), solana_program_test::BanksClientError>) -> Option<u32> {
+    match result {
+        Err(solana_program_test::BanksClientError::TransactionError(solana_sdk::transaction::TransactionError::InstructionError(
+            _,
+            solana_sdk::instruction::InstructionError::Custom(code),
+        ))) => Some(code),
+        _ => None,
+    }
+}
+
+fn code_of(error: predictions::PredError) -> Option<u32> {
+    Some(u32::from(error))
+}
+
+/// Bytes on the wire with one signature and both compute-budget instructions a wallet adds.
+fn wire_len(payer: &Pubkey, instruction: &Instruction) -> usize {
+    let limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+    let price = ComputeBudgetInstruction::set_compute_unit_price(1_000);
+    let message = solana_sdk::message::Message::new(&[limit, price, instruction.clone()], Some(payer));
+    bincode::serialize(&Transaction::new_unsigned(message)).unwrap().len()
+}
+
+const WIRE_LIMIT: usize = 1232;
+/// Rent of one coupon's share of a canopy record: 256 bytes for 1,024 coupons.
+const STORAGE_FEE: u64 = 1_740;
+
+#[tokio::test]
+async fn a_canopy_slip_sends_ten_hashes_and_pays_once() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let winner = Keypair::new();
+    let hidden = Keypair::new();
+    let stranger = Keypair::new();
+    for player in [&winner, &hidden, &stranger] {
+        fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    }
+    fund(&mut context, &other.pubkey(), 10_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let nonce = 120u64;
+    let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), nonce, now + 30);
+    send(&mut context, &admin, create).await.unwrap();
+
+    let rent = context.banks_client.get_rent().await.unwrap();
+    assert_eq!(load_event(&mut context, event).await.canopy, predictions::CANOPY_LEVELS, "a new event has a canopy");
+    let created = load_canopy(&mut context, event).await;
+    assert_eq!(created.data.len(), 704);
+    assert_eq!(created.lamports, rent.minimum_balance(704), "the creator pays for the first chunk");
+    assert_eq!(created.root(canopy::ENTRY), predictions::slip_empty_root());
+    assert_eq!(Canopy::event(&created.data), event.to_bytes());
+
+    let picks = all_home();
+    let slips = [
+        colored_reveal(0, winner.pubkey(), 1, picks, vec![]),
+        colored_reveal(1, hidden.pubkey(), 1, picks, vec![]),
+        colored_reveal(2, winner.pubkey(), 1, picks, vec![]),
+    ];
+    let players = [&winner, &hidden, &winner];
+    let entries: Vec<[u8; 32]> = slips.iter().map(|slip| predictions::slip_leaf(slip.index, &slip.owner, slip.combinations, &slip.commitment)).collect();
+
+    let full_proof_place = place_slip_ix(winner.pubkey(), admin.pubkey(), nonce, SlipArg { commitment: slips[0].commitment, combinations: 1 }, empty_proof());
+    assert_eq!(custom_code(send(&mut context, &winner, full_proof_place).await), code_of(predictions::PredError::WrongTree), "a new event refuses the full-proof place");
+    assert!(context.banks_client.get_account(slips_of(&event)).await.unwrap().is_none(), "no slip book is created next to a canopy");
+
+    for (slip, player) in slips.iter().zip(players) {
+        let arg = SlipArg { commitment: slip.commitment, combinations: slip.combinations };
+        send(&mut context, player, place_canopy_ix(player.pubkey(), admin.pubkey(), nonce, arg)).await.unwrap();
+    }
+    let placed = load_canopy(&mut context, event).await;
+    assert_eq!(Canopy::count(&placed.data), 3);
+    assert_eq!(placed.root(canopy::ENTRY), full_root(&entries), "the canopy root is the depth-20 root of the same leaves");
+    assert_eq!(placed.lamports, created.lamports + 3 * STORAGE_FEE, "each coupon pays its share of the next record");
+    assert_eq!(placed.data.len(), 704);
+    let stored = load_event(&mut context, event).await;
+    assert_eq!(stored.coupon_count, 3);
+    assert_eq!(stored.sales, 600_000_000);
+    assert_eq!(context.banks_client.get_balance(vault).await.unwrap(), stored.rent_reserve + 600_000_000, "the storage fee is not part of the pool");
+
+    let reveal_of = |index: usize, reveals: &[[u8; 32]]| {
+        reveal_canopy_ix(stranger.pubkey(), admin.pubkey(), nonce, slips[index].clone(), bottom_proof(&entries, index), bottom_proof(reveals, index))
+    };
+    assert!(send(&mut context, &stranger, reveal_of(0, &[])).await.is_err(), "a reveal before the deadline must fail");
+
+    set_clock(&mut context, now + 31);
+    // A reveal that is consistent with itself but was never entered. Without the entry
+    // proof it would take the index and the real coupon could not be revealed or counted.
+    let forged = colored_reveal(0, stranger.pubkey(), 1, picks, vec![]);
+    let forged_ix = reveal_canopy_ix(stranger.pubkey(), admin.pubkey(), nonce, forged, bottom_proof(&entries, 0), bottom_proof(&[], 0));
+    assert_eq!(custom_code(send(&mut context, &stranger, forged_ix).await), code_of(predictions::PredError::BadCommitment), "a reveal for a coupon nobody entered is refused");
+    let mut wrong_picks = slips[0].clone();
+    wrong_picks.picks[0] = 0b010;
+    let wrong_ix = reveal_canopy_ix(stranger.pubkey(), admin.pubkey(), nonce, wrong_picks, bottom_proof(&entries, 0), bottom_proof(&[], 0));
+    assert!(send(&mut context, &stranger, wrong_ix).await.is_err(), "the commitment rejects other picks");
+    let wrong_proof = reveal_canopy_ix(stranger.pubkey(), admin.pubkey(), nonce, slips[0].clone(), bottom_proof(&entries, 1), bottom_proof(&[], 0));
+    assert!(send(&mut context, &stranger, wrong_proof).await.is_err(), "another coupon's proof is refused");
+    let long_proof = reveal_canopy_ix(stranger.pubkey(), admin.pubkey(), nonce, slips[0].clone(), tree_proof(&entries, 0), bottom_proof(&[], 0));
+    assert!(send(&mut context, &stranger, long_proof).await.is_err(), "the stored upper hashes are not sent again");
+
+    let empty = predictions::slip_zero(0);
+    let mut reveals = vec![empty; 3];
+    send(&mut context, &stranger, reveal_of(0, &reveals)).await.unwrap();
+    assert!(send(&mut context, &stranger, reveal_of(0, &reveals)).await.is_err(), "a reveal cannot be repeated");
+    reveals[0] = reveal_leaf_of(&slips[0]);
+    assert!(send(&mut context, &stranger, reveal_of(0, &reveals)).await.is_err(), "a reveal cannot be repeated with the new proof either");
+    send(&mut context, &stranger, reveal_of(2, &reveals)).await.unwrap();
+    reveals[2] = reveal_leaf_of(&slips[2]);
+    let revealed = load_canopy(&mut context, event).await;
+    assert_eq!(Canopy::reveal_count(&revealed.data), 2);
+    assert_eq!(revealed.root(canopy::REVEAL), full_root(&reveals));
+    assert_eq!(revealed.root(canopy::ENTRY), placed.root(canopy::ENTRY));
+
+    set_clock(&mut context, now + 50);
+    send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    send(&mut context, &other, approve_ix(other.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    open_fallback(&mut context, event).await;
+    let score_of = |index: usize, revealed: bool| score_canopy_ix(stranger.pubkey(), admin.pubkey(), nonce, slips[index].clone(), revealed, bottom_proof(&reveals, index));
+    assert_eq!(custom_code(send(&mut context, &stranger, score_of(1, false)).await), code_of(predictions::PredError::CouponOrder), "coupons are counted in order");
+    assert!(send(&mut context, &stranger, score_of(0, false)).await.is_err(), "a revealed coupon cannot be counted as hidden");
+    send(&mut context, &stranger, score_of(0, true)).await.unwrap();
+    assert!(send(&mut context, &stranger, score_of(0, true)).await.is_err(), "a coupon is counted once");
+    assert!(send(&mut context, &stranger, score_of(1, true)).await.is_err(), "a hidden coupon cannot be counted as revealed");
+    send(&mut context, &stranger, score_of(1, false)).await.unwrap();
+    assert_eq!(load_event(&mut context, event).await.status, EventStatus::Tallying);
+    send(&mut context, &stranger, score_of(2, true)).await.unwrap();
+    let settled = load_event(&mut context, event).await;
+    assert_eq!(settled.status, EventStatus::Resolved);
+    assert_eq!(settled.winners[7], 2, "the hidden coupon is not counted");
+    assert_eq!(settled.per_winner[6], 270_000_000, "the hidden stake stays in the pool");
+    assert_eq!(settled.house, 30_000_000);
+
+    let claim_of = |owner: &Keypair, index: usize| claim_canopy_ix(owner.pubkey(), admin.pubkey(), nonce, slips[index].clone(), bottom_proof(&reveals, index));
+    assert!(send(&mut context, &stranger, claim_of(&stranger, 0)).await.is_err(), "a claim cannot be redirected");
+    assert!(send(&mut context, &hidden, claim_of(&hidden, 1)).await.is_err(), "an unrevealed slip cannot be claimed");
+    let before = context.banks_client.get_balance(vault).await.unwrap();
+    send(&mut context, &winner, claim_of(&winner, 0)).await.unwrap();
+    assert_eq!(before - context.banks_client.get_balance(vault).await.unwrap(), 270_000_000);
+    assert_eq!(custom_code(send(&mut context, &winner, claim_of(&winner, 0)).await), code_of(predictions::PredError::AlreadyPaid), "a slip claim cannot be repeated");
+    send(&mut context, &winner, claim_of(&winner, 2)).await.unwrap();
+    assert_eq!(context.banks_client.get_balance(vault).await.unwrap(), settled.rent_reserve + settled.house);
+    let paid = load_canopy(&mut context, event).await;
+    assert!(paid.tree().is_marked(&paid.data, 0) && paid.tree().is_marked(&paid.data, 2) && !paid.tree().is_marked(&paid.data, 1));
+    assert_eq!(paid.root(canopy::REVEAL), revealed.root(canopy::REVEAL), "a claim sets one bit and leaves the trees alone");
+}
+
+#[tokio::test]
+async fn a_cancelled_canopy_slip_refunds_its_owner_once() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let first = Keypair::new();
+    let second = Keypair::new();
+    for player in [&first, &second] {
+        fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    }
+    let now = clock(&mut context).await.unix_timestamp;
+    let nonce = 121u64;
+    let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), nonce, now + 3_600);
+    send(&mut context, &admin, create).await.unwrap();
+    let reserve = load_event(&mut context, event).await.rent_reserve;
+
+    let picks = all_home();
+    let slips = [colored_reveal(0, first.pubkey(), 1, picks, vec![]), colored_reveal(1, second.pubkey(), 1, picks, vec![])];
+    let entries: Vec<[u8; 32]> = slips.iter().map(|slip| predictions::slip_leaf(slip.index, &slip.owner, slip.combinations, &slip.commitment)).collect();
+    for (slip, player) in slips.iter().zip([&first, &second]) {
+        send(&mut context, player, place_canopy_ix(player.pubkey(), admin.pubkey(), nonce, SlipArg { commitment: slip.commitment, combinations: 1 })).await.unwrap();
+    }
+    let refund_of = |owner: &Keypair, index: usize, combinations: u32| {
+        refund_canopy_ix(owner.pubkey(), admin.pubkey(), nonce, index as u32, combinations, slips[index].commitment, bottom_proof(&entries, index))
+    };
+    assert!(send(&mut context, &first, refund_of(&first, 0, 1)).await.is_err(), "an open event does not refund");
+    cancel(&mut context, &admin, &other, event).await;
+
+    assert!(send(&mut context, &second, refund_of(&second, 0, 1)).await.is_err(), "a refund cannot be redirected");
+    assert!(send(&mut context, &first, refund_of(&first, 0, 2)).await.is_err(), "a refund cannot claim more rows than were paid");
+    send(&mut context, &first, refund_of(&first, 0, 1)).await.unwrap();
+    assert_eq!(context.banks_client.get_balance(vault).await.unwrap(), reserve + 200_000_000);
+    assert_eq!(custom_code(send(&mut context, &first, refund_of(&first, 0, 1)).await), code_of(predictions::PredError::AlreadyPaid), "a slip refund cannot be repeated");
+    send(&mut context, &second, refund_of(&second, 1, 1)).await.unwrap();
+    assert_eq!(context.banks_client.get_balance(vault).await.unwrap(), reserve);
+}
+
+/// Puts `count` coupons that nobody will open into an event, without a transaction each.
+async fn inject_coupons(context: &mut ProgramTestContext, event: Pubkey, data: Vec<u8>, count: u32) {
+    let rent = context.banks_client.get_rent().await.unwrap();
+    let canopy_key = canopy_of(&event);
+    let mut account = context.banks_client.get_account(canopy_key).await.unwrap().unwrap();
+    account.lamports = rent.minimum_balance(data.len());
+    account.data = data;
+    context.set_account(&canopy_key, &account.into());
+    let price = load_event(context, event).await.price;
+    let sales = u64::from(count) * price;
+    patch_event(context, event, |stored| {
+        stored.coupon_count = count;
+        stored.sales = sales;
+    })
+    .await;
+    let vault = pda(&[b"vault", event.as_ref()]);
+    let mut vault_account = context.banks_client.get_account(vault).await.unwrap().unwrap();
+    vault_account.lamports += sales;
+    context.set_account(&vault, &vault_account.into());
+}
+
+#[tokio::test]
+async fn the_canopy_grows_by_one_record_per_chunk() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    fund(&mut context, &player.pubkey(), 2_000_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let nonce = 122u64;
+    let (create, event, _) = create_ix(admin.pubkey(), other.pubkey(), nonce, now + 30);
+    send(&mut context, &admin, create).await.unwrap();
+
+    // 1,023 coupons are already in the first chunk.
+    let filler = Pubkey::new_unique();
+    let mut leaves: Vec<[u8; 32]> = (0..1_023u32).map(|index| predictions::slip_leaf(index, &filler, 1, &[index as u8; 32])).collect();
+    let mut data = load_canopy(&mut context, event).await.data;
+    let tree = Canopy::open(&data, 20).unwrap();
+    for leaf in &leaves {
+        tree.append(&mut data, leaf).unwrap();
+    }
+    inject_coupons(&mut context, event, data, 1_023).await;
+    let rent = context.banks_client.get_rent().await.unwrap();
+
+    let picks = all_home();
+    let last_of_chunk = colored_reveal(1_023, player.pubkey(), 1, picks, vec![]);
+    let first_of_next = colored_reveal(1_024, player.pubkey(), 1, picks, vec![]);
+    for slip in [&last_of_chunk, &first_of_next] {
+        send(&mut context, &player, place_canopy_ix(player.pubkey(), admin.pubkey(), nonce, SlipArg { commitment: slip.commitment, combinations: 1 })).await.unwrap();
+        leaves.push(predictions::slip_leaf(slip.index, &slip.owner, 1, &slip.commitment));
+        let stored = load_canopy(&mut context, event).await;
+        assert_eq!(stored.root(canopy::ENTRY), full_root(&leaves), "root after coupon {}", slip.index);
+        if slip.index == 1_023 {
+            assert_eq!(stored.data.len(), 704, "the last coupon of a chunk needs no new record");
+            assert_eq!(stored.lamports, rent.minimum_balance(704) + STORAGE_FEE);
+        } else {
+            assert_eq!(stored.data.len(), 960, "the first coupon of a chunk adds one 256-byte record");
+            assert_eq!(stored.tree().records(), 2);
+            assert_eq!(stored.lamports, rent.minimum_balance(960), "the account stays rent exempt after it grows");
+        }
+    }
+
+    // A reveal in each chunk. The second chunk's proof never touches the first chunk's leaves.
+    set_clock(&mut context, now + 31);
+    let empty = predictions::slip_zero(0);
+    let mut reveals = vec![empty; 1_025];
+    let second_chunk = reveal_canopy_ix(player.pubkey(), admin.pubkey(), nonce, first_of_next.clone(), bottom_proof(&leaves[1_024..], 0), bottom_proof(&[], 0));
+    send(&mut context, &player, second_chunk).await.unwrap();
+    reveals[1_024] = reveal_leaf_of(&first_of_next);
+    let first_chunk = reveal_canopy_ix(player.pubkey(), admin.pubkey(), nonce, last_of_chunk.clone(), bottom_proof(&leaves[..1_024], 1_023), bottom_proof(&[], 1_023));
+    send(&mut context, &player, first_chunk).await.unwrap();
+    reveals[1_023] = reveal_leaf_of(&last_of_chunk);
+    let stored = load_canopy(&mut context, event).await;
+    assert_eq!(stored.root(canopy::REVEAL), full_root(&reveals));
+    assert_eq!(stored.root(canopy::ENTRY), full_root(&leaves));
+    assert_eq!(stored.data.len(), 960, "a reveal never grows the account");
+}
+
+#[tokio::test]
+async fn coupon_one_million_fits_and_the_next_is_refused() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let player = Keypair::new();
+    let late = Keypair::new();
+    for wallet in [&player, &late] {
+        fund(&mut context, &wallet.pubkey(), 2_000_000_000).await;
+    }
+    fund(&mut context, &other.pubkey(), 10_000_000).await;
+    let now = clock(&mut context).await.unix_timestamp;
+    let deadline = now + 30;
+    let nonce = 123u64;
+    let mut args = event_args(nonce, deadline);
+    args.signers = vec![admin.pubkey(), other.pubkey()];
+    args.price = 1_000_000;
+    args.tiers = vec![TierArg { correct: 7, percent: 60 }, TierArg { correct: 6, percent: 30 }];
+    args.max_coupons = 1_000_001;
+    let (mut create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), nonce, deadline);
+    create.data = predictions::instruction::CreateEvent { args: args.clone() }.data();
+    assert!(send(&mut context, &admin, create.clone()).await.is_err(), "an event cannot be created for more than 1,000,000 coupons");
+    args.max_coupons = 1_000_000;
+    create.data = predictions::instruction::CreateEvent { args }.data();
+    send(&mut context, &admin, create).await.unwrap();
+
+    // 999,999 coupons are already in. Every full chunk holds the same filler leaf, so its
+    // node is computed once. The last chunk starts at coupon 999,424 and holds 575 of them.
+    let bump = load_canopy(&mut context, event).await.data[41];
+    let filler = [7u8; 32];
+    let pair = |left: &[u8; 32], right: &[u8; 32]| anchor_lang::solana_program::hash::hashv(&[left, right]).to_bytes();
+    let full_chunk = (0..10).fold(filler, |node, _| pair(&node, &node));
+    let mut data = vec![0u8; canopy::account_len(10, 976)];
+    let tree = Canopy::init(&mut data, &event.to_bytes(), 10, bump, 20).unwrap();
+    for chunk in 0..976 {
+        tree.set_chunk(&mut data, canopy::ENTRY, chunk, &full_chunk);
+    }
+    data[canopy::COUNT_AT..canopy::COUNT_AT + 4].copy_from_slice(&999_424u32.to_le_bytes());
+    data.resize(canopy::account_len(10, 977), 0);
+    let tree = Canopy::open(&data, 20).unwrap();
+    tree.init_record(&mut data, 976);
+    let mut last_chunk = vec![filler; 575];
+    for leaf in &last_chunk {
+        tree.append(&mut data, leaf).unwrap();
+    }
+    assert_eq!(Canopy::count(&data), 999_999);
+    assert_eq!(data.len(), 250_560, "a full event stores about 250 KB");
+    inject_coupons(&mut context, event, data, 999_999).await;
+    let rent = context.banks_client.get_rent().await.unwrap();
+    assert!(rent.minimum_balance(250_560) < 1_750_000_000, "the rent of a full canopy is about 1.74 SOL, paid 1,740 lamports per coupon");
+
+    // Coupon 1,000,000 is the widest one the program takes: four colors.
+    let mut frame = [0u8; 13];
+    frame[..7].fill(0b111);
+    let colors = vec![
+        ColorArg { signs: ones_on(7), min: 6, max: 6 },
+        ColorArg { signs: ones_on(7) << 1, min: 0, max: 7 },
+        ColorArg { signs: ones_on(7) << 2, min: 0, max: 7 },
+        ColorArg { signs: ones_on(1), min: 0, max: 1 },
+    ];
+    let slip = colored_reveal(999_999, player.pubkey(), 14, frame, colors);
+    let place = place_canopy_ix(player.pubkey(), admin.pubkey(), nonce, SlipArg { commitment: slip.commitment, combinations: 14 });
+    assert!(wire_len(&player.pubkey(), &place) <= WIRE_LIMIT);
+    send(&mut context, &player, place).await.unwrap();
+    last_chunk.push(predictions::slip_leaf(999_999, &player.pubkey(), 14, &slip.commitment));
+    let stored = load_event(&mut context, event).await;
+    assert_eq!(stored.coupon_count, 1_000_000);
+    let placed = load_canopy(&mut context, event).await;
+    assert_eq!(Canopy::count(&placed.data), 1_000_000);
+    assert_eq!(placed.data.len(), 250_560, "the last chunk already has its record");
+    // The root over 976 full chunks, the last chunk, and empty chunks up to depth 20.
+    let mut level: Vec<[u8; 32]> = vec![full_chunk; 976];
+    level.push(predictions::slip_fold(0, &last_chunk[0], &bottom_proof(&last_chunk, 0)));
+    for height in 10..20 {
+        level = (0..level.len().div_ceil(2)).map(|at| pair(&level[2 * at], level.get(2 * at + 1).unwrap_or(&predictions::slip_zero(height)))).collect();
+    }
+    assert_eq!(placed.root(canopy::ENTRY), level[0], "the root is the depth-20 root of one million leaves");
+
+    let one_more = place_canopy_ix(late.pubkey(), admin.pubkey(), nonce, SlipArg { commitment: [9; 32], combinations: 1 });
+    assert_eq!(custom_code(send(&mut context, &late, one_more).await), code_of(predictions::PredError::TooManyCoupons), "coupon 1,000,001 is refused");
+    assert_eq!(load_event(&mut context, event).await.coupon_count, 1_000_000);
+
+    set_clock(&mut context, deadline + 1);
+    let entry_proof = bottom_proof(&last_chunk, 575);
+    let empty_reveals = bottom_proof(&[], 575);
+    let reveal = reveal_canopy_ix(other.pubkey(), admin.pubkey(), nonce, slip.clone(), entry_proof, empty_reveals.clone());
+    assert!(wire_len(&other.pubkey(), &reveal) <= WIRE_LIMIT, "reveal is {} bytes", wire_len(&other.pubkey(), &reveal));
+    send(&mut context, &other, reveal).await.unwrap();
+    let mut reveal_chunk = vec![predictions::slip_zero(0); 576];
+    reveal_chunk[575] = reveal_leaf_of(&slip);
+    let reveal_proof = bottom_proof(&reveal_chunk, 575);
+
+    set_clock(&mut context, deadline + 25);
+    send(&mut context, &admin, approve_ix(admin.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    send(&mut context, &other, approve_ix(other.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    open_fallback(&mut context, event).await;
+    // The 999,999 coupons before it were hidden and are already counted.
+    patch_event(&mut context, event, |stored| stored.tallied = 999_999).await;
+    let score = score_canopy_ix(other.pubkey(), admin.pubkey(), nonce, slip.clone(), true, reveal_proof.clone());
+    assert!(wire_len(&other.pubkey(), &score) <= WIRE_LIMIT, "score is {} bytes", wire_len(&other.pubkey(), &score));
+    send(&mut context, &other, score).await.unwrap();
+    let settled = load_event(&mut context, event).await;
+    assert_eq!(settled.status, EventStatus::Resolved);
+    assert_eq!(settled.tallied, 1_000_000);
+    assert_eq!(settled.winners[6], 14);
+
+    let claim = claim_canopy_ix(player.pubkey(), admin.pubkey(), nonce, slip.clone(), reveal_proof.clone());
+    assert!(wire_len(&player.pubkey(), &claim) <= WIRE_LIMIT, "claim is {} bytes", wire_len(&player.pubkey(), &claim));
+    let before = context.banks_client.get_balance(vault).await.unwrap();
+    send(&mut context, &player, claim.clone()).await.unwrap();
+    assert_eq!(before - context.banks_client.get_balance(vault).await.unwrap(), 14 * settled.per_winner[5]);
+    assert_eq!(custom_code(send(&mut context, &player, claim).await), code_of(predictions::PredError::AlreadyPaid));
+
+    let refund = refund_canopy_ix(player.pubkey(), admin.pubkey(), nonce, 999_999, 14, slip.commitment, bottom_proof(&last_chunk, 575));
+    assert!(wire_len(&player.pubkey(), &refund) <= WIRE_LIMIT);
+    // The same coupon on an older event sends three depth-20 proofs to be counted.
+    let full = vec![[1u8; 32]; 20];
+    let older = score_slip_ix(other.pubkey(), admin.pubkey(), nonce, slip, true, full.clone(), full.clone(), full);
+    assert!(wire_len(&other.pubkey(), &older) > WIRE_LIMIT, "without a canopy this count does not fit");
+}
+
+fn totals_pda(event: &Pubkey) -> Pubkey {
+    pda(&[b"totals", event.as_ref()])
+}
+
+fn fee_pda(event: &Pubkey, payer: &Pubkey) -> Pubkey {
+    pda(&[b"recount-fee", event.as_ref(), payer.as_ref()])
+}
+
+fn rows_at(score: usize, rows: u64) -> [u64; 14] {
+    let mut totals = [0u64; 14];
+    totals[score] = rows;
+    totals
+}
+
+fn sign_totals_ix(signer: Pubkey, poster: Pubkey, event: Pubkey, totals: [u64; 14]) -> Instruction {
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::SignTotals {
+            signer,
+            poster,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            signers: signers_of(&event),
+            canopy: canopy_of(&event),
+            totals: totals_pda(&event),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::SignTotals { totals }.data(),
+    }
+}
+
+fn challenge_ix(challenger: Pubkey, _admin: Pubkey, event: Pubkey) -> Instruction {
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::Challenge {
+            challenger,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            totals: totals_pda(&event),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::Challenge {}.data(),
+    }
+}
+
+fn finalize_ix(caller: Pubkey, poster: Pubkey, admin: Pubkey, event: Pubkey) -> Instruction {
+    Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::FinalizeTotals {
+            caller,
+            event,
+            vault: pda(&[b"vault", event.as_ref()]),
+            totals: totals_pda(&event),
+            poster,
+            schedule: schedule_of(&admin),
+            kinds: kinds_of(&admin),
+            league: league_vault(),
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::FinalizeTotals {}.data(),
+    }
+}
+
+fn score_recount_ix(caller: Pubkey, poster: Pubkey, challenger: Pubkey, admin: Pubkey, nonce: u64, reveal: RevealArg, proof: Vec<[u8; 32]>) -> Instruction {
+    let mut ix = score_canopy_ix(caller, admin, nonce, reveal, true, proof);
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    ix.accounts.push(AccountMeta::new(totals_pda(&event), false));
+    ix.accounts.push(AccountMeta::new(fee_pda(&event, &caller), false));
+    ix.accounts.push(AccountMeta::new_readonly(solana_sdk::system_program::ID, false));
+    ix.accounts.push(AccountMeta::new(poster, false));
+    ix.accounts.push(AccountMeta::new(challenger, false));
+    ix
+}
+
+fn claim_capped_ix(owner: Pubkey, admin: Pubkey, nonce: u64, reveal: RevealArg, proof: Vec<[u8; 32]>) -> Instruction {
+    let mut ix = claim_canopy_ix(owner, admin, nonce, reveal, proof);
+    let event = pda(&[b"event", admin.as_ref(), &nonce.to_le_bytes()]);
+    ix.accounts.push(AccountMeta::new(totals_pda(&event), false));
+    ix
+}
+
+async fn load_totals(context: &mut ProgramTestContext, event: Pubkey) -> predictions::SignedTotals {
+    let account = context.banks_client.get_account(totals_pda(&event)).await.unwrap().unwrap();
+    predictions::SignedTotals::try_deserialize(&mut account.data.as_slice()).unwrap()
+}
+
+struct Played {
+    event: Pubkey,
+    vault: Pubkey,
+    slips: Vec<RevealArg>,
+    reveals: Vec<[u8; 32]>,
+}
+
+/// Two revealed all-home coupons on a new event, with both result signers approved.
+async fn play_two(context: &mut ProgramTestContext, admin: &Keypair, other: &Keypair, players: [&Keypair; 2], nonce: u64) -> Played {
+    let now = clock(context).await.unix_timestamp;
+    let (create, event, vault) = create_ix(admin.pubkey(), other.pubkey(), nonce, now + 30);
+    send(context, admin, create).await.unwrap();
+    let created = load_event(context, event).await;
+    assert_eq!(created.settlement_path, 1);
+    assert_eq!(created.dispute_min, 10);
+    assert_eq!(created.dispute_max, 50);
+    let picks = all_home();
+    let mut slips = Vec::new();
+    let mut leaves = Vec::new();
+    for (index, player) in players.iter().enumerate() {
+        fund(context, &player.pubkey(), 2_000_000_000).await;
+        let reveal = colored_reveal(index as u32, player.pubkey(), 1, picks, vec![]);
+        send(context, player, place_canopy_ix(player.pubkey(), admin.pubkey(), nonce, SlipArg { commitment: reveal.commitment, combinations: 1 })).await.unwrap();
+        leaves.push(predictions::slip_leaf(index as u32, &player.pubkey(), 1, &reveal.commitment));
+        slips.push(reveal);
+    }
+    set_clock(context, now + 31);
+    let mut reveals = vec![predictions::slip_zero(0); 2];
+    for (index, slip) in slips.iter().enumerate() {
+        let ix = reveal_canopy_ix(admin.pubkey(), admin.pubkey(), nonce, slip.clone(), bottom_proof(&leaves, index), bottom_proof(&reveals, index));
+        send(context, admin, ix).await.unwrap();
+        reveals[index] = reveal_leaf_of(slip);
+    }
+    let canopy = load_canopy(context, event).await;
+    assert_eq!(canopy::revealed_rows(&canopy.data), 2, "reveal keeps the running row total");
+    set_clock(context, now + 50);
+    send(context, admin, approve_ix(admin.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    fund(context, &other.pubkey(), 50_000_000).await;
+    send(context, other, approve_ix(other.pubkey(), admin.pubkey(), event, b"1111111".to_vec())).await.unwrap();
+    assert_eq!(load_event(context, event).await.status, EventStatus::Tallying);
+    Played { event, vault, slips, reveals }
+}
+
+async fn lock_totals(context: &mut ProgramTestContext, admin: &Keypair, other: &Keypair, event: Pubkey, totals: [u64; 14]) {
+    let first = sign_totals_ix(other.pubkey(), admin.pubkey(), event, totals);
+    send(context, other, first).await.unwrap();
+    assert_eq!(load_event(context, event).await.status, EventStatus::Tallying, "one signature does not lock totals");
+    let second = sign_totals_ix(admin.pubkey(), admin.pubkey(), event, totals);
+    send(context, admin, second).await.unwrap();
+    assert_eq!(load_event(context, event).await.status, EventStatus::Window);
+    assert_eq!(load_totals(context, event).await.poster_bond, 3_000_000_000);
+}
+
+fn proof_of(played: &Played, index: usize) -> Vec<[u8; 32]> {
+    bottom_proof(&played.reveals, index)
+}
+
+#[tokio::test]
+async fn correct_totals_settle_after_the_window_and_a_short_clock_does_not() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let players = [Keypair::new(), Keypair::new()];
+    let played = play_two(&mut context, &admin, &other, [&players[0], &players[1]], 190).await;
+    let early = score_canopy_ix(other.pubkey(), admin.pubkey(), 190, played.slips[0].clone(), true, proof_of(&played, 0));
+    assert_eq!(custom_code(send(&mut context, &other, early).await), code_of(predictions::PredError::TotalsPending));
+
+    let mut high = rows_at(7, 3);
+    assert!(send(&mut context, &other, sign_totals_ix(other.pubkey(), admin.pubkey(), played.event, high)).await.is_err(), "totals above the revealed rows are rejected");
+    high[7] = 2;
+    let other_list = rows_at(0, 2);
+    send(&mut context, &other, sign_totals_ix(other.pubkey(), admin.pubkey(), played.event, other_list)).await.unwrap();
+    send(&mut context, &admin, sign_totals_ix(admin.pubkey(), admin.pubkey(), played.event, high)).await.unwrap();
+    assert_eq!(load_event(&mut context, played.event).await.status, EventStatus::Tallying, "a different list does not lock");
+    assert_eq!(load_totals(&mut context, played.event).await.approvals.count_ones(), 1);
+
+    // The poster signs the transaction that reaches the threshold, so the bond can move.
+    let mut locking = sign_totals_ix(other.pubkey(), admin.pubkey(), played.event, high);
+    for meta in &mut locking.accounts {
+        if meta.pubkey == admin.pubkey() {
+            meta.is_signer = true;
+        }
+    }
+    send_all(&mut context, &[&admin, &other], locking).await.unwrap();
+    assert_eq!(load_event(&mut context, played.event).await.status, EventStatus::Window);
+    let during = claim_capped_ix(players[0].pubkey(), admin.pubkey(), 190, played.slips[0].clone(), proof_of(&played, 0));
+    assert!(send(&mut context, &players[0], during).await.is_err(), "a claim during the window is refused");
+
+    let open_at = load_totals(&mut context, played.event).await.window_slot;
+    let now = clock(&mut context).await.unix_timestamp;
+    set_clock(&mut context, now + 365 * 24 * 60 * 60);
+    let stranger = Keypair::new();
+    fund(&mut context, &stranger.pubkey(), 10_000_000).await;
+    assert_eq!(
+        custom_code(send(&mut context, &stranger, finalize_ix(stranger.pubkey(), admin.pubkey(), admin.pubkey(), played.event)).await),
+        code_of(predictions::PredError::ChallengeClosed),
+        "wall-clock time does not end the window"
+    );
+    context.warp_to_slot(open_at + 54_000).unwrap();
+    send(&mut context, &stranger, finalize_ix(stranger.pubkey(), admin.pubkey(), admin.pubkey(), played.event)).await.unwrap();
+    let settled = load_event(&mut context, played.event).await;
+    assert_eq!(settled.status, EventStatus::Resolved);
+    assert_eq!(settled.winners[7], 2);
+    assert_eq!(settled.per_winner[6], 180_000_000);
+    assert_eq!(load_totals(&mut context, played.event).await.rejected, 0);
+    let before = context.banks_client.get_balance(played.vault).await.unwrap();
+    send(&mut context, &players[0], claim_capped_ix(players[0].pubkey(), admin.pubkey(), 190, played.slips[0].clone(), proof_of(&played, 0))).await.unwrap();
+    assert_eq!(before - context.banks_client.get_balance(played.vault).await.unwrap(), 180_000_000);
+}
+
+#[tokio::test]
+async fn an_undercount_is_recounted_and_the_challenger_receives_both_bonds() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let players = [Keypair::new(), Keypair::new()];
+    let challenger = Keypair::new();
+    let scorer = Keypair::new();
+    fund(&mut context, &challenger.pubkey(), 12_000_000_000).await;
+    fund(&mut context, &scorer.pubkey(), 1_000_000_000).await;
+    let played = play_two(&mut context, &admin, &other, [&players[0], &players[1]], 191).await;
+    let mut under = rows_at(7, 1);
+    under[0] = 1;
+    lock_totals(&mut context, &admin, &other, played.event, under).await;
+    let claim = claim_capped_ix(players[0].pubkey(), admin.pubkey(), 191, played.slips[0].clone(), proof_of(&played, 0));
+    assert!(send(&mut context, &players[0], claim).await.is_err(), "a claim during the window is refused");
+
+    let before = context.banks_client.get_balance(challenger.pubkey()).await.unwrap();
+    send(&mut context, &challenger, challenge_ix(challenger.pubkey(), admin.pubkey(), played.event)).await.unwrap();
+    assert_eq!(load_event(&mut context, played.event).await.status, EventStatus::Recount);
+    let again = Keypair::new();
+    fund(&mut context, &again.pubkey(), 12_000_000_000).await;
+    let again_before = context.banks_client.get_balance(again.pubkey()).await.unwrap();
+    assert!(send(&mut context, &again, challenge_ix(again.pubkey(), admin.pubkey(), played.event)).await.is_err(), "a second challenge is refused");
+    assert_eq!(context.banks_client.get_balance(again.pubkey()).await.unwrap(), again_before, "a refused challenge moves no money");
+
+    let recount_claim = claim_capped_ix(players[0].pubkey(), admin.pubkey(), 191, played.slips[0].clone(), proof_of(&played, 0));
+    assert!(send(&mut context, &players[0], recount_claim).await.is_err(), "a claim during a recount is refused");
+    for index in 0..2 {
+        let ix = score_recount_ix(scorer.pubkey(), admin.pubkey(), challenger.pubkey(), admin.pubkey(), 191, played.slips[index].clone(), proof_of(&played, index));
+        send(&mut context, &scorer, ix).await.unwrap();
+    }
+    let settled = load_event(&mut context, played.event).await;
+    assert_eq!(settled.status, EventStatus::Resolved);
+    assert_eq!(settled.winners[7], 2, "the recount totals are used");
+    assert_eq!(settled.per_winner[6], 180_000_000);
+    let totals = load_totals(&mut context, played.event).await;
+    assert_eq!(totals.rejected, 1);
+    assert_eq!(totals.fee_pot, 10_000, "two scores record 5,000 lamports each, taken from the poster bond");
+    let after = context.banks_client.get_balance(challenger.pubkey()).await.unwrap();
+    assert!(after > before, "the challenger receives both bonds after the recorded fees");
+    assert!(after - before > 2_000_000_000, "the challenger is paid the poster's bond as well as their own");
+
+    send(&mut context, &players[0], claim_capped_ix(players[0].pubkey(), admin.pubkey(), 191, played.slips[0].clone(), proof_of(&played, 0))).await.unwrap();
+    send(&mut context, &players[1], claim_capped_ix(players[1].pubkey(), admin.pubkey(), 191, played.slips[1].clone(), proof_of(&played, 1))).await.unwrap();
+    let third = claim_capped_ix(players[0].pubkey(), admin.pubkey(), 191, played.slips[0].clone(), proof_of(&played, 0));
+    assert!(send(&mut context, &players[0], third).await.is_err(), "a paid coupon cannot be claimed again");
+}
+
+#[tokio::test]
+async fn a_false_challenge_repays_recount_fees_before_the_pool_and_the_signed_totals_stand() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let players = [Keypair::new(), Keypair::new()];
+    let challenger = Keypair::new();
+    let scorer = Keypair::new();
+    fund(&mut context, &challenger.pubkey(), 12_000_000_000).await;
+    fund(&mut context, &scorer.pubkey(), 1_000_000_000).await;
+    let played = play_two(&mut context, &admin, &other, [&players[0], &players[1]], 192).await;
+    let correct = rows_at(7, 2);
+    lock_totals(&mut context, &admin, &other, played.event, correct).await;
+    let poster_before = context.banks_client.get_balance(admin.pubkey()).await.unwrap();
+    send(&mut context, &challenger, challenge_ix(challenger.pubkey(), admin.pubkey(), played.event)).await.unwrap();
+    for index in 0..2 {
+        let ix = score_recount_ix(scorer.pubkey(), admin.pubkey(), challenger.pubkey(), admin.pubkey(), 192, played.slips[index].clone(), proof_of(&played, index));
+        send(&mut context, &scorer, ix).await.unwrap();
+    }
+    let settled = load_event(&mut context, played.event).await;
+    assert_eq!(settled.winners[7], 2);
+    assert_eq!(load_totals(&mut context, played.event).await.rejected, 0, "the signed totals stand");
+    assert!(context.banks_client.get_balance(admin.pubkey()).await.unwrap() > poster_before + 2_000_000_000, "the poster bond comes back");
+    assert_eq!(load_totals(&mut context, played.event).await.fee_pot, 10_000);
+    assert!(settled.sales > 400_000_000, "what remains of the challenger bond joins the pool");
+    let fee_ix = Instruction {
+        program_id: predictions::ID,
+        accounts: predictions::accounts::ClaimRecountFee {
+            payer: scorer.pubkey(),
+            event: played.event,
+            vault: played.vault,
+            totals: totals_pda(&played.event),
+            fee: fee_pda(&played.event, &scorer.pubkey()),
+        }
+        .to_account_metas(None),
+        data: predictions::instruction::ClaimRecountFee {}.data(),
+    };
+    send(&mut context, &scorer, fee_ix).await.unwrap();
+    assert_eq!(load_totals(&mut context, played.event).await.fee_pot, 0, "recount fees are paid back before anything else");
+}
+
+#[tokio::test]
+async fn a_claim_past_the_signed_tier_is_refused_and_no_totals_falls_back_to_the_count() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let players = [Keypair::new(), Keypair::new()];
+    let played = play_two(&mut context, &admin, &other, [&players[0], &players[1]], 193).await;
+    let mut under = rows_at(7, 1);
+    under[0] = 1;
+    lock_totals(&mut context, &admin, &other, played.event, under).await;
+    let open_at = load_totals(&mut context, played.event).await.window_slot;
+    context.warp_to_slot(open_at + 54_000).unwrap();
+    let stranger = Keypair::new();
+    fund(&mut context, &stranger.pubkey(), 10_000_000).await;
+    send(&mut context, &stranger, finalize_ix(stranger.pubkey(), admin.pubkey(), admin.pubkey(), played.event)).await.unwrap();
+    send(&mut context, &players[0], claim_capped_ix(players[0].pubkey(), admin.pubkey(), 193, played.slips[0].clone(), proof_of(&played, 0))).await.unwrap();
+    assert_eq!(
+        custom_code(send(&mut context, &players[1], claim_capped_ix(players[1].pubkey(), admin.pubkey(), 193, played.slips[1].clone(), proof_of(&played, 1))).await),
+        code_of(predictions::PredError::BadTotals),
+        "a claim past the signed total for that tier is refused"
+    );
+
+    let fallback_players = [Keypair::new(), Keypair::new()];
+    let fallback = play_two(&mut context, &admin, &other, [&fallback_players[0], &fallback_players[1]], 194).await;
+    let blocked = score_canopy_ix(other.pubkey(), admin.pubkey(), 194, fallback.slips[0].clone(), true, proof_of(&fallback, 0));
+    assert_eq!(custom_code(send(&mut context, &other, blocked).await), code_of(predictions::PredError::TotalsPending));
+    open_fallback(&mut context, fallback.event).await;
+    for index in 0..2 {
+        let ix = score_canopy_ix(other.pubkey(), admin.pubkey(), 194, fallback.slips[index].clone(), true, proof_of(&fallback, index));
+        send(&mut context, &other, ix).await.unwrap();
+    }
+    let settled = load_event(&mut context, fallback.event).await;
+    assert_eq!(settled.status, EventStatus::Resolved);
+    assert_eq!(settled.winners[7], 2);
+    assert_eq!(settled.per_winner[6], 180_000_000);
+}
+
+#[tokio::test]
+async fn a_result_signer_opens_the_count_without_waiting() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let players = [Keypair::new(), Keypair::new()];
+    let played = play_two(&mut context, &admin, &other, [&players[0], &players[1]], 197).await;
+    let stranger = Keypair::new();
+    fund(&mut context, &stranger.pubkey(), 10_000_000).await;
+    assert_eq!(
+        custom_code(send(&mut context, &stranger, open_count_ix(stranger.pubkey(), played.event)).await),
+        code_of(predictions::PredError::NotEnoughSigners)
+    );
+    send(&mut context, &other, open_count_ix(other.pubkey(), played.event)).await.unwrap();
+    assert_eq!(load_event(&mut context, played.event).await.count_started, 1);
+    assert!(
+        send(&mut context, &admin, sign_totals_ix(admin.pubkey(), admin.pubkey(), played.event, rows_at(7, 2))).await.is_err(),
+        "signed totals close once the count is open"
+    );
+    let ix = score_canopy_ix(other.pubkey(), admin.pubkey(), 197, played.slips[0].clone(), true, proof_of(&played, 0));
+    send(&mut context, &other, ix).await.unwrap();
+    assert_eq!(load_event(&mut context, played.event).await.tallied, 1);
+}
+
+#[tokio::test]
+async fn signers_can_cancel_during_the_window_and_the_poster_bond_returns() {
+    let mut context = start().await;
+    let admin = Keypair::try_from(context.payer.to_bytes().as_slice()).unwrap();
+    let other = Keypair::new();
+    let players = [Keypair::new(), Keypair::new()];
+    let played = play_two(&mut context, &admin, &other, [&players[0], &players[1]], 195).await;
+    lock_totals(&mut context, &admin, &other, played.event, rows_at(7, 2)).await;
+    let mut cancel = approve_cancel_ix(other.pubkey(), admin.pubkey(), played.event);
+    cancel.accounts.push(AccountMeta::new(totals_pda(&played.event), false));
+    cancel.accounts.push(AccountMeta::new(admin.pubkey(), false));
+    send(&mut context, &other, cancel).await.unwrap();
+    assert_eq!(load_event(&mut context, played.event).await.status, EventStatus::Window, "one signer cannot cancel");
+    let vault_before = context.banks_client.get_balance(played.vault).await.unwrap();
+    let mut finish = approve_cancel_ix(admin.pubkey(), admin.pubkey(), played.event);
+    finish.accounts.push(AccountMeta::new(totals_pda(&played.event), false));
+    finish.accounts.push(AccountMeta::new(admin.pubkey(), false));
+    send(&mut context, &admin, finish).await.unwrap();
+    let cancelled = load_event(&mut context, played.event).await;
+    assert_eq!(cancelled.status, EventStatus::Cancelled);
+    assert_eq!(vault_before - context.banks_client.get_balance(played.vault).await.unwrap(), 3_000_000_000, "the poster bond leaves the vault");
+    assert_eq!(load_totals(&mut context, played.event).await.poster_bond, 0);
 }

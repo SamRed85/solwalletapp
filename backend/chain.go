@@ -44,9 +44,16 @@ const (
 	eventRolloverOffset    = 142
 	// per_winner follows rollover_in, house, paid, rollover_out, and the forwarded flag.
 	// per_winner[n-1] is the lamports paid for one row with n correct picks.
-	perWinnerOffset         = 175
-	eventMinRowsOffset      = 430
-	eventMaxCouponsOffset   = 434
+	perWinnerOffset       = 175
+	eventMinRowsOffset    = 430
+	eventMaxCouponsOffset = 434
+	// Proof hashes a client sends for a slip. Zero on events created before the canopy.
+	eventCanopyOffset       = 438
+	eventDisputeMinOffset   = 440
+	eventDisputeMaxOffset   = 441
+	eventPathOffset         = 442
+	eventCountStartedOffset = 443
+	eventApprovedAtOffset   = 444
 	eventAccountMinimumSize = 421
 
 	signersEventOffset     = 8
@@ -56,7 +63,7 @@ const (
 	signersAccountSize     = 203
 )
 
-var chainStatuses = []string{"open", "resolved", "cancelled", "tallying"}
+var chainStatuses = []string{"open", "resolved", "cancelled", "tallying", "window", "recount"}
 
 func anchorDiscriminator(account string) []byte {
 	sum := sha256.Sum256([]byte("account:" + account))
@@ -87,6 +94,17 @@ type chainEvent struct {
 	League         bool
 	MinRows        uint32
 	MaxCoupons     uint32
+	// Canopy is the number of proof hashes a slip sends. The program stores the levels above.
+	// Zero is an event created before the canopy, whose slips send the whole proof.
+	Canopy int
+	// DisputeMin and DisputeMax are whole SOL. Zero means the account predates the field: 10 and 50.
+	DisputeMin int
+	DisputeMax int
+	// SettlementPath is 0 for the on-chain count, 1 while signed totals are pending or in the
+	// window, and 2 once claims are capped at the totals.
+	SettlementPath int
+	CountStarted   int
+	ApprovedAt     int64
 }
 
 func decodeChainEvent(account *chainAccount, programID string) (*chainEvent, error) {
@@ -126,7 +144,7 @@ func decodeChainEvent(account *chainAccount, programID string) (*chainEvent, err
 		at := eventTiersOffset + 2*i
 		ev.Tiers = append(ev.Tiers, Tier{Correct: int(d[at]), Percent: int(d[at+1])})
 	}
-	if ev.Status == "resolved" || ev.Status == "tallying" {
+	if ev.Status == "resolved" || ev.Status == "tallying" || ev.Status == "window" || ev.Status == "recount" {
 		ev.Results = string(d[eventResultsOffset : eventResultsOffset+ev.GameCount])
 	}
 	// kind sits in the spare bytes after the winner table. Older accounts are zero, which is a SOL event.
@@ -137,6 +155,19 @@ func decodeChainEvent(account *chainAccount, programID string) (*chainEvent, err
 	if len(d) >= eventMaxCouponsOffset+4 {
 		ev.MinRows = binary.LittleEndian.Uint32(d[eventMinRowsOffset:])
 		ev.MaxCoupons = binary.LittleEndian.Uint32(d[eventMaxCouponsOffset:])
+	}
+	if len(d) > eventCanopyOffset {
+		ev.Canopy = int(d[eventCanopyOffset])
+		if ev.Canopy >= slipDepth {
+			return nil, errors.New("the event account is malformed")
+		}
+	}
+	if len(d) > eventApprovedAtOffset+4 {
+		ev.DisputeMin = int(d[eventDisputeMinOffset])
+		ev.DisputeMax = int(d[eventDisputeMaxOffset])
+		ev.SettlementPath = int(d[eventPathOffset])
+		ev.CountStarted = int(d[eventCountStartedOffset])
+		ev.ApprovedAt = int64(binary.LittleEndian.Uint32(d[eventApprovedAtOffset:]))
 	}
 	return ev, nil
 }
@@ -223,6 +254,8 @@ func checkVaultMatches(e *Event, vault ChainVault, ev *chainEvent, signers *chai
 		return "the on-chain event is not the same kind of pool"
 	case !sameCouponLimits(e, ev):
 		return "the on-chain coupon limits differ from the event"
+	case !sameDispute(e, ev):
+		return "the on-chain challenge bond limits differ from the event"
 	case ev.Deadline != e.StartTime.Unix():
 		return "the on-chain entry deadline differs from the event start"
 	case ev.EndTime != e.EndTime.Unix() || ev.RevealDeadline != ev.EndTime:
@@ -245,6 +278,24 @@ func checkVaultMatches(e *Event, vault ChainVault, ev *chainEvent, signers *chai
 
 // A legacy account and a legacy event both carry zeros. Publishing that event with the
 // current program writes the defaults, which is the same event.
+func sameDispute(e *Event, ev *chainEvent) bool {
+	wantMin, wantMax := e.DisputeMin, e.DisputeMax
+	gotMin, gotMax := ev.DisputeMin, ev.DisputeMax
+	if wantMin == 0 {
+		wantMin = 10
+	}
+	if wantMax == 0 {
+		wantMax = 50
+	}
+	if gotMin == 0 {
+		gotMin = 10
+	}
+	if gotMax == 0 {
+		gotMax = 50
+	}
+	return wantMin == gotMin && wantMax == gotMax
+}
+
 func sameCouponLimits(e *Event, ev *chainEvent) bool {
 	wantMin, wantMax := e.MinRows, e.MaxCoupons
 	if wantMin == 0 && wantMax == 0 {
@@ -314,7 +365,7 @@ func (a *App) handleSyncChain(w http.ResponseWriter, r *http.Request) {
 		set["resultsSetAt"] = time.Now()
 		filter["resultsSetAt"] = bson.M{"$exists": false}
 	}
-	if _, err := a.events.UpdateOne(ctx, filter, bson.M{"$set": set}); err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+	if _, err := a.events.UpdateOne(ctx, filter, chainStatusUpdate(ev, e, set)); err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
 		writeError(w, http.StatusInternalServerError, "failed to save the on-chain status")
 		return
 	}
@@ -384,6 +435,15 @@ func (a *App) mirrorOne(ctx context.Context, e *Event) error {
 		set["resultsSetAt"] = time.Now()
 		filter["resultsSetAt"] = bson.M{"$exists": false}
 	}
-	_, err = a.events.UpdateOne(ctx, filter, bson.M{"$set": set})
+	_, err = a.events.UpdateOne(ctx, filter, chainStatusUpdate(ev, e, set))
 	return err
+}
+
+// chainStatusUpdate drops the auto-resolve hand-set notice once the results are locked.
+func chainStatusUpdate(ev *chainEvent, e *Event, set bson.M) bson.M {
+	update := bson.M{"$set": set}
+	if ev.Status != "open" && e.ScoreBlock != "" {
+		update["$unset"] = bson.M{"scoreBlock": ""}
+	}
+	return update
 }

@@ -24,8 +24,8 @@
               <p class="mb-3">Choose a color, then tap signs to group them. A row is kept only when every color lands between its min and max. You sign once and pay only for the rows it keeps.</p>
             </template>
             <p class="text-caption text-medium-emphasis mb-1">Pool</p>
-            <p v-if="event?.league" class="mb-3">This round is paid in RAD. You earn 1 RAD for every row on a SOL event.<span v-if="radBalance !== null"> You have {{ radBalance }} RAD.</span></p>
-            <p v-else class="mb-3">You pay the row price only, plus a small Solana network fee. The row earns 1 RAD toward the league event. A losing coupon keeps its stake in the pool. The house keeps {{ houseCut }}% and the league vault keeps {{ leagueCut }}% of ticket sales.</p>
+            <p v-if="event?.league" class="mb-3">This round is paid in RAD. You earn 1 RAD for every row on a SOL event.<span v-if="radBalance !== null"> You have {{ radBalance }} RAD.</span><span v-if="limits.canopy"> Each coupon also pays {{ storageSol }} SOL for the space it takes on chain.</span></p>
+            <p v-else class="mb-3">You pay the row price<span v-if="limits.canopy">, a small Solana network fee, and {{ storageSol }} SOL per coupon for the space it takes on chain</span><span v-else> only, plus a small Solana network fee</span>. The row earns 1 RAD toward the league event. A losing coupon keeps its stake in the pool. The house keeps {{ houseCut }}% and the league vault keeps {{ leagueCut }}% of ticket sales.</p>
             <p class="text-caption text-medium-emphasis mb-1">Prize rows</p>
             <p v-for="tier in allocationTiers" :key="tier.correct" class="mb-1">
               {{ tier.correct }} correct receives {{ tier.percent }}% of ticket sales<span v-if="tier.correct === event?.gameCount">, plus any jackpot</span>.
@@ -159,7 +159,7 @@
                 <v-icon icon="mdi-chevron-down" size="16" />
               </button>
               <span class="step-value">{{ colorLimits[id].min }}</span>
-              <button type="button" class="step-btn" :disabled="paying || colorLimits[id].min >= colorMarks[id].length" :aria-label="`Raise ${colorLabels[id]} minimum`" @click="stepLimit(id, 'min', 1)">
+              <button type="button" class="step-btn" :disabled="paying || colorLimits[id].min >= colorReach(id)" :aria-label="`Raise ${colorLabels[id]} minimum`" @click="stepLimit(id, 'min', 1)">
                 <v-icon icon="mdi-chevron-up" size="16" />
               </button>
             </span>
@@ -169,11 +169,12 @@
                 <v-icon icon="mdi-chevron-down" size="16" />
               </button>
               <span class="step-value">{{ colorLimits[id].max }}</span>
-              <button type="button" class="step-btn" :disabled="paying || colorLimits[id].max >= colorMarks[id].length" :aria-label="`Raise ${colorLabels[id]} maximum`" @click="stepLimit(id, 'max', 1)">
+              <button type="button" class="step-btn" :disabled="paying || colorLimits[id].max >= colorReach(id)" :aria-label="`Raise ${colorLabels[id]} maximum`" @click="stepLimit(id, 'max', 1)">
                 <v-icon icon="mdi-chevron-up" size="16" />
               </button>
             </span>
           </div>
+          <p v-if="colorsIdle" class="reduce-note">A row hits a color once per game. These limits still keep every row.</p>
         </div>
         <GameCardOptions :event="event" />
         <div v-if="event.games.length" class="game-row fill-row">
@@ -222,6 +223,12 @@
           </div>
         </div>
         <ProjectedPayout :system="systemRows(picks)" :colors="reductionState?.ok ? reductionState.colors : []" :projection="projection" />
+        <v-alert v-if="reductionState && !reductionState.ok" type="warning" variant="tonal" density="compact" class="mt-3">
+          {{ reductionState.error }}
+        </v-alert>
+        <v-alert v-if="eventFull" type="warning" variant="tonal" density="compact" class="mt-3">
+          This event is full at {{ limits.maxCoupons.toLocaleString() }} coupons. It takes no more entries.
+        </v-alert>
         <v-alert v-if="paying" type="info" variant="tonal" density="compact" class="mt-3">{{ stepLabels[step] }}</v-alert>
         <div class="pay-dock">
           <div class="pay-hero">
@@ -264,11 +271,12 @@ import ProjectedPayout from '@/components/ProjectedPayout.vue'
 import VaultPanel from '@/components/VaultPanel.vue'
 import { eventApi, reductionApi } from '@/services/api'
 import { eventTypeOf } from '@/services/eventTypes'
-import { couponCapacity, fetchRad } from '@/services/program'
+import { CANOPY_STORAGE_LAMPORTS, couponCapacity, fetchRad } from '@/services/program'
 import { payAndEnter, placeOnChain, placeReduction } from '@/services/entry'
-import { auth, loadConfig, login, refreshBalance } from '@/stores/auth'
+import { auth, loadConfig, openLogin, refreshBalance } from '@/stores/auth'
 import { notify, notifyError } from '@/stores/notify'
 import { combinationCount, expandCombinations, systemRows } from '@/utils/coupons'
+import { blankHold, shownLimit, stepHold } from '@/utils/colorMarks'
 import { COLOR_IDS, colorPaint, colorReduction } from '@/utils/reduce'
 import { eventStarted } from '@/services/gameCards'
 import { showStandingPayout } from '@/services/projection'
@@ -288,9 +296,11 @@ const signProgress = ref({ done: 0, total: 0 })
 const colorIds = COLOR_IDS
 const colorLabels = { purple: 'Purple', yellow: 'Yellow', red: 'Red', green: 'Green' }
 const colorMarks = ref({ purple: [], yellow: [], red: [], green: [] })
-const colorLimits = ref({
-  purple: { min: 0, max: 0 }, yellow: { min: 0, max: 0 }, red: { min: 0, max: 0 }, green: { min: 0, max: 0 }
-})
+const colorHold = ref({ purple: blankHold(), yellow: blankHold(), red: blankHold(), green: blankHold() })
+function colorReach (id) {
+  return new Set(colorMarks.value[id].map(key => key.split(':')[0])).size
+}
+const colorLimits = computed(() => Object.fromEntries(colorIds.map(id => [id, shownLimit(colorHold.value[id], colorReach(id))])))
 const activeColor = ref('')
 const pendingGroup = ref(null)
 const expandedNames = ref(new Set())
@@ -306,12 +316,12 @@ function toggleName (key) {
 
 const stepLabels = computed(() => event.value?.chain ? {
   sign: signProgress.value.total > 1
-    ? `Approve coupon ${Math.min(signProgress.value.done + 1, signProgress.value.total)} of ${signProgress.value.total} in Phantom.`
-    : 'Approve the entry in Phantom.',
+    ? `Approve coupon ${Math.min(signProgress.value.done + 1, signProgress.value.total)} of ${signProgress.value.total} in your wallet.`
+    : 'Approve the entry in your wallet.',
   confirm: 'Waiting for the entry to be finalized on devnet...',
   schedule: 'Saving the time-locked picks. They are published when entries close.'
 } : {
-  sign: 'Approve the payment in Phantom (make sure Phantom is set to Devnet)...',
+  sign: 'Approve the payment in your wallet. Set the wallet to Devnet.',
   confirm: 'Waiting for the payment to be finalized on devnet. This can take about a minute...',
   submit: 'Payment confirmed. Registering your coupons...'
 })
@@ -361,8 +371,10 @@ const reductionState = computed(() => {
     return { ok: false, error: error.message, rows: error.rows || 0 }
   }
 })
-const overRows = computed(() => reductionState.value?.ok === false ? reductionState.value.rows : 0)
-const paidRows = computed(() => reductionState.value?.ok ? reductionState.value.rows : (overRows.value || combinationTotal.value))
+const paidRows = computed(() => reductionState.value ? reductionState.value.rows : combinationTotal.value)
+const colorsIdle = computed(() => Boolean(
+  reductionState.value?.ok && usedColorIds.value.length && reductionState.value.rows === reductionState.value.frameRows
+))
 const removedPercent = computed(() => {
   if (!reductionState.value?.ok || !combinationTotal.value) return 0
   return Math.round((1 - reductionState.value.rows / combinationTotal.value) * 100)
@@ -370,6 +382,7 @@ const removedPercent = computed(() => {
 const signedPieceCount = computed(() => pendingGroup.value?.pieces.filter(piece => piece.status === 'signed').length || 0)
 const tooMany = computed(() => !reductionState.value && combinationTotal.value > maxCombinations.value)
 const chainCapacity = ref(null)
+const storageSol = (CANOPY_STORAGE_LAMPORTS / 1e9).toFixed(8)
 const limits = computed(() => {
   if (chainCapacity.value) return chainCapacity.value
   const current = event.value
@@ -483,12 +496,8 @@ const allRows = computed(() => {
   return source.filter(row => paying.has(row.correct))
 })
 
-async function onLogin () {
-  try {
-    await login()
-  } catch (error) {
-    notifyError(error)
-  }
+function onLogin () {
+  openLogin()
 }
 
 async function loadProjection () {
@@ -506,9 +515,7 @@ async function loadProjection () {
 function resetPicks () {
   picks.value = event.value.games.map(() => [])
   colorMarks.value = { purple: [], yellow: [], red: [], green: [] }
-  colorLimits.value = {
-    purple: { min: 0, max: 0 }, yellow: { min: 0, max: 0 }, red: { min: 0, max: 0 }, green: { min: 0, max: 0 }
-  }
+  colorHold.value = { purple: blankHold(), yellow: blankHold(), red: blankHold(), green: blankHold() }
   activeColor.value = ''
 }
 
@@ -529,27 +536,14 @@ function signStyle (game, outcome) {
   return colorPaint(signColors(game, outcome))
 }
 
-// Min and max move one step at a time, between 0 and the number of signs in the color.
+// Min and max count games a row can hit, so two signs on one game do not raise the ceiling.
 function stepLimit (id, field, delta) {
-  const limits = colorLimits.value[id]
-  const cap = colorMarks.value[id].length
-  const next = limits[field] + delta
-  if (next < 0 || next > cap) return
-  limits[field] = next
-  if (limits.min > limits.max) {
-    if (field === 'min') limits.max = limits.min
-    else limits.min = limits.max
-  }
+  colorHold.value[id] = stepHold(colorHold.value[id], colorReach(id), field, delta)
 }
 
 function stripSign (game, outcome) {
   const key = signKey(game, outcome)
-  for (const id of colorIds) {
-    colorMarks.value[id] = colorMarks.value[id].filter(mark => mark !== key)
-    const limits = colorLimits.value[id]
-    if (limits.max > colorMarks.value[id].length) limits.max = colorMarks.value[id].length
-    if (limits.min > limits.max) limits.min = limits.max
-  }
+  for (const id of colorIds) colorMarks.value[id] = colorMarks.value[id].filter(mark => mark !== key)
 }
 
 function togglePick (game, outcome) {
@@ -567,16 +561,7 @@ function toggleColorSign (game, outcome) {
   if (!isSelected(game, outcome)) togglePick(game, outcome)
   const key = signKey(game, outcome)
   const marks = colorMarks.value[id]
-  if (marks.includes(key)) {
-    colorMarks.value[id] = marks.filter(mark => mark !== key)
-  } else {
-    const tracking = colorLimits.value[id].max === marks.length
-    colorMarks.value[id] = [...marks, key]
-    if (tracking) colorLimits.value[id].max = colorMarks.value[id].length
-  }
-  const limits = colorLimits.value[id]
-  if (limits.max > colorMarks.value[id].length) limits.max = colorMarks.value[id].length
-  if (limits.min > limits.max) limits.min = limits.max
+  colorMarks.value[id] = marks.includes(key) ? marks.filter(mark => mark !== key) : [...marks, key]
 }
 
 function onPick (game, outcome) {
@@ -877,6 +862,11 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
   margin-top: 8px;
   font-size: 13px;
   user-select: none;
+}
+.reduce-note {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: rgba(var(--v-theme-on-surface), 0.72);
 }
 .color-name { width: 48px; flex: none; }
 .stepper { display: inline-flex; align-items: center; gap: 4px; flex: none; }

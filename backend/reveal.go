@@ -521,6 +521,90 @@ func signLegacy(payer ed25519.PrivateKey, writable, readonly [][]byte, ixs []ixS
 	return append(out, msg...), nil
 }
 
+type txAccount struct {
+	key      []byte
+	signer   bool
+	writable bool
+}
+
+// signAccounts signs a legacy transaction whose accounts are already in Solana order:
+// writable signers, readonly signers, writable accounts, readonly accounts.
+func signAccounts(keys []ed25519.PrivateKey, accounts []txAccount, ixs []ixSpec, blockhash []byte) ([]byte, error) {
+	if len(blockhash) != 32 {
+		return nil, errors.New("blockhash must be 32 bytes")
+	}
+	signers := 0
+	readonlySigned := 0
+	readonlyUnsigned := 0
+	phase := 0
+	for _, account := range accounts {
+		kind := 3
+		switch {
+		case account.signer && account.writable:
+			kind = 0
+			signers++
+		case account.signer:
+			kind = 1
+			signers++
+			readonlySigned++
+		case account.writable:
+			kind = 2
+		default:
+			readonlyUnsigned++
+		}
+		if kind < phase {
+			return nil, errors.New("transaction accounts are out of order")
+		}
+		phase = kind
+		if len(account.key) != 32 {
+			return nil, errors.New("an account key is the wrong size")
+		}
+	}
+	if signers == 0 {
+		return nil, errors.New("the transaction has no signer")
+	}
+	var msg []byte
+	msg = append(msg, byte(signers), byte(readonlySigned), byte(readonlyUnsigned))
+	msg = append(msg, shortBytes(len(accounts))...)
+	for _, account := range accounts {
+		msg = append(msg, account.key...)
+	}
+	msg = append(msg, blockhash...)
+	msg = append(msg, shortBytes(len(ixs))...)
+	for _, ix := range ixs {
+		msg = append(msg, byte(ix.program))
+		msg = append(msg, shortBytes(len(ix.accounts))...)
+		for _, account := range ix.accounts {
+			msg = append(msg, byte(account))
+		}
+		msg = append(msg, shortBytes(len(ix.data))...)
+		msg = append(msg, ix.data...)
+	}
+	var sigs []byte
+	signed := 0
+	for _, account := range accounts {
+		if !account.signer {
+			continue
+		}
+		var key ed25519.PrivateKey
+		for _, candidate := range keys {
+			if bytes.Equal(candidate.Public().(ed25519.PublicKey), account.key) {
+				key = candidate
+				break
+			}
+		}
+		if key == nil {
+			return nil, errors.New("a required signer key is missing")
+		}
+		sigs = append(sigs, ed25519.Sign(key, msg)...)
+		signed++
+	}
+	if signed != signers {
+		return nil, errors.New("the transaction signers do not match")
+	}
+	return append(append(shortBytes(signers), sigs...), msg...), nil
+}
+
 func (s *solanaRPC) latestBlockhash(ctx context.Context) ([]byte, error) {
 	var out struct {
 		Value struct {

@@ -263,3 +263,42 @@ Reveal checks the commitment and the colors. It rejects a color with no signs, a
 Worked example: six games marked yellow on `1`, minimum 3 and maximum 5, and every other selected sign left as it is. The other two games of an eight-game frame are `1`, `X`, and `2`. The frame is 6,561 rows and the kept rows are 2,088, on one coupon with one signature.
 
 Entries placed before this rule were split in the browser into ordinary system coupons, one `place_slip` per pattern, from a group saved in MongoDB with the picks sealed by the wallet's coupon key. A group saved that way can still be resumed, and each of its coupons is revealed, scored, claimed, and refunded by the rules for one slip.
+
+## 13. Event size and the canopy
+
+An event takes at most 1,000,000 coupons, or the lower maximum the admin set when creating it. The program refuses the next coupon, and the event page says the event is full. The limit counts coupons, not rows.
+
+The coupons of a vault event are the leaves of two hash trees of depth 20: one for entries and one for revealed picks. A coupon proves its place with the 20 hashes on its path. An event created from this rule on has a canopy: an account, owned by the program, that stores every node from level 10 up to the root of both trees, and one paid bit per coupon. A transaction for one coupon sends only the 10 hashes inside the coupon's own group of 1,024. The program reads the other 10 from the canopy and checks the same depth-20 root. Placing a coupon sends no hashes at all. This keeps place, reveal, count, claim, and refund for one coupon inside one Solana transaction up to coupon 1,000,000.
+
+The canopy changes how a coupon is proved. It does not change what a coupon pays or wins. An event created from the signed-totals rule on settles from a signed winner list, as section 14 describes. An earlier event is still counted one coupon per transaction, in coupon order, and every amount in sections 4 to 12 is computed as before.
+
+- **Storage fee.** The canopy grows by 256 bytes for every 1,024 coupons. Each coupon pays 1,740 lamports toward the rent of those bytes, in SOL, on SOL events and league events alike. The fee goes to the canopy account. It is not part of the pool, it is not a house fee, and it is not returned when a coupon is refunded.
+- **Reveal.** A reveal is accepted only with a proof that the coupon was entered with that owner, row count, and commitment, and only while that coupon's reveal leaf is empty.
+- **Paid once.** A claim or a refund sets the coupon's paid bit. A second claim or refund of the same coupon is refused.
+- **Earlier events.** An event created before this rule has no canopy. It keeps the instructions and the full proofs it was created with, and it is not converted.
+
+## 14. Signed totals and the challenge window
+
+An event created from this rule on does not count every coupon on chain before it can pay. After the result signers lock the results, the keeper counts the archive with the same kept-row count as the program and posts the number of rows at each score. The result signers sign that exact list. The same threshold as a result applies. A list that differs in any value, or a different poster, is a different proposal and the approvals start again.
+
+The poster locks 3 SOL with the totals. That bond moves into the event vault on the signature that reaches the threshold, and only when the poster signs that transaction. The 6-hour window then starts. It is 54,000 slots from the slot in which the totals locked, so a halt of the cluster does not shorten it. Wall-clock time does not end it.
+
+During the window, claims are closed. Anyone can challenge by locking a bond. The bond is 10% of the player pot, clamped to the minimum and maximum stored on the event. The player pot is the part of sales the tiers take, plus rollover in: sales times the sum of the tier percents, divided by 100, plus rollover. The limits are whole SOL from 1 to 100, and the minimum cannot be above the maximum. The defaults are 10 and 50. A pot of 100 SOL or less locks 10 SOL, a pot of 250 SOL locks 25 SOL, and a pot of 500 SOL or more locks 50 SOL. An event created before the field existed uses 10 and 50. A minimum under 10 SOL does not cover the fees of a recount at 1,000,000 coupons; the page warns, and the program still accepts it.
+
+Only the first challenge counts. A later one is refused and moves no money. Only the challenger's signing key can receive the bonds.
+
+When the window ends with no challenge, anyone can finalize. That sets the payout per row from the signed totals, runs the settlement in section 7, including the house share, the league 5%, and rollover, opens claims, and returns the poster's bond.
+
+A challenge starts the recount. The on-chain count runs again from the first coupon, one coupon per transaction, in order. Anyone can send those scores. Claims stay closed until it finishes. Each score in the recount records a fee of 5,000 lamports for its fee payer. At 1,000,000 coupons that is 5 SOL. The recorded fee is that fixed amount, so a caller cannot choose a larger one.
+
+If the recount matches the signed totals, those totals stand. The challenger's bond first pays the recorded fees back, up to the bond, and the remainder is added to the pool before settlement. The poster's bond is returned. If the recount differs, the recount totals are used, the event shows that the signed totals were rejected, and the challenger receives their bond plus what remains of the poster's bond after the recorded fees. Fees above the 3 SOL poster bond stay with whoever sent the scores.
+
+A claim adds the rows it pays to a per-tier counter and is refused past the signed total for that tier, or past the recount total when the signed list was rejected. The tier pot is the ceiling. A total that is too high makes every payout smaller and leaves the rest in the vault.
+
+The totals for scores 0 through 13 must add up to the kept rows of every revealed coupon. Each reveal adds that coupon's kept rows to a running sum on the canopy. Totals that add up to anything else are rejected. Scores above the event's game count must be zero. Rows can still be moved between scores, and the challenge is what catches that.
+
+The event admin, or a result signer, can start the on-chain count as soon as the results are locked. Starting it closes the signed-totals path. If no totals are locked within 24 hours of the result approval, anyone can start that count with no bonds. The 24 hours are unix time. An event cannot stay unpaid because nobody signed.
+
+During the window the result signers can cancel with the usual threshold. Every stake is then refunded and the poster bond is returned. A wrong result can still be undone before a claim is paid. Cancelling is not available merely because the results are locked and the totals are not yet posted.
+
+Events created before this rule, and events already counting when the program is upgraded, keep the earlier count. The new path applies to events created after the upgrade.

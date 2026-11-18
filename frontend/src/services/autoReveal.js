@@ -15,7 +15,7 @@ const CLOCK_MARGIN_MS = 5000
 let timer = null
 let running = false
 let failures = 0
-// Coupons whose reveal the player declined in Phantom are left to the manual button.
+// Coupons whose reveal the player declined in the wallet are left to the manual button.
 let declined = new Set()
 
 function schedule (ms) {

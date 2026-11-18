@@ -73,11 +73,11 @@ func TestAutoResolveUsesSavedScoresUntilTheyAreFinal(t *testing.T) {
 	if allowScoreFetch(resolveScoreFetches, time.Time{}, now) {
 		t.Fatal("the feed was called again after the saved scores stayed unfinished")
 	}
-	if resolveScoreFetches != 5 || resolveScoreGap != 5*time.Minute {
+	if resolveScoreFetches != 10 || resolveScoreGap != 30*time.Minute {
 		t.Fatalf("retries = %d gap = %s", resolveScoreFetches, resolveScoreGap)
 	}
 	notice := scoreGiveUpMessage("game 1 is still in play")
-	if notice != "Auto resolve stopped after 5 tries, 5 minutes apart: game 1 is still in play. Set the results by hand." {
+	if notice != "Auto resolve stopped after 10 tries, 30 minutes apart: game 1 is still in play. Set the results by hand." {
 		t.Fatal(notice)
 	}
 	final := map[int]fixtureState{7: finished("FT", 1, 0)}
@@ -88,6 +88,25 @@ func TestAutoResolveUsesSavedScoresUntilTheyAreFinal(t *testing.T) {
 	got := decideAutoResolve(games, final, final)
 	if got.Results != "1" {
 		t.Fatalf("saved score decision %+v", got)
+	}
+}
+
+func TestLockedResultsDropTheHandSetNotice(t *testing.T) {
+	event := &Event{
+		AutoResolve: true,
+		Games:       []Game{{FixtureID: 11}},
+		ScoreBlock:  "Auto resolve stopped after 5 tries, 5 minutes apart: game 11 is still in play. Set the results by hand.",
+		Chain:       &ChainVault{Status: "tallying"},
+		StartTime:   time.Now().Add(-time.Hour),
+	}
+	(&App{}).prepare(event, time.Now())
+	if event.AutoResolveBlock != "" {
+		t.Fatalf("locked results still asked for a hand result: %s", event.AutoResolveBlock)
+	}
+	event.Chain.Status = "open"
+	(&App{}).prepare(event, time.Now())
+	if event.AutoResolveBlock == "" {
+		t.Fatal("an open vault hid the hand-set notice")
 	}
 }
 

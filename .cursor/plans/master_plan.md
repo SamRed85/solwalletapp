@@ -90,28 +90,39 @@ todos:
     status: completed
     dependencies:
       - phase15_reduction
-  - id: phase17_canopy
-    content: "Phase 17: Canopy so one score, place, or claim still fits at 1,000,000 coupons. The program refuses coupon 1,000,001. The tree stays depth 20."
-    status: pending
+  - id: phase17_event_types
+    content: "Phase 17: Event types and type-aware rollover. Saturday 13, Wildcard 13 and Sprint 8. A jackpot only rolls to the next event of the same type."
+    status: completed
     dependencies:
       - phase16_game_details
-  - id: phase18_signed_totals
-    content: "Phase 18: Signed totals. The keeper counts off chain, the result signers sign the winner totals, and claims open after a 6-hour challenge window. The admin sets the disputer's minimum and maximum SOL when creating the event (defaults 10 and 50). A challenge locks 10% of the player pot inside that range and starts the on-chain recount. Claims are capped per tier at the signed totals."
-    status: pending
+  - id: phase18_canopy
+    content: "Phase 18: Canopy so one score, place, or claim still fits at 1,000,000 coupons. The program refuses coupon 1,000,001. The tree stays depth 20. Built and tested in this tree; the devnet upgrade waits for the user."
+    status: completed
     dependencies:
       - phase16_game_details
+  - id: phase19_signed_totals
+    content: "Phase 19: Signed totals. The keeper counts off chain, the result signers sign the winner totals, and claims open after a 6-hour challenge window. Built and tested in this tree. The devnet upgrade waits for the user. A second process with TOTALS_WATCH=1, its own MongoDB, and its own RPC is the watcher."
+    status: completed
+    dependencies:
+      - phase16_game_details
+  - id: phase20_wallets
+    content: "Phase 20: Wallet Standard sign-in. Phantom, Jupiter Wallet, Jupiter Mobile on Android, Solflare and Backpack can sign in, pay and place. Sign In With Solana when the wallet has it, otherwise the existing nonce message. The session cookie stays. No embedded or social login. Live wallet passes are still open."
+    status: in_progress
+    dependencies:
+      - phase1_session_auth
   - id: fixes_before_final
     content: "Fixes before the final phase: move the upgrade authority to a multisig with a time lock, split the two result keys, show who can approve an event, add a dispute window, and decide what happens to unclaimed prizes. Do not start until the user asks for it."
     status: pending
     dependencies:
       - phase16_game_details
-      - phase18_signed_totals
+      - phase19_signed_totals
   - id: phase10_audit_mainnet
     content: "Final phase: Tests, fuzzing, external audit, bug bounty, capped mainnet launch. When it starts, choose the independent second signer: it signs only a result it derived from the full-time scores, a mismatch stays unsigned, and the 7-day refund stays. A timeout must not adopt the first signature. Do not start until the user says start final phase."
     status: pending
     dependencies:
-      - phase17_canopy
-      - phase18_signed_totals
+      - phase18_canopy
+      - phase19_signed_totals
+      - phase20_wallets
       - fixes_before_final
 ---
 
@@ -601,7 +612,7 @@ Each saved game stores that feed's fixture id. Team names are not matched again 
 - [x] A restart continues from the on-chain `tallied` counter. A coupon that is already scored is not sent again.
 - [x] The keeper pays the network fee. The count does not wait for the admin's wallet.
 - [x] **Count coupons and settle** stays and still counts from the same counter.
-- [x] If one score transaction does not fit, the keeper stops and says so. This phase does not add a canopy. A few hundred coupons fit. Ten thousand do not. Phase 17 is the canopy.
+- [x] If one score transaction does not fit, the keeper stops and says so. This phase does not add a canopy. A few hundred coupons fit. Ten thousand do not. Phase 18 is the canopy.
 
 **Done when:** an approved event with several coupons settles with no Phantom approval for the count, and a stopped keeper finishes the remaining coupons on its own.
 
@@ -762,24 +773,34 @@ Rules:
 ---
 ## Phase 18: Canopy for large events
 
+Built (Nov 2026). The program, the keeper and the pages are in this tree and tested. The devnet program is not upgraded yet: that is a separate step the user asks for. The pages and the keeper in this tree need the upgraded program, because `create_event` now takes the canopy account.
+
 **Goal:** placing, counting, and claiming one coupon still fit in a Solana transaction at 1,000,000 coupons, and the program refuses another one. The tree stays depth 20, which could hold 1,048,576. The event stops at 1,000,000.
 
 Empty proof hashes are already left out. Above a few hundred coupons the upper hashes are real, and three of those proofs do not fit. A canopy is the upper part of the tree stored by the program. The wallet sends only the bottom of the proof. The program attaches the stored top and checks the same root.
 
-- [ ] New events grow a canopy as coupons are placed. The program writes the shared upper nodes. The client does not send them again on place, reveal, score, claim, or refund.
-- [ ] A score, place, or claim for one coupon stays under the Solana size limit at coupon 1,000,000.
-- [ ] `place_slip` rejects the coupon that would make the count 1,000,001. The create-event page and the coupon page say the event is full.
-- [ ] The tree depth stays 20. Events already on chain keep the proofs they use now.
-- [ ] The stored nodes have to fit in accounts the event can rent.
-- [ ] The payout math does not change. The on-chain count is still one coupon per transaction, in order. A canopy makes each transaction fit. It does not settle every coupon in one approval. After Phase 18, that count runs only as the recount after a challenge, or when no totals are signed in time.
+- [x] New events grow a canopy as coupons are placed. The program writes the shared upper nodes. The client does not send them again on place, reveal, score, claim, or refund. `create_event` creates one canopy account per event (`canopy` + event). It stores levels 10 to 20 of the entry tree and the reveal tree, and one paid bit per coupon. New events use `place_canopy_slip`, `reveal_canopy_slip`, `score_canopy_slip`, `claim_canopy_slip` and `refund_canopy_slip`. Place sends no hashes. The others send the 10 hashes inside the coupon's group of 1,024.
+- [x] A score, place, or claim for one coupon stays under the Solana size limit at coupon 1,000,000. With four colors and a compute limit instruction: place 412 bytes, reveal 1,070, score 879, claim 779, refund 708, against a limit of 1,232.
+- [x] `place_canopy_slip` rejects the coupon that would make the count 1,000,001. Every new event has a canopy, so `place_slip` is only reached on an older event, which keeps the maximum it was created with. The create-event page says an event is full at its maximum, and the coupon page and the vault panel say the event is full.
+- [x] The tree depth stays 20. Events already on chain keep the proofs they use now: an event with no canopy keeps `place_slip`, `reveal_slip`, `score_slip`, `claim_slip` and `refund_slip`, and the canopy instructions refuse it. A new event refuses the old ones.
+- [x] The stored nodes have to fit in accounts the event can rent. The canopy starts at 704 bytes, paid by the admin with the event (about 0.0058 SOL). It grows by 256 bytes when the first coupon of each group of 1,024 is placed. Each coupon pays 1,740 lamports toward that rent on top of its stake. A full event is 250,560 bytes, about 1.74 SOL of rent in total. No instruction closes the canopy, so that rent stays in the account.
+- [x] The payout math does not change. The on-chain count is still one coupon per transaction, in order. A canopy makes each transaction fit. It does not settle every coupon in one approval. After Phase 19, that count runs only as the recount after a challenge, or when no totals are signed in time.
+- [x] On a canopy event a reveal also proves the entry leaf, so a reveal for a coupon that was never placed is refused. An older event does not check that.
+- [x] The archive answers for one group of 1,024 (`from`, `to`) or for one wallet (`owner`), so a proof or a coupon list does not load the whole event. The keeper and the pages send a compute limit of 400,000 units with a colored coupon on a canopy event: a count at the 64-state cap used 220,029 units on the local validator, above the default 200,000.
 
-**Done when:** coupon 1,000,000 can be placed, counted, and claimed in a transaction that fits, and coupon 1,000,001 is rejected.
+**Done when:** coupon 1,000,000 can be placed, counted, and claimed in a transaction that fits, and coupon 1,000,001 is rejected. Met in the program tests (`coupon_one_million_fits_and_the_next_is_refused`), the keeper tests and the page tests, and the built program ran place, reveal and score through a canopy on a local validator.
+
+Left open:
+
+- The archive reads 25 program signatures a minute. A page or the keeper also sends each of its own transactions to the archive at once, but a restart in the middle of a large event catches up at that pace.
+- `place_coupon` still works on a slip event and takes a coupon number the tree does not have. Slips are then refused on that event. The test scripts still use it, so it was left in. It belongs with the fixes build.
+- An older event's count and claim send no compute limit. A colored coupon near the 64-state cap can pass 200,000 units there. Adding the instruction can push an older event's count over the size limit, so it was not changed.
 
 ---
 
 ## Phase 19: Signed totals and a challenge window
 
-Do not start this phase until the user asks for it. 
+Do not start this phase until the user asks for it. The user asked, and the work below is in this tree. The devnet program is not upgraded until the user asks.
 
 **Goal:** an event with 1,000,000 coupons settles in hours, not weeks. Counting moves off chain. Each claim is still checked on chain. A wrong total can be thrown out by anyone during a short window, and the vault can never pay out more than the pool.
 
@@ -798,46 +819,102 @@ How it works:
 
 Rules:
 
-- [ ] **Totals instruction.** `sign_totals` records one signer's approval of a totals list and its poster, the same way `approve_resolution` records a result. When the threshold agrees on the same list, the totals are locked, the poster's bond moves into the event, and the window opens. A second list cannot replace a locked one.
-- [ ] **Bounded totals.** Every revealed row has exactly one score, so the totals for 0 through 13 correct must add up to the kept rows of every revealed coupon. `reveal_slip` keeps that running sum on chain. Totals that add up to anything else are rejected, so rows cannot be invented or dropped as a whole. Rows can still be moved between tiers, and the challenge is what catches that.
-- [ ] **Per-tier claim cap.** `claim_slip` adds the rows it pays to a per-tier counter and refuses a claim that would go past the signed total for that tier. The tier pot is the ceiling, whatever was signed.
-- [ ] **Disputer bond set on the event.** The create-event form has a minimum and a maximum SOL for the disputer. The defaults are 10 and 50. Both are whole SOL amounts from 1 to 100, and the minimum cannot be above the maximum. The program stores them on the event. The bond is 10% of the player pot, clamped to that event's minimum and maximum. The player pot is the amount the tiers divide: sales plus rollover, after the house and league shares. With the defaults, a pot of 100 SOL or less locks 10 SOL, a pot of 250 SOL locks 25 SOL, and a pot of 500 SOL or more locks 50 SOL. The page shows the amount before the challenger signs. Events created before this field existed use 10 and 50. A minimum under 10 SOL does not cover the fees of a recount at 1,000,000 coupons.
-- [ ] **One challenge.** Only the first challenge counts. A later challenge is refused and moves no money. Only the challenger's signing key can receive the bonds, so copying the challenge transaction earns nothing.
-- [ ] **Recount fees.** Each `score_slip` in a recount records its fee payer and the fee. The losing bond pays those fees back first, up to the bond, before anything else is paid. At 1,000,000 coupons the recount costs about 5 SOL. With the default minimum of 10 SOL, a false challenge covers those fees and the remainder goes to the event pool. A lower minimum set on the event can leave some of the fees unpaid. A challenge that wins is repaid from the poster's 3 SOL bond, so fees above that stay with whoever sent the scores.
-- [ ] **No totals in time.** If no totals are locked within 24 hours of result approval, anyone can start the on-chain count without bonds, as today. An event cannot be stuck because nobody signed.
-- [ ] **Signers can still cancel.** During the window the result signers can cancel the event with the usual threshold. Every stake is then refunded. This is the dispute window from "Fixes before the final phase": a wrong result, such as a mistyped `C`, can still be undone before money moves.
-- [ ] **Claims wait.** No claim is paid while the event is in the window or a recount. A signer who undercounts a tier cannot claim first.
-- [ ] **Too-high totals.** A total that is too high makes every payout smaller and leaves the rest in the vault. That remainder follows the unclaimed-prize rule chosen in the fixes phase.
-- [ ] **Events already on chain.** Events already tallying, and events created before the upgrade, keep the Phase 12 count. The new path applies to events created after the upgrade.
+- [x] **Totals instruction.** `sign_totals` records one signer's approval of a totals list and its poster, the same way `approve_resolution` records a result. When the threshold agrees on the same list, the totals are locked, the poster's bond moves into the event, and the window opens. A second list cannot replace a locked one.
+- [x] **Bounded totals.** Every revealed row has exactly one score, so the totals for 0 through 13 correct must add up to the kept rows of every revealed coupon. `reveal_canopy_slip` keeps that running sum on the canopy. Totals that add up to anything else are rejected, so rows cannot be invented or dropped as a whole. Rows can still be moved between tiers, and the challenge is what catches that.
+- [x] **Per-tier claim cap.** `claim_slip` adds the rows it pays to a per-tier counter and refuses a claim that would go past the signed total for that tier. The tier pot is the ceiling, whatever was signed.
+- [x] **Disputer bond set on the event.** The create-event form has a minimum and a maximum SOL for the disputer. The defaults are 10 and 50. Both are whole SOL amounts from 1 to 100, and the minimum cannot be above the maximum. The program stores them on the event. The bond is 10% of the player pot, clamped to that event's minimum and maximum. The player pot is the amount the tiers divide: sales plus rollover, after the house and league shares. With the defaults, a pot of 100 SOL or less locks 10 SOL, a pot of 250 SOL locks 25 SOL, and a pot of 500 SOL or more locks 50 SOL. The page shows the amount before the challenger signs. Events created before this field existed use 10 and 50. A minimum under 10 SOL does not cover the fees of a recount at 1,000,000 coupons.
+- [x] **One challenge.** Only the first challenge counts. A later challenge is refused and moves no money. Only the challenger's signing key can receive the bonds, so copying the challenge transaction earns nothing.
+- [x] **Recount fees.** Each `score_slip` in a recount records its fee payer and the fee. The losing bond pays those fees back first, up to the bond, before anything else is paid. At 1,000,000 coupons the recount costs about 5 SOL. With the default minimum of 10 SOL, a false challenge covers those fees and the remainder goes to the event pool. A lower minimum set on the event can leave some of the fees unpaid. A challenge that wins is repaid from the poster's 3 SOL bond, so fees above that stay with whoever sent the scores.
+- [x] **No totals in time.** If no totals are locked within 24 hours of result approval, anyone can start the on-chain count without bonds, as today. An event cannot be stuck because nobody signed.
+- [x] **Signers can still cancel.** During the window the result signers can cancel the event with the usual threshold. Every stake is then refunded. This is the dispute window from "Fixes before the final phase": a wrong result, such as a mistyped `C`, can still be undone before money moves.
+- [x] **Claims wait.** No claim is paid while the event is in the window or a recount. A signer who undercounts a tier cannot claim first.
+- [x] **Too-high totals.** A total that is too high makes every payout smaller and leaves the rest in the vault. That remainder follows the unclaimed-prize rule chosen in the fixes phase.
+- [x] **Events already on chain.** Events already tallying, and events created before the upgrade, keep the Phase 12 count. The new path applies to events created after the upgrade.
 
 Off-chain work:
 
-- [ ] **Keeper.** It counts with the same colored row count as the program (`kept_counts`, the shared test vectors), builds the scored list, asks the signers to sign, and posts. A count error in Go must lose a challenge, not settle.
-- [ ] **Two watchers.** At least two watchers, each with its own archive built from chain history as the event runs, on different RPC providers. Neither may read the other's MongoDB. Each counts independently and challenges automatically when its totals differ from the signed totals, and it alerts the operator either way. Many RPC providers drop old transactions, so the archive is kept from the first coupon, not rebuilt after the event.
-- [ ] **The second signer counts on its own.** It signs totals only when its own count, from its own archive, matches. When the counts differ, it does not sign, and the 24-hour fallback applies.
-- [ ] **Event page.** It shows the signed totals, the time left in the window, the bond amounts, the challenge button, and the recount progress, and it says whether the totals were confirmed or rejected.
+- [x] **Keeper.** It counts with the same colored row count as the program (`kept_counts`, the shared test vectors), builds the scored list, asks the signers to sign, and posts. A count error in Go must lose a challenge, not settle.
+- [x] **Two watchers.** At least two watchers, each with its own archive built from chain history as the event runs, on different RPC providers. Neither may read the other's MongoDB. Each counts independently and challenges automatically when its totals differ from the signed totals, and it alerts the operator either way. Many RPC providers drop old transactions, so the archive is kept from the first coupon, not rebuilt after the event.
+- [x] **The second signer counts on its own.** It signs totals only when its own count, from its own archive, matches. When the counts differ, it does not sign, and the 24-hour fallback applies.
+- [x] **Event page.** It shows the signed totals, the time left in the window, the bond amounts, the challenge button, and the recount progress, and it says whether the totals were confirmed or rejected.
 
 Tests:
 
-- [ ] Correct totals settle after the window with no challenge, and claims pay as before.
-- [ ] Undercounted totals are challenged and recounted, the recount totals are used, and the challenger receives both bonds.
-- [ ] A false challenge loses its bond, the recount fees are paid back first, and the signed totals stand.
-- [ ] A claim past the tier cap is refused. A claim during the window or a recount is refused.
-- [ ] A second challenge, a totals list that differs between signers, totals above the revealed rows, and a window shortened by wall-clock time are all rejected.
-- [ ] With no totals after 24 hours, the old count runs and settles.
+- [x] Correct totals settle after the window with no challenge, and claims pay as before.
+- [x] Undercounted totals are challenged and recounted, the recount totals are used, and the challenger receives both bonds.
+- [x] A false challenge loses its bond, the recount fees are paid back first, and the signed totals stand.
+- [x] A claim past the tier cap is refused. A claim during the window or a recount is refused.
+- [x] A second challenge, a totals list that differs between signers, totals above the revealed rows, and a window shortened by wall-clock time are all rejected.
+- [x] With no totals after 24 hours, the old count runs and settles.
 
-**Done when:** a devnet event settles from signed totals 6 hours after posting with no score transactions, a deliberately wrong total is thrown out by a watcher's challenge and recounted, and no claim can pay more than its tier pot.
+**Done when:** a devnet event settles from signed totals 6 hours after posting with no score transactions, a deliberately wrong total is thrown out by a watcher's challenge and recounted, and no claim can pay more than its tier pot. The program, keeper, watcher, page, and tests are in this tree. The tests cover that settlement. The devnet program was upgraded on 13 Nov 2026. The binary hash is `a5df12a6e862cfd74a9b3b6b2260bce11bcd178a3acf48ef317d370ad7f0386d`. The live settlement pass is still open. Run a second process with `TOTALS_WATCH=1`, its own `MONGODB_URI`, and its own `SOLANA_RPC_URL`. That process challenges and does not post.
+
+---
+
+## Phase 20: More ways to sign in
+
+Built in this tree. It does not change the program. The session stays a signature checked by the server, then the same 12-hour HMAC cookie from Phase 1. The live wallet passes at the bottom are still open.
+
+**Goal:** a player can sign in, pay, place, reveal and claim with Jupiter Wallet, Solflare or Backpack, as well as Phantom. A phone can use Jupiter Mobile. The server still only trusts an ed25519 signature from that account.
+
+Today `frontend/src/services/solana.js` talks only to `window.phantom.solana`, or to `window.solana` when that object says it is Phantom. Home says a Phantom wallet is required. Jupiter Wallet can pretend to be Phantom from its own settings. That workaround picks the wrong account once two extensions both answer as Phantom.
+
+How Solana sign-in works now:
+
+- Wallets register with the Wallet Standard. The page asks the browser which Solana wallets are installed. Phantom, Jupiter Wallet, Solflare and Backpack all register. There is no package per wallet.
+- Sign In With Solana (`solana:signIn` on the Wallet Standard) is one prompt. The wallet builds the message, naming this site's domain, the account, the chain, a nonce and the time, then signs it. Phantom, Solflare and Backpack do this. The wallet checks the domain, so a copy of the site cannot reuse a sign-in made for this origin.
+- A wallet without `signIn` still has `signMessage`. Jupiter's extension signs off-chain messages, including from a Ledger. Jupiter Mobile, reached through the Solana Mobile Wallet Adapter, connects and then signs a message. It does not return a native sign-in result. Those wallets keep today's message from `loginMessage`: `Sign in to Sol (devnet)`, the wallet, the nonce and the issued time.
+- The server keeps issuing the nonce and storing the exact text it will accept (`nonceStore.issue`). For a Sign In With Solana wallet, the page passes that nonce, this origin, `solana:devnet` and the statement into `signIn`, and login sends the bytes the wallet signed. The server accepts the signature only when those bytes are the stored message, or a Sign In With Solana message whose domain, address, chain and nonce are the ones it issued. A message supplied by the client that merely contains the nonce is rejected. The nonce stays single use, for five minutes, bound to one wallet.
+- Version `1.1.0` of `signIn` can wrap that text as an off-chain message, which a Ledger can display. Pass `useOffchainMessage` only when the wallet reports version `1.1.0`. A wallet on `1.0.0` rejects the field.
+- Payments and program transactions use that same wallet's `solana:signAndSendTransaction`, chain `solana:devnet`, and the serialized transaction the page already builds. The wallet broadcasts it. A wallet left on mainnet rejects the devnet blockhash, which is what Phantom does today, so a mainnet account does not spend real SOL.
+
+Wallets in this phase:
+
+- Phantom, on desktop and inside its in-app browser. The provider can still appear after the page loads. Listen for the Wallet Standard `register` event instead of polling for Phantom.
+- Jupiter Wallet, the browser extension, on Chromium browsers (Chrome, Brave, Arc, Edge, Opera). There is no Firefox extension. The install link is the official page at jup.ag/wallet, whose extension publisher is `extension@jup.ag`.
+- Jupiter Mobile on Android Chrome, through the Solana Mobile Wallet Adapter. The page registers that adapter only on Android, and only for devnet, so Chrome can hand the site to Jupiter Mobile. A desktop QR is not shown: production wallets, including Jupiter, do not complete the remote adapter pairing, and the QR Jupiter documents is WalletConnect, which this phase does not add. On a phone the page opened inside Jupiter, Phantom, Solflare or Backpack uses that wallet directly.
+- Solflare, extension and its in-app browser.
+- Backpack, extension and its in-app browser.
+
+Left out on purpose:
+
+- Jupiter ID (email, Google or Apple) and any other embedded wallet. That key is created behind someone else's login. Here the payment, the coupon encryption key and the claim all belong to the account that signed in. An embedded key is a different product.
+- A React wallet kit, including Jupiter Wallet Kit. This frontend is Vue. The page talks to the Wallet Standard itself.
+- WalletConnect as its own button. Jupiter Mobile and the in-app browsers cover the phone.
+- Every other Wallet Standard wallet on the first day. A wallet that can connect but cannot pay is a broken sign-in. Adding another wallet later is a devnet pass of sign-in, one treasury payment and one vault place.
+
+Rules:
+
+- [x] **One wallet module.** Connect, sign-in, `signMessage`, account changes and `signAndSendTransaction` go through the selected Wallet Standard wallet. Phantom uses that path too. `getProvider` no longer looks up Phantom by name.
+- [x] **Picker.** The connect control lists whichever of these wallets are installed. On Android, Jupiter Mobile is the Mobile Wallet Adapter. The home page no longer says Phantom is required. Approval text says "your wallet".
+- [x] **Same session.** The cookie, the 12-hour HMAC, the display name and the admin check stay as they are. Signing out still clears the cookie and disconnects the wallet.
+- [x] **Account switch.** A different account from the wallet ends the session, as a Phantom account change does today.
+- [x] **Devnet only.** Sign-in and every transaction name `solana:devnet`.
+- [x] **Coupon key.** The encryption signature stays a `signMessage` of the existing fixed text, from the connected wallet.
+- [x] **No secret leaves the wallet.** The page receives a public key and signatures only.
+
+Tests:
+
+- [ ] Phantom still signs in, pays a treasury entry, and places a vault coupon on devnet.
+- [ ] Jupiter Wallet does those same three steps.
+- [ ] Solflare and Backpack do those same three steps.
+- [ ] Jupiter Mobile signs in from a phone and completes one payment.
+- [ ] A wallet with `signIn` and a wallet with only `signMessage` both get a session. A reused nonce fails for both. The server side is tested: both messages are accepted once, and the nonce cannot be used again.
+- [x] A Sign In With Solana message for another domain, another chain, or another address is rejected.
+- [ ] A wallet set to mainnet does not broadcast the devnet payment. The page always asks for `solana:devnet`. A mainnet wallet still has to be tried on a device.
+
+**Done when:** Phantom, Jupiter Wallet, Solflare and Backpack can each sign in, pay and place on devnet, Jupiter Mobile can sign in and pay, and the server still rejects a signature that was not made by the account in the session.
 
 ---
 
 ## Fixes before the final phase
 
-Do not start this phase until the user asks for it. It does not wait for Phase 17, and the final phase does not start until this one is done. Nothing here changes the live devnet program until the user asks for a build.
+Do not start this phase until the user asks for it. It does not wait for Phase 18, and the final phase does not start until this one is done. Nothing here changes the live devnet program until the user asks for a build.
 
 The Phase 5 council cannot upgrade the program. `execute_upgrade` fails with PrivilegeEscalation: the loader needs the program account writable, and the runtime keeps the running program read-only. On devnet the upgrade authority is the deployer key `955GUT...`, so that one key can replace the program instantly and can therefore take any vault. No council account exists for program `AaXABVJE...`.
 
 - [x] **Stop the handoff that would freeze the program.** `handoff-devnet.sh` and `deploy-devnet.sh` moved the authority to the council PDA, which can never sign an upgrade. The handoff is disabled in both. `upgrade-devnet.mjs --probe` is retired. Council addresses are derived from the program id. The copied address `D6e74...` belonged to the retired program. `examples/initialize_upgrade.rs` derives the address too, so a local run no longer panics on the old one.
-- [ ] **Add a dispute window.** Once the threshold approves, the event is in Tallying and cannot be cancelled, so a wrong result, including a mistyped void game `C`, cannot be corrected. Phase 18's 6-hour totals window is that window: the signers can cancel during it. Ship both in this build.
+- [ ] **Add a dispute window.** Once the threshold approves, the event is in Tallying and cannot be cancelled, so a wrong result, including a mistyped void game `C`, cannot be corrected. Phase 19's 6-hour totals window is that window: the signers can cancel during it. Ship both in this build.
 - [ ] **Decide unclaimed prizes.** Winnings with no claim stay in the vault forever, so a lost key locks that share. Choose one: leave them, or roll them into the next event after a claim deadline. A rollover needs a program change, so it belongs in the same build as the items below.
 - [ ] **Delete the dead council instructions.** Remove `schedule_upgrade`, `execute_upgrade`, `override_upgrade_delay` and `initialize_upgrade`. The last one hard-codes the deployer address. The devnet-testing build's five-minute delay and override go with them.
 - [ ] **Build the production binary.** The live program is the devnet-testing build. The replacement drops the delay and the override, because the delay will live in the multisig. This build also carries the dispute window and the unclaimed-prize rule. It is the last program change before the audit, and the last upgrade the deployer key signs.
@@ -855,8 +932,8 @@ Do not start this phase until the user says "start final phase", and not before 
 
 **Choose this when the phase starts.** The second result signer runs apart from the first and signs only a result it has derived itself from the full-time scores. When both sides produce the same 1, X, 2 string, both approvals land and the event settles with no one at the keyboard. When they differ, the event stays unsigned. The 7-day rule stays: after the resolution window, anyone can cancel and every stake is refunded. A timeout must not adopt the first signer's result, because that would let one key settle the pot by waiting.
 
-- [ ] **Independent second signer.** Take the option above. The first signature never becomes the result on its own. The same signer also signs the Phase 18 totals only from its own count.
-- [ ] **More result signers.** Decide whether an event can have more than 2 result signers, and its threshold. Results and Phase 18 totals use the same set.
+- [ ] **Independent second signer.** Take the option above. The first signature never becomes the result on its own. The same signer also signs the Phase 19 totals only from its own count.
+- [ ] **More result signers.** Decide whether an event can have more than 2 result signers, and its threshold. Results and Phase 19 totals use the same set.
 - [ ] Confirm the deployed program is the production build from the fixes phase, with the council instructions removed and the upgrade authority on the multisig.
 - [ ] Internal review against the spec and invariants.
 - [ ] Fuzz tests on `place_coupon`, `claim` and `refund`.
@@ -890,7 +967,8 @@ Do not start this phase until the user says "start final phase", and not before 
 | 17 | Every 13-game event looks the same in the list, and a Wildcard jackpot can land on Saturday, or the other way round |
 | 18 | An event past a few hundred coupons cannot be counted or claimed, or it keeps accepting coupons after 1,000,000 |
 | 19 | A 1,000,000-coupon event takes about 23 days to count before anyone can claim |
+| 20 | Only Phantom can sign in or pay, so a Jupiter, Solflare or Backpack user cannot play |
 | Fixes | One key can replace the program and take every vault, one server approves both sides of a result, and a wrong result cannot be undone |
 | Final | Real users lose real money |
 
-**Next step:** Phase 15 is done: a colored entry is one coupon and one signature, and the devnet program counts only its kept rows. Groups split before the upgrade still finish through the old queue. Phase 16 game details are on the event page. Phase 17 is the canopy and does not start until the user asks for it. Phase 18 (event types and type-aware rollover) is built: Saturday 13, Wildcard 13 and Sprint 8. The backend and the pages are in this tree. The program change ships with the next devnet upgrade; until then a Wildcard or Sprint vault cannot be published. Phase 19 replaces the coupon-by-coupon count with signed totals, a 6-hour challenge window and an on-chain recount on challenge. It does not start until the user asks for it, and its program change ships with the fixes build. "Fixes before the final phase" covers the upgrade authority, the result signers, the dispute window and unclaimed prizes, and does not start until the user asks for it. Do not start the final phase until the user says "start final phase". The old lottery vault is not paid by this program.
+**Next step:** Phase 15 is done: a colored entry is one coupon and one signature, and the devnet program counts only its kept rows. Groups split before the upgrade still finish through the old queue. Phase 16 game details are on the event page. Phase 17 (event types and type-aware rollover) is built: Saturday 13, Wildcard 13 and Sprint 8. The backend and the pages are in this tree. The program change ships with the next devnet upgrade; until then a Wildcard or Sprint vault cannot be published. Phase 18 (the canopy) is built and tested in this tree: new events store the upper tree nodes on chain, one coupon's transaction fits at coupon 1,000,000, and coupon 1,000,001 is refused. It ships with the same devnet upgrade, and the pages and the keeper in this tree must go out together with it, because `create_event` now takes the canopy account. Phase 19 is built in this tree: after results lock, the keeper posts signed winner totals, a 6-hour slot window can be challenged, and a recount or the 24-hour fallback settles the event. Claims are capped at the signed tier. The devnet program was upgraded on 13 Nov 2026 (hash `a5df12a6e862cfd74a9b3b6b2260bce11bcd178a3acf48ef317d370ad7f0386d`). The pages and the keeper in this tree still have to go out with it. This build still ships ahead of the fixes build. A second process with `TOTALS_WATCH=1` and its own database and RPC is the watcher. Phase 20 is in this tree: Phantom, Jupiter Wallet, Solflare and Backpack sign in through the Wallet Standard, and Android Chrome can hand the page to Jupiter Mobile. It does not change the program. The live sign-in, payment and place passes for those wallets are still open. "Fixes before the final phase" covers the upgrade authority, the result signers, the dispute window and unclaimed prizes, and does not start until the user asks for it. Do not start the final phase until the user says "start final phase". The old lottery vault is not paid by this program.

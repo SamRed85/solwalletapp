@@ -1,8 +1,22 @@
 import { reactive } from 'vue'
 import { authApi, configApi, setUnauthorizedHandler } from '@/services/api'
 import { SESSION_KEY, clearSession, loadSession, saveSession } from '@/services/session'
-import { connectWallet, disconnectWallet, getBalance, onPhantomAccount, selectedAccount, signMessage } from '@/services/solana'
+import { getBalance } from '@/services/solana'
+import {
+  connectPrompt,
+  disconnectWallet,
+  onWalletAccount,
+  openLogin,
+  reattach,
+  rememberAccount,
+  selectedAccount,
+  signLogin,
+  startWallets,
+  walletChoices
+} from '@/services/wallets'
 import { notify } from '@/stores/notify'
+
+export { openLogin, walletChoices }
 
 export const auth = reactive({
   wallet: null,
@@ -14,7 +28,7 @@ export const auth = reactive({
 })
 
 // A request sent before this moment carried no cookie for the current session, so its 401
-// says nothing about that session. Phantom's in-app browser also reports an empty account
+// says nothing about that session. A wallet's in-app browser also reports an empty account
 // for a few seconds after the first approval. That report is not a disconnect.
 let signedInAt = 0
 const SIGN_IN_GRACE_MS = 5000
@@ -24,6 +38,7 @@ function apply (session) {
   auth.displayName = session?.displayName ?? ''
   auth.isAdmin = session?.isAdmin ?? false
   if (!session) auth.balance = null
+  rememberAccount(auth.wallet)
 }
 
 export function setProfile (user) {
@@ -50,17 +65,18 @@ export async function refreshBalance () {
   }
 }
 
-export async function login () {
+export async function login (wallet) {
   auth.busy = true
   try {
-    const wallet = await connectWallet()
-    const { nonce, message } = await authApi.nonce(wallet)
-    const signature = await signMessage(message)
-    const { expiresAt, user } = await authApi.login(wallet, nonce, signature)
+    const account = await connectPrompt(wallet)
+    const { nonce, message } = await authApi.nonce(account.address)
+    const signed = await signLogin(wallet, account, { nonce, message })
+    const { expiresAt, user } = await authApi.login(signed.publicKey, nonce, signed.signature, signed.signedMessage)
     const session = { expiresAt, wallet: user.walletAddress, displayName: user.displayName || '', isAdmin: user.isAdmin }
     signedInAt = Date.now()
     saveSession(session)
     apply(session)
+    walletChoices.open = false
     refreshBalance()
   } finally {
     auth.busy = false
@@ -107,7 +123,7 @@ window.addEventListener('storage', event => {
 let leaving = false
 
 // The session belongs to one wallet. An empty account does not end it: the in-app browser
-// clears publicKey while the connection made a moment ago is still the approved one.
+// clears the account while the connection made a moment ago is still the approved one.
 // A real switch arrives as a different address.
 async function leaveIfWalletChanged (next) {
   if (leaving || !auth.wallet || !next || next === auth.wallet) return
@@ -115,23 +131,23 @@ async function leaveIfWalletChanged (next) {
   leaving = true
   try {
     await logout()
-    notify('Signed out because the Phantom account changed', 'info')
+    notify('Signed out because the wallet account changed', 'info')
   } finally {
     leaving = false
   }
 }
 
-function syncPhantomAccount () {
+function syncAccount () {
   if (!auth.wallet) return
   const next = selectedAccount()
   if (next) void leaveIfWalletChanged(next)
 }
 
-onPhantomAccount(next => { void leaveIfWalletChanged(next) })
+onWalletAccount(next => { void leaveIfWalletChanged(next) })
 
-window.addEventListener('focus', () => { void syncPhantomAccount() })
+window.addEventListener('focus', () => { void syncAccount() })
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') void syncPhantomAccount()
+  if (document.visibilityState === 'visible') void syncAccount()
 })
 
 setInterval(() => {
@@ -139,4 +155,4 @@ setInterval(() => {
   if (next) void leaveIfWalletChanged(next)
 }, 1000)
 
-export const authReady = restore().then(syncPhantomAccount)
+export const authReady = startWallets().then(restore).then(reattach).then(syncAccount)

@@ -94,6 +94,10 @@ type Event struct {
 	// Zero on events created before the limits existed.
 	MinRows    int `json:"minRows" bson:"minRows,omitempty"`
 	MaxCoupons int `json:"maxCoupons" bson:"maxCoupons,omitempty"`
+	// DisputeMin and DisputeMax are whole SOL. The challenge bond is 10% of the player pot,
+	// clamped to this pair. Zero means 10 and 50.
+	DisputeMin int `json:"disputeMin" bson:"disputeMin,omitempty"`
+	DisputeMax int `json:"disputeMax" bson:"disputeMax,omitempty"`
 	// EntryCount is the number of coupons, not rows. It is filled for the response.
 	EntryCount       int    `json:"entryCount" bson:"-"`
 	AutoResolveBlock string `json:"autoResolveBlock,omitempty" bson:"-"`
@@ -142,6 +146,17 @@ func normalizeCouponLimits(minRows, maxCoupons int) (int, int, string) {
 	return minRows, maxCoupons, ""
 }
 
+// normalizeDispute fills 10 and 50 when both were left out. Both are whole SOL from 1 to 100.
+func normalizeDispute(min, max int) (int, int, string) {
+	if min == 0 && max == 0 {
+		return 10, 50, ""
+	}
+	if min < 1 || max > 100 || min > max {
+		return 0, 0, "the challenge bond limits are whole SOL from 1 to 100, and the minimum cannot be above the maximum"
+	}
+	return min, max, ""
+}
+
 // entryLimits is what a coupon is checked against. Events saved before the limits existed
 // still take one row and up to the tree cap.
 func (e *Event) entryLimits() (int, int) {
@@ -185,12 +200,18 @@ func (a *App) prepare(e *Event, now time.Time) {
 	if e.Chain != nil && e.Chain.ProgramID != a.cfg.ProgramID {
 		e.Chain = nil
 	}
-	if e.AutoResolve && e.Status != "completed" && e.Status != "cancelled" {
+	if e.AutoResolve && e.Status != "completed" && e.Status != "cancelled" && chainAwaitingResults(e) {
 		e.AutoResolveBlock = autoResolveBlock(e.Games)
 		if e.AutoResolveBlock == "" {
 			e.AutoResolveBlock = e.ScoreBlock
 		}
 	}
+}
+
+// chainAwaitingResults is true until the vault leaves open. A locked result no longer
+// needs the "set the results by hand" notice.
+func chainAwaitingResults(e *Event) bool {
+	return e.Chain == nil || e.Chain.Status == "" || e.Chain.Status == "open"
 }
 
 func (a *App) countCoupons(ctx context.Context, events []Event) {
@@ -357,6 +378,8 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		League              bool   `json:"league"`
 		MinRows             int    `json:"minRows"`
 		MaxCoupons          int    `json:"maxCoupons"`
+		DisputeMin          int    `json:"disputeMin"`
+		DisputeMax          int    `json:"disputeMax"`
 		Type                string `json:"type"`
 	}
 	if !decodeJSON(w, r, &req) {
@@ -397,6 +420,11 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	minRows, maxCoupons, limitMsg := normalizeCouponLimits(req.MinRows, req.MaxCoupons)
 	if limitMsg != "" {
 		writeError(w, http.StatusBadRequest, limitMsg)
+		return
+	}
+	disputeMin, disputeMax, disputeMsg := normalizeDispute(req.DisputeMin, req.DisputeMax)
+	if disputeMsg != "" {
+		writeError(w, http.StatusBadRequest, disputeMsg)
 		return
 	}
 
@@ -453,6 +481,8 @@ func (a *App) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 		League:              req.League,
 		MinRows:             minRows,
 		MaxCoupons:          maxCoupons,
+		DisputeMin:          disputeMin,
+		DisputeMax:          disputeMax,
 		StartTime:           req.StartTime.UTC(),
 		EndTime:             req.EndTime.UTC(),
 		Games:               []Game{},

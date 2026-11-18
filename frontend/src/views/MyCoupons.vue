@@ -1,6 +1,89 @@
 <template>
-  <v-container class="py-6" max-width="1000">
-    <template v-if="selectedId">
+  <v-container class="coupon-page py-6" max-width="1000" :aria-hidden="panelOpen ? 'true' : undefined">
+    <h1 class="text-h4 mb-2">My Coupons</h1>
+    <v-checkbox
+      v-model="hideResults" label="Hide each result until I open the coupon"
+      density="compact" hide-details class="mb-4"
+    />
+
+    <v-alert
+      v-for="p in newestPending" :key="p.signature" type="warning" variant="tonal" class="mb-4"
+      title="Payment not registered yet"
+    >
+      You paid {{ formatSol(p.lamports) }} for {{ (p.combinations || p.coupons?.length || 0).toLocaleString() }} combination(s) in {{ p.eventTitle }},
+      but the coupons were not registered.
+      <a :href="explorerTx(p.signature)" target="_blank" rel="noopener">View payment</a>
+      <div v-if="expired(p)" class="mt-2">
+        This payment is more than an hour old and can no longer become an entry. Request a verified refund below.
+      </div>
+      <template #append>
+        <div class="d-flex flex-column ga-2">
+          <v-btn v-if="!expired(p)" color="warning" variant="flat" :loading="retrying === p.signature" @click="retry(p)">Retry</v-btn>
+          <v-btn variant="text" size="small" :loading="recovering === p.signature" @click="recover(p)">Request refund</v-btn>
+          <v-btn variant="text" size="small" @click="dismiss(p)">Dismiss</v-btn>
+        </div>
+      </template>
+    </v-alert>
+
+    <div class="d-flex flex-wrap align-center ga-2 mb-2">
+      <v-btn v-if="unrecovered" size="small" color="warning" variant="flat" :loading="recoveringChain" @click="recoverChain">
+        Recover {{ unrecovered }} coupon(s) from chain
+      </v-btn>
+      <v-btn size="small" variant="text" prepend-icon="mdi-download" @click="exportBackup">Export backup</v-btn>
+      <v-btn size="small" variant="text" prepend-icon="mdi-upload" @click="importInput?.click()">Import backup</v-btn>
+      <input ref="importInput" type="file" accept="application/json" hidden @change="importBackup">
+    </div>
+    <v-alert v-if="chainError" type="warning" variant="tonal" class="mb-4">{{ chainError }}</v-alert>
+
+    <v-progress-linear v-if="loading" indeterminate class="my-4" />
+    <v-card v-if="!loading && couponList.length === 0" class="pa-6 text-center">
+      <p class="text-medium-emphasis mb-4">You have not placed any coupons yet.</p>
+      <v-btn color="primary" to="/">Browse events</v-btn>
+    </v-card>
+
+    <button v-for="item in couponList" :key="item.key" type="button" class="coupon-row" @click="openCoupon(item.id)">
+      <template v-if="item.kind === 'vault'">
+        <span class="coupon-copy">
+          <span class="coupon-title">{{ item.row.eventTitle }}</span>
+          <span class="coupon-meta">Coupon #{{ item.row.index + 1 }} · {{ item.row.combinations.toLocaleString() }} combination(s)</span>
+        </span>
+        <v-chip size="small" variant="flat" :color="concealed(item.row.id, hasOutcome(item.row)) ? 'default' : item.row.color">{{ chipText(item.row) }}</v-chip>
+      </template>
+      <template v-else>
+        <span class="coupon-copy">
+          <span class="coupon-title">{{ item.entry.eventTitle || 'Event' }}</span>
+          <span class="coupon-meta">
+            {{ (item.entry.combinations || item.entry.coupons?.length || 0).toLocaleString() }} combination(s) · paid {{ formatSol(item.entry.lamports) }} · {{ formatDate(item.entry.createdAt) }}
+          </span>
+        </span>
+        <v-chip v-if="entrySettled(item.entry) && !concealed(item.entry.id, true)" size="small" variant="flat" :color="item.entry.winningsLamports ? 'success' : 'default'">
+          {{ item.entry.winningsLamports ? `Won ${formatSol(item.entry.winningsLamports)}` : 'No win' }}
+        </v-chip>
+        <v-chip v-else-if="item.entry.event" size="small" variant="flat" :color="entrySettled(item.entry) ? 'default' : statusColors[item.entry.event.status]">
+          {{ entrySettled(item.entry) ? 'Settled' : item.entry.event.status }}
+        </v-chip>
+      </template>
+      <v-icon icon="mdi-chevron-right" size="20" class="coupon-chevron" />
+    </button>
+    
+  </v-container>
+  <div
+    v-show="shownId"
+    ref="panel"
+    class="coupon-panel"
+    :class="{ 'is-dragging': dragging, 'is-away': Math.abs(shift) >= 1 && !dragging }"
+    :style="panelStyle"
+    @touchstart="onTouchStart"
+    @touchmove="onTouchMove"
+    @touchend="onTouchEnd"
+    @touchcancel="onTouchEnd"
+  >
+    <v-container class="py-4" max-width="1000">
+      <button type="button" class="panel-back" @click="closeCoupon">
+        <v-icon icon="mdi-arrow-left" size="18" />
+        My coupons
+      </button>
+
       <v-progress-linear v-if="loading && !selectedRow && !selectedEntry" indeterminate class="mb-4" />
 
       <v-card v-else-if="selectedRow" class="coupon-detail">
@@ -39,7 +122,7 @@
         </v-card-text>
       </v-card>
 
-      <v-card v-else-if="selectedEntry" class="coupon-detail">
+<v-card v-else-if="selectedEntry" class="coupon-detail">
         <v-card-title class="d-flex align-center flex-wrap ga-2">
           <router-link :to="`/events/${selectedEntry.eventId}`" class="text-decoration-none">{{ selectedEntry.eventTitle || 'Event' }}</router-link>
           <v-chip v-if="selectedEntry.event" :color="statusColors[selectedEntry.event.status]" size="small" variant="flat">{{ selectedEntry.event.status }}</v-chip>
@@ -83,88 +166,14 @@
         <p class="text-medium-emphasis mb-4">This coupon is not in your list any more.</p>
         <v-btn color="primary" variant="flat" @click="closeCoupon">Back to my coupons</v-btn>
       </v-card>
-    </template>
 
-    <template v-else>
-      <h1 class="text-h4 mb-2">My Coupons</h1>
-      <v-checkbox
-        v-model="hideResults" label="Hide each result until I open the coupon"
-        density="compact" hide-details class="mb-4"
-      />
-
-      <v-alert
-        v-for="p in newestPending" :key="p.signature" type="warning" variant="tonal" class="mb-4"
-        title="Payment not registered yet"
-      >
-        You paid {{ formatSol(p.lamports) }} for {{ (p.combinations || p.coupons?.length || 0).toLocaleString() }} combination(s) in {{ p.eventTitle }},
-        but the coupons were not registered.
-        <a :href="explorerTx(p.signature)" target="_blank" rel="noopener">View payment</a>
-        <div v-if="expired(p)" class="mt-2">
-          This payment is more than an hour old and can no longer become an entry. Request a verified refund below.
-        </div>
-        <template #append>
-          <div class="d-flex flex-column ga-2">
-            <v-btn v-if="!expired(p)" color="warning" variant="flat" :loading="retrying === p.signature" @click="retry(p)">Retry</v-btn>
-            <v-btn variant="text" size="small" :loading="recovering === p.signature" @click="recover(p)">Request refund</v-btn>
-            <v-btn variant="text" size="small" @click="dismiss(p)">Dismiss</v-btn>
-          </div>
-        </template>
-      </v-alert>
-
-      <v-card v-if="totalWinnings && !hideResults" color="success" variant="tonal" class="mb-4">
-        <v-card-text class="text-h6">
-          <v-icon class="mr-2">mdi-trophy</v-icon>
-          Total winnings: {{ formatSol(totalWinnings) }}
-          <div class="text-body-2 mt-1">Winnings are paid to your wallet by the admin from the devnet treasury.</div>
-        </v-card-text>
-      </v-card>
-
-      <div class="d-flex flex-wrap align-center ga-2 mb-2">
-        <v-btn v-if="unrecovered" size="small" color="warning" variant="flat" :loading="recoveringChain" @click="recoverChain">
-          Recover {{ unrecovered }} coupon(s) from chain
-        </v-btn>
-        <v-btn size="small" variant="text" prepend-icon="mdi-download" @click="exportBackup">Export backup</v-btn>
-        <v-btn size="small" variant="text" prepend-icon="mdi-upload" @click="importInput?.click()">Import backup</v-btn>
-        <input ref="importInput" type="file" accept="application/json" hidden @change="importBackup">
-      </div>
-      <v-alert v-if="chainError" type="warning" variant="tonal" class="mb-4">{{ chainError }}</v-alert>
-
-      <v-progress-linear v-if="loading" indeterminate class="my-4" />
-      <v-card v-if="!loading && couponList.length === 0" class="pa-6 text-center">
-        <p class="text-medium-emphasis mb-4">You have not placed any coupons yet.</p>
-        <v-btn color="primary" to="/">Browse events</v-btn>
-      </v-card>
-
-      <button v-for="item in couponList" :key="item.key" type="button" class="coupon-row" @click="openCoupon(item.id)">
-        <template v-if="item.kind === 'vault'">
-          <span class="coupon-copy">
-            <span class="coupon-title">{{ item.row.eventTitle }}</span>
-            <span class="coupon-meta">Coupon #{{ item.row.index + 1 }} · {{ item.row.combinations.toLocaleString() }} combination(s)</span>
-          </span>
-          <v-chip size="small" variant="flat" :color="concealed(item.row.id, hasOutcome(item.row)) ? 'default' : item.row.color">{{ chipText(item.row) }}</v-chip>
-        </template>
-        <template v-else>
-          <span class="coupon-copy">
-            <span class="coupon-title">{{ item.entry.eventTitle || 'Event' }}</span>
-            <span class="coupon-meta">
-              {{ (item.entry.combinations || item.entry.coupons?.length || 0).toLocaleString() }} combination(s) · paid {{ formatSol(item.entry.lamports) }} · {{ formatDate(item.entry.createdAt) }}
-            </span>
-          </span>
-          <v-chip v-if="entrySettled(item.entry) && !concealed(item.entry.id, true)" size="small" variant="flat" :color="item.entry.winningsLamports ? 'success' : 'default'">
-            {{ item.entry.winningsLamports ? `Won ${formatSol(item.entry.winningsLamports)}` : 'No win' }}
-          </v-chip>
-          <v-chip v-else-if="item.entry.event" size="small" variant="flat" :color="entrySettled(item.entry) ? 'default' : statusColors[item.entry.event.status]">
-            {{ entrySettled(item.entry) ? 'Settled' : item.entry.event.status }}
-          </v-chip>
-        </template>
-        <v-icon icon="mdi-chevron-right" size="20" class="coupon-chevron" />
-      </button>
-    </template>
-  </v-container>
+    </v-container>
+  </div>
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { SWIPE_EDGE } from '@/utils/swipeNav'
 import { useRoute, useRouter } from 'vue-router'
 import CouponCompare from '@/components/CouponCompare.vue'
 import CouponScore from '@/components/CouponScore.vue'
@@ -205,9 +214,21 @@ const outcomeLabels = new Set(['Won', 'No win', 'Not revealed', 'Claimed'])
 watch(hideResults, value => localStorage.setItem('sol.hideResults', value ? '1' : '0'))
 
 // The open coupon lives in the URL, so the bar's back button and the browser's back both close it.
+// The list stays mounted, so its scroll position is still there when the coupon slides away.
 const selectedId = computed(() => typeof route.query.coupon === 'string' ? route.query.coupon : '')
-const selectedRow = computed(() => chainRows.value.find(row => row.id === selectedId.value))
-const selectedEntry = computed(() => entries.value.find(entry => entry.id === selectedId.value))
+const shownId = ref('')
+const shift = ref(1)
+const dragging = ref(false)
+const panel = ref(null)
+const panelOpen = computed(() => !!shownId.value && Math.abs(shift.value) < 0.98)
+let gesture = null
+let phase = 'pending'
+const motion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
+const panelStyle = computed(() => ({
+  transform: `translate3d(${Math.min(1, Math.max(-1, shift.value)) * 100}%, 0, 0)`
+}))
+const selectedRow = computed(() => chainRows.value.find(row => row.id === shownId.value))
+const selectedEntry = computed(() => entries.value.find(entry => entry.id === shownId.value))
 const couponList = computed(() => {
   const vault = chainRows.value.map(row => ({
     key: `vault:${row.id}`,
@@ -228,16 +249,92 @@ const couponList = computed(() => {
   return [...vault, ...paid].sort((a, b) => b.at - a.at || b.index - a.index)
 })
 
-watch(selectedId, id => {
-  if (id) opened.value = { ...opened.value, [id]: true }
-  window.scrollTo(0, 0)
+watch(selectedId, (id, previous) => {
+  if (id) {
+    shownId.value = id
+    opened.value = { ...opened.value, [id]: true }
+    if (motion()) {
+      dragging.value = false
+      shift.value = 0
+      return
+    }
+    dragging.value = true
+    shift.value = 1
+    nextTick(() => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          dragging.value = false
+          shift.value = 0
+        })
+      })
+    })
+    return
+  }
+  if (!previous) return
+  dragging.value = false
+  if (Math.abs(shift.value) < 0.98) shift.value = 1
+  const wait = motion() ? 0 : 220
+  window.setTimeout(() => {
+    if (!selectedId.value) shownId.value = ''
+  }, wait)
 }, { immediate: true })
 
 function openCoupon (id) {
   router.push({ query: { coupon: id } })
 }
 function closeCoupon () {
-  router.replace({ query: {} })
+  if (!selectedId.value) return
+  if (window.history.state?.back) router.back()
+  else router.replace({ query: {} })
+}
+
+function onTouchStart (event) {
+  if (!selectedId.value || Math.abs(shift.value) > 0.02 || event.touches.length !== 1) return
+  const touch = event.touches[0]
+  const width = panel.value?.clientWidth || window.innerWidth
+  gesture = { x: touch.clientX, y: touch.clientY, edge: touch.clientX >= width - SWIPE_EDGE, dir: '' }
+  phase = 'pending'
+}
+
+function onTouchMove (event) {
+  if (!gesture || event.touches.length !== 1) return
+  const touch = event.touches[0]
+  const dx = touch.clientX - gesture.x
+  const dy = touch.clientY - gesture.y
+  if (phase === 'scroll') return
+  if (phase !== 'drag') {
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return
+    if (Math.abs(dy) >= Math.abs(dx)) {
+      phase = 'scroll'
+      return
+    }
+    // Dragging right dismisses the coupon the way it arrived. The page's back
+    // swipe, leftward from the right edge, dismisses it too.
+    if (dx <= 0 && !gesture.edge) {
+      phase = 'scroll'
+      return
+    }
+    phase = 'drag'
+    dragging.value = true
+    gesture.dir = dx < 0 ? 'back' : 'dismiss'
+  }
+  const width = panel.value?.clientWidth || window.innerWidth
+  shift.value = gesture.dir === 'back' ? Math.min(0, dx) / width : Math.max(0, dx) / width
+  if (event.cancelable) event.preventDefault()
+}
+
+function onTouchEnd () {
+  if (!gesture) return
+  const commit = phase === 'drag' && Math.abs(shift.value) >= 0.22
+  dragging.value = false
+  gesture = null
+  phase = 'pending'
+  if (commit) {
+    shift.value = shift.value < 0 ? -1 : 1
+    closeCoupon()
+  } else if (selectedId.value) {
+    shift.value = 0
+  }
 }
 function concealed (id, outcome) {
   return !!outcome && hideResults.value && !opened.value[id]
@@ -636,5 +733,47 @@ onBeforeUnmount(() => clearInterval(projectionTimer))
 .coupon-title { font-size: var(--fs-body); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .coupon-meta { font-size: var(--fs-small); color: rgba(var(--v-theme-on-surface), 0.62); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .coupon-chevron { flex: none; opacity: 0.45; }
-.coupon-detail { min-height: calc(100dvh - 200px); }
+.coupon-panel {
+  position: fixed;
+  z-index: 6;
+  top: calc(64px + var(--inset-top));
+  right: 0;
+  bottom: 40px;
+  left: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: rgb(var(--v-theme-background));
+  touch-action: pan-y;
+  transition: transform 220ms ease;
+}
+.coupon-panel.is-dragging { transition: none; }
+.coupon-panel.is-away { pointer-events: none; }
+.panel-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  padding: 6px 10px 6px 4px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: none;
+  color: rgb(var(--v-theme-on-surface));
+  font: inherit;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  cursor: pointer;
+}
+.panel-back:focus-visible {
+  outline: 2px solid rgb(var(--v-theme-primary));
+  outline-offset: 2px;
+}
+@media (max-width: 959px) {
+  .coupon-panel {
+    top: calc(56px + var(--inset-top));
+    bottom: calc(16px + var(--nav-height) + 16px + var(--inset-bottom));
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .coupon-panel { transition: none; }
+}
 </style>

@@ -275,9 +275,10 @@ func (a *App) handleNonce(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PublicKey string `json:"publicKey"`
-		Nonce     string `json:"nonce"`
-		Signature string `json:"signature"`
+		PublicKey     string `json:"publicKey"`
+		Nonce         string `json:"nonce"`
+		Signature     string `json:"signature"`
+		SignedMessage string `json:"signedMessage"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -287,13 +288,18 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "signature must be base64")
 		return
 	}
+	signed, err := decodeSignedMessage(req.SignedMessage)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	now := time.Now()
 	message, ok := a.nonces.consume(r.Context(), req.Nonce, req.PublicKey, now)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "sign-in request expired, please try again")
 		return
 	}
-	if !verifyWalletSignature(req.PublicKey, message, signature) {
+	if !a.loginSignatureAccepted(req.PublicKey, message, req.Nonce, signature, signed, now) {
 		writeError(w, http.StatusUnauthorized, "signature does not match wallet")
 		return
 	}
